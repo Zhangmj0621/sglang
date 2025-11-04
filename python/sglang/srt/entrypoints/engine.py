@@ -59,6 +59,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromP2pReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -467,6 +468,28 @@ class Engine(EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def update_weights_from_p2p(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        send_ranks: list[int],
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source."""
+        obj = UpdateWeightsFromP2pReqInput(
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            send_ranks=send_ranks,
+            group_name=group_name,
+            flush_cache=flush_cache,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_p2p(obj, None)
         )
 
     def update_weights_from_tensor(

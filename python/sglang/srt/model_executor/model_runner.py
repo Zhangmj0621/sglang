@@ -1126,6 +1126,59 @@ class ModelRunner:
             )
             logger.error(error_msg)
             return False, error_msg
+        
+    def update_weights_from_p2p(self, names, dtypes, shapes, send_ranks, group_name):
+        """
+        Update specific parameter in the model weights online
+        through `_model_update_group` process group.
+
+        Args:
+            name: the name of the parameter to be updated.
+            dtype: the data type of the parameter to be updated.
+            shape: the shape of the parameter to be updated.
+            send_ranks: the ranks of the senders to each sglang rank.
+        """
+
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        try:
+            # get local_rank in process group
+            local_rank = torch.distributed.get_rank(
+                group=self._model_update_group[group_name]
+            )
+
+            weights = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.irecv(
+                        weight,
+                        src=send_ranks[local_rank],
+                        group=self._model_update_group[group_name],
+                    )
+                )
+                weights.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            self.model.load_weights(weights)
+            return True, "Succeeded to update parameter online."
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
 
     def update_weights_from_tensor(
         self,

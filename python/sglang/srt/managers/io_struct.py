@@ -1057,7 +1057,32 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
 class UpdateWeightsFromDistributedReqOutput(BaseReq):
     success: bool
     message: str
+    
+@dataclass
+class UpdateWeightsFromP2pReqInput(BaseReq):
+    """Update model weights from p2p input.
 
+    - Tensors are transferred via p2p communication
+    - Data is structured in JSON for easy transmission over HTTP
+    """
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    # send ranks for each recv rank
+    send_ranks: List[int]
+    # The group name
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    
+@dataclass
+class UpdateWeightsFromP2pReqOutput(BaseReq):
+    success: bool
+    message: str
 
 @dataclass
 class UpdateWeightsFromTensorReqInput(BaseReq):

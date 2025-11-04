@@ -26,6 +26,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromP2pReqInput,
+    UpdateWeightsFromP2pReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -73,6 +75,20 @@ class SchedulerUpdateWeightsMixin:
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
+    
+    def update_weights_from_p2p(
+        self,
+        recv_req: UpdateWeightsFromP2pReqInput,
+    ) -> Tuple[bool, str]:
+        """Update the online model parameter."""
+        success, message = self.tp_worker.update_weights_from_p2p(recv_req)
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        return UpdateWeightsFromP2pReqOutput(success, message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""

@@ -96,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromP2pReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
@@ -831,6 +832,28 @@ async def update_weights_from_distributed(
     """Update model parameter from distributed online."""
     success, message = (
         await _global_state.tokenizer_manager.update_weights_from_distributed(
+            obj, request
+        )
+    )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+    
+@app.post("/update_weights_from_p2p")
+async def update_weights_from_p2p(
+    obj: UpdateWeightsFromP2pReqInput, request: Request
+):
+    """Update model parameter from p2p online."""
+    success, message = (
+        await _global_state.tokenizer_manager.update_weights_from_p2p(
             obj, request
         )
     )

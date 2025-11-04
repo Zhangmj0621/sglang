@@ -63,6 +63,8 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromP2pReqInput,
+    UpdateWeightsFromP2pReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -162,6 +164,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_p2p_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.init_weights_send_group_for_remote_instance_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -227,6 +232,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromDistributedReqOutput,
                     self.update_weights_from_distributed_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromP2pReqOutput,
+                    self.update_weights_from_p2p_communicator.handle_recv,
                 ),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -402,6 +411,25 @@ class TokenizerCommunicatorMixin:
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             results = await self.update_weights_from_distributed_communicator(obj)
+            return _Communicator.merge_results(results)
+
+    async def update_weights_from_p2p(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromP2pReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from p2p"
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        # This means that weight sync
+        # cannot run while requests are in progress.
+        async with self.model_update_lock.writer_lock:
+            results = await self.update_weights_from_p2p_communicator(obj)
             return _Communicator.merge_results(results)
 
     async def init_weights_send_group_for_remote_instance(

@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromP2pReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -153,6 +154,14 @@ class BaseTpWorker(ABC):
     ):
         success, message = self.model_runner.update_weights_from_distributed(
             recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
+        )
+        return success, message
+    
+    def update_weights_from_p2p(
+        self, recv_req: UpdateWeightsFromP2pReqInput
+    ):
+        success, message = self.model_runner.update_weights_from_p2p(
+            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.send_ranks, recv_req.group_name
         )
         return success, message
 
