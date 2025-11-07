@@ -329,6 +329,7 @@ class ModelRunner:
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+        self._local_rank = {}
 
         if (
             self.server_args.enable_piecewise_cuda_graph
@@ -1060,6 +1061,7 @@ class ModelRunner:
                 rank=rank,
                 group_name=group_name,
             )
+            self._local_rank[group_name] = rank
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -1146,9 +1148,7 @@ class ModelRunner:
 
         try:
             # get local_rank in process group
-            local_rank = torch.distributed.get_rank(
-                group=self._model_update_group[group_name]
-            )
+            local_rank = self._local_rank[group_name]
 
             weights = []
             handles = []
