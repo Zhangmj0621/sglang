@@ -1128,7 +1128,7 @@ class ModelRunner:
             )
             logger.error(error_msg)
             return False, error_msg
-        
+
     def update_weights_from_p2p(self, names, dtypes, shapes, send_ranks, group_name):
         """
         Update specific parameter in the model weights online
@@ -1179,6 +1179,18 @@ class ModelRunner:
             )
             logger.error(error_msg)
             return False, error_msg
+
+    def get_param_metadata(self) -> list[str]:
+        """Get the name of all parameters in the model.
+
+        Returns:
+            A list of parameter names.
+        """
+        try:
+            return [name for name, _ in dict(self.model.named_parameters()).items()]
+        except Exception as e:
+            logger.error(f"Error when getting parameter metadata: {e}")
+            return None
 
     def update_weights_from_tensor(
         self,

@@ -38,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    GetParamMetadataReqInput,
+    GetParamMetadataReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -182,6 +184,9 @@ class TokenizerCommunicatorMixin:
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_param_metadata_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.release_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -256,6 +261,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetWeightsByNameReqOutput,
                     self.get_weights_by_name_communicator.handle_recv,
+                ),
+                (
+                    GetParamMetadataReqOutput,
+                    self.get_param_metadata_communicator.handle_recv,
                 ),
                 (
                     ReleaseMemoryOccupationReqOutput,
@@ -613,6 +622,19 @@ class TokenizerCommunicatorMixin:
             return all_parameters[0]
         else:
             return all_parameters
+        
+    async def get_param_metadata(
+        self: TokenizerManager,
+        obj: GetParamMetadataReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        results = await self.get_param_metadata_communicator(obj)
+        all_param_names = [r.param_names for r in results]
+        if self.server_args.dp_size == 1:
+            return all_param_names[0]
+        else:
+            return all_param_names
 
     async def release_memory_occupation(
         self: TokenizerManager,

@@ -49,6 +49,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    GetParamMetadataReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
@@ -541,6 +542,13 @@ class Engine(EngineBase):
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+        
+    def get_param_metadata(self):
+        """Get the name of all parameters in the model."""
+        obj = GetParamMetadataReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.get_param_metadata(obj, None)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):

@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromP2pReqInput,
+    GetParamMetadataReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -164,6 +165,15 @@ class BaseTpWorker(ABC):
             recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.send_ranks, recv_req.group_name
         )
         return success, message
+
+    def get_param_metadata(self, recv_req: GetParamMetadataReqInput) -> list[str]:
+        """Get the name of all parameters in the model.
+
+        Returns:
+            A list of parameter names.
+        """
+        param_names = self.model_runner.get_param_metadata()
+        return param_names
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 

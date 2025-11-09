@@ -1059,6 +1059,14 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
     message: str
     
 @dataclass
+class GetParamMetadataReqInput(BaseReq):
+    pass
+
+@dataclass
+class GetParamMetadataReqOutput(BaseReq):
+    param_names: List[str]    
+    
+@dataclass
 class UpdateWeightsFromP2pReqInput(BaseReq):
     """Update model weights from p2p input.
 

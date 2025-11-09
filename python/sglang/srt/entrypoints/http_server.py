@@ -81,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    GetParamMetadataReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -932,6 +933,19 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)
+    
+@app.api_route("/get_param_metadata", methods=["GET"])
+async def get_param_metadata(obj: GetParamMetadataReqInput, request: Request):
+    """Get model parameter metadata by name."""
+    try:
+        ret = await _global_state.tokenizer_manager.get_param_metadata(obj, request)
+        if ret is None:
+            return _create_error_response("Get parameter metadata by name failed")
+        else:
+            return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])

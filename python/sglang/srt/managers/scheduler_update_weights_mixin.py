@@ -15,6 +15,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
+    GetParamMetadataReqInput,
+    GetParamMetadataReqOutput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
@@ -118,6 +120,11 @@ class SchedulerUpdateWeightsMixin:
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
+    
+    def get_param_metadata(self, recv_req: GetParamMetadataReqInput):
+        """Get the name of all parameters in the model."""
+        param_names = self.tp_worker.get_param_metadata(recv_req)
+        return GetParamMetadataReqOutput(param_names)
 
     def release_memory_occupation(
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
