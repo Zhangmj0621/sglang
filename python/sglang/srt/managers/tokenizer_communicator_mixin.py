@@ -631,10 +631,7 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         results = await self.get_param_metadata_communicator(obj)
         all_param_names = [r.param_names for r in results]
-        if self.server_args.dp_size == 1:
-            return all_param_names[0]
-        else:
-            return all_param_names
+        return all_param_names
 
     async def release_memory_occupation(
         self: TokenizerManager,
