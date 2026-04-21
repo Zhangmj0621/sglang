@@ -196,8 +196,11 @@ class RefAwareHiRadixCache(HiRadixCache):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
-        for ref_info in self.rid_to_ref_info.values():
-            ref_info.nodes.discard(node)
+        for rid in node.tracked_rids:
+            ref_info = self.rid_to_ref_info.get(rid)
+            if ref_info is not None:
+                ref_info.nodes.discard(node)
+        node.tracked_rids.clear()
         super()._delete_leaf(node)
 
     # --- Tiered eviction ---
@@ -333,9 +336,11 @@ class RefAwareHiRadixCache(HiRadixCache):
             assert v == x, f"parent does not have child key, {key}"
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
-            # Clean up ref tracking
-            for ref_info in self.rid_to_ref_info.values():
-                ref_info.nodes.discard(x)
+            for rid in x.tracked_rids:
+                ref_info = self.rid_to_ref_info.get(rid)
+                if ref_info is not None:
+                    ref_info.nodes.discard(x)
+            x.tracked_rids.clear()
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
@@ -408,6 +413,7 @@ class RefAwareHiRadixCache(HiRadixCache):
         for node in new_nodes:
             self._inc_priority_ref_single(node, is_high)
             ref_info.nodes.add(node)
+            node.tracked_rids.add(rid)
 
     def _collect_nodes_on_path(self, key: RadixKey):
         node = self.root_node
@@ -455,6 +461,7 @@ class RefAwareHiRadixCache(HiRadixCache):
 
         for node in ref_info.nodes:
             self._dec_priority_ref_single(node, ref_info.is_high)
+            node.tracked_rids.discard(rid)
         return True, f"released {len(ref_info.nodes)} nodes for rid {rid}"
 
     def update_ref(self, rid: str, new_priority: int) -> Tuple[bool, str]:
@@ -478,9 +485,11 @@ class RefAwareHiRadixCache(HiRadixCache):
         new_node = super()._split_node(key, child, split_len)
         new_node.high_ref = child.high_ref
         new_node.low_ref = child.low_ref
-        # Update rid_to_ref_info: if child was tracked, new_node (its parent) should also be tracked
-        for ref_info in self.rid_to_ref_info.values():
-            if child in ref_info.nodes:
+        # new_node inherits tracked_rids from child (already done in RadixCache._split_node)
+        # Update rid_to_ref_info: add new_node to each tracking rid's node set
+        for rid in new_node.tracked_rids:
+            ref_info = self.rid_to_ref_info.get(rid)
+            if ref_info is not None:
                 ref_info.nodes.add(new_node)
         self._update_ref_aware_leaf_status(new_node)
         self._update_ref_aware_leaf_status(child)

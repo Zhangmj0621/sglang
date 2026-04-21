@@ -167,6 +167,7 @@ class TreeNode:
         self.priority = priority
         self.high_ref = 0
         self.low_ref = 0
+        self.tracked_rids: set = set()
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -771,6 +772,7 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.high_ref = child.high_ref
         new_node.low_ref = child.low_ref
+        new_node.tracked_rids = set(child.tracked_rids)
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
         child.parent = new_node
