@@ -894,13 +894,11 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-                self._req_inc_priority_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
-                self._req_inc_priority_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -935,7 +933,6 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                self._req_inc_priority_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()

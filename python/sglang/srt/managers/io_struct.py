@@ -218,6 +218,9 @@ class GenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Whether this is the first turn of a multi-turn rollout (for ref-aware KV cache)
+    is_first_turn: bool = False
+
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -754,6 +757,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Whether this is the first turn of a multi-turn rollout (for ref-aware KV cache)
+    is_first_turn: bool = False
+
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
@@ -1208,6 +1214,29 @@ class FlushCacheReqInput(BaseReq):
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+    message: str = ""
+
+
+@dataclass
+class ReleaseRefReqInput(BaseReq):
+    rid: str = ""
+
+
+@dataclass
+class ReleaseRefReqOutput(BaseReq):
+    success: bool = True
+    message: str = ""
+
+
+@dataclass
+class UpdateRefReqInput(BaseReq):
+    rid: str = ""
+    new_priority: int = 0
+
+
+@dataclass
+class UpdateRefReqOutput(BaseReq):
+    success: bool = True
     message: str = ""
 
 
