@@ -129,6 +129,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
+    ReleaseRefReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
@@ -136,6 +137,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateRefReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -775,6 +777,20 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
         content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
+
+
+@app.post("/release_ref")
+async def release_ref_request(obj: ReleaseRefReqInput, request: Request):
+    """Release ref tracking for a completed multi-turn rollout."""
+    success, message = await _global_state.tokenizer_manager.release_ref(obj)
+    return ORJSONResponse({"success": success, "message": message})
+
+
+@app.post("/update_ref")
+async def update_ref_request(obj: UpdateRefReqInput, request: Request):
+    """Update priority class for a tracked multi-turn rollout."""
+    success, message = await _global_state.tokenizer_manager.update_ref(obj)
+    return ORJSONResponse({"success": success, "message": message})
 
 
 @app.post("/add_external_corpus")

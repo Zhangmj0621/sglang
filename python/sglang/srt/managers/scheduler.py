@@ -125,6 +125,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -140,6 +142,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1347,6 +1351,8 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (ReleaseRefReqInput, self.handle_release_ref),
+                (UpdateRefReqInput, self.handle_update_ref),
             ]
         )
 
@@ -3057,6 +3063,22 @@ class Scheduler(
 
         self._pending_flush = (recv_req, time.monotonic() + timeout_s)
         return None
+
+    def handle_release_ref(self, recv_req: ReleaseRefReqInput):
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                success, msg = self.tree_cache.release_ref(recv_req.rid)
+                return ReleaseRefReqOutput(success=success, message=msg)
+        return ReleaseRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+
+    def handle_update_ref(self, recv_req: UpdateRefReqInput):
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                success, msg = self.tree_cache.update_ref(recv_req.rid, recv_req.new_priority)
+                return UpdateRefReqOutput(success=success, message=msg)
+        return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

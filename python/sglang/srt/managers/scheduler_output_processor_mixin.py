@@ -93,6 +93,10 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                if self.enable_ref_aware_kv_buffer:
+                    from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+                    if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                        self.tree_cache.register_ref(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -192,6 +196,10 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
+                        if self.enable_ref_aware_kv_buffer:
+                            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+                            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                                self.tree_cache.register_ref(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
@@ -326,6 +334,10 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        if self.enable_ref_aware_kv_buffer:
+                            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+                            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                                self.tree_cache.register_ref(req)
                         req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -563,6 +575,10 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                if self.enable_ref_aware_kv_buffer:
+                    from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+                    if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                        self.tree_cache.register_ref(req)
 
             req.time_stats.set_completion_time()
 

@@ -37,6 +37,10 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
@@ -108,6 +112,8 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("release_ref", ReleaseRefReqOutput),
+    ("update_ref", UpdateRefReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -259,6 +265,16 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def release_ref(self: TokenizerManager, obj: ReleaseRefReqInput):
+        self.auto_create_handle_loop()
+        results = await self.release_ref_communicator(obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def update_ref(self: TokenizerManager, obj: UpdateRefReqInput):
+        self.auto_create_handle_loop()
+        results = await self.update_ref_communicator(obj)
+        return FanOutCommunicator.merge_results(results)
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
