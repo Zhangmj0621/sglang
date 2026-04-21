@@ -574,6 +574,10 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # Ref-aware KV cache eviction (requires hierarchical cache)
+    enable_ref_aware_kv_buffer: bool = False
+    high_priority_threshold: int = 1
+
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
@@ -3773,6 +3777,11 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_ref_aware_kv_buffer and not self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-ref-aware-kv-buffer requires --enable-hierarchical-cache"
+            )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -5632,6 +5641,18 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--enable-ref-aware-kv-buffer",
+            action="store_true",
+            default=ServerArgs.enable_ref_aware_kv_buffer,
+            help="Enable ref-aware KV cache eviction with two-tier priority (high_ref/low_ref). Requires --enable-hierarchical-cache.",
+        )
+        parser.add_argument(
+            "--high-priority-threshold",
+            type=int,
+            default=ServerArgs.high_priority_threshold,
+            help="Requests with priority >= this threshold are classified as high-priority for ref-aware eviction. Default: 1.",
         )
 
         # Hierarchical sparse attention
