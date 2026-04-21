@@ -3,7 +3,8 @@ from __future__ import annotations
 import heapq
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
 import torch
 
@@ -13,13 +14,21 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     IncLockRefResult,
+    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
+
+
+@dataclass
+class RefInfo:
+    is_high: bool
+    nodes: Set[TreeNode] = field(default_factory=set)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +56,7 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.unused_evictable_size_: int = 0
         self.low_ref_evictable_size_: int = 0
         self.high_ref_evictable_size_: int = 0
+        self.rid_to_ref_info: Dict[str, RefInfo] = {}
         super().__init__(params=params, server_args=server_args)
 
     def reset(self):
@@ -56,6 +66,7 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.unused_evictable_size_ = 0
         self.low_ref_evictable_size_ = 0
         self.high_ref_evictable_size_ = 0
+        self.rid_to_ref_info.clear()
         super().reset()
 
     def is_high_priority(self, priority: int) -> bool:
@@ -185,6 +196,8 @@ class RefAwareHiRadixCache(HiRadixCache):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
+        for ref_info in self.rid_to_ref_info.values():
+            ref_info.nodes.discard(node)
         super()._delete_leaf(node)
 
     # --- Tiered eviction ---
@@ -274,21 +287,109 @@ class RefAwareHiRadixCache(HiRadixCache):
 
         return num_evicted
 
-    # --- Handle dec_priority_ref on request finish ---
+    # --- Explicit ref management for RL multi-turn ---
 
-    def cache_finished_req(self, req, is_insert: bool = True):
+    def register_ref(self, req: Req):
+        rid = req.rid
         is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
-        if not self.disable and req.last_node is not None:
-            self.dec_priority_ref(req.last_node, is_high)
-        super().cache_finished_req(req, is_insert=is_insert)
+        is_first_turn = getattr(req, "is_first_turn", False)
 
-    def cache_unfinished_req(self, req, chunked=False):
-        is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
-        if not self.disable and req.last_node is not None:
-            self.dec_priority_ref(req.last_node, is_high)
-        super().cache_unfinished_req(req, chunked=chunked)
-        if not self.disable and req.last_node is not None:
-            self.inc_priority_ref(req.last_node, is_high)
+        if rid not in self.rid_to_ref_info:
+            if not is_first_turn:
+                logger.warning(
+                    "register_ref: rid %s not found but is_first_turn=False, treating as first turn",
+                    rid,
+                )
+            self.rid_to_ref_info[rid] = RefInfo(is_high=is_high)
+
+        ref_info = self.rid_to_ref_info[rid]
+
+        token_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        if not token_ids:
+            return
+
+        radix_key = RadixKey(
+            list(token_ids), getattr(req, "extra_key", None)
+        ).page_aligned(self.page_size)
+        if len(radix_key) == 0:
+            return
+
+        # Walk the tree to find all nodes for this token sequence
+        nodes_on_path = self._collect_nodes_on_path(radix_key)
+
+        if is_first_turn or not ref_info.nodes:
+            # First turn: inc ref on ALL nodes in the path
+            new_nodes = set(nodes_on_path) - ref_info.nodes
+        else:
+            # Subsequent turn: inc ref only on NEW nodes (extend part)
+            new_nodes = set(nodes_on_path) - ref_info.nodes
+
+        for node in new_nodes:
+            self._inc_priority_ref_single(node, is_high)
+            ref_info.nodes.add(node)
+
+    def _collect_nodes_on_path(self, key: RadixKey):
+        node = self.root_node
+        nodes = []
+        child_key_fn = self.get_child_key_fn
+
+        while len(key) > 0:
+            ck = child_key_fn(key)
+            if ck not in node.children:
+                break
+            child = node.children[ck]
+            prefix_len = self.key_match_fn(child.key, key)
+            if prefix_len <= 0:
+                break
+            nodes.append(child)
+            if prefix_len < len(child.key):
+                break
+            key = key[prefix_len:]
+        return nodes
+
+    def _inc_priority_ref_single(self, node: TreeNode, is_high: bool):
+        old_tier = _classify_node_tier(node)
+        if is_high:
+            node.high_ref += 1
+        else:
+            node.low_ref += 1
+        new_tier = _classify_node_tier(node)
+        if node.lock_ref == 0 and old_tier != new_tier:
+            self._move_node_tier(node, old_tier, new_tier)
+
+    def _dec_priority_ref_single(self, node: TreeNode, is_high: bool):
+        old_tier = _classify_node_tier(node)
+        if is_high:
+            node.high_ref = max(0, node.high_ref - 1)
+        else:
+            node.low_ref = max(0, node.low_ref - 1)
+        new_tier = _classify_node_tier(node)
+        if node.lock_ref == 0 and old_tier != new_tier:
+            self._move_node_tier(node, old_tier, new_tier)
+
+    def release_ref(self, rid: str) -> Tuple[bool, str]:
+        ref_info = self.rid_to_ref_info.pop(rid, None)
+        if ref_info is None:
+            return False, f"rid {rid} not found in ref tracking"
+
+        for node in ref_info.nodes:
+            self._dec_priority_ref_single(node, ref_info.is_high)
+        return True, f"released {len(ref_info.nodes)} nodes for rid {rid}"
+
+    def update_ref(self, rid: str, new_priority: int) -> Tuple[bool, str]:
+        ref_info = self.rid_to_ref_info.get(rid)
+        if ref_info is None:
+            return False, f"rid {rid} not found in ref tracking"
+
+        new_is_high = self.is_high_priority(new_priority)
+        if new_is_high == ref_info.is_high:
+            return True, "priority class unchanged"
+
+        for node in ref_info.nodes:
+            self._dec_priority_ref_single(node, ref_info.is_high)
+            self._inc_priority_ref_single(node, new_is_high)
+        ref_info.is_high = new_is_high
+        return True, f"updated {len(ref_info.nodes)} nodes for rid {rid}"
 
     # --- Split node override to propagate high_ref/low_ref ---
 
@@ -296,6 +397,10 @@ class RefAwareHiRadixCache(HiRadixCache):
         new_node = super()._split_node(key, child, split_len)
         new_node.high_ref = child.high_ref
         new_node.low_ref = child.low_ref
+        # Update rid_to_ref_info: if child was tracked, new_node (its parent) should also be tracked
+        for ref_info in self.rid_to_ref_info.values():
+            if child in ref_info.nodes:
+                ref_info.nodes.add(new_node)
         self._update_ref_aware_leaf_status(new_node)
         self._update_ref_aware_leaf_status(child)
         return new_node
