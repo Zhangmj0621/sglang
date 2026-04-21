@@ -274,6 +274,22 @@ class RefAwareHiRadixCache(HiRadixCache):
 
         return num_evicted
 
+    # --- Handle dec_priority_ref on request finish ---
+
+    def cache_finished_req(self, req, is_insert: bool = True):
+        is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
+        if not self.disable and req.last_node is not None:
+            self.dec_priority_ref(req.last_node, is_high)
+        super().cache_finished_req(req, is_insert=is_insert)
+
+    def cache_unfinished_req(self, req, chunked=False):
+        is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
+        if not self.disable and req.last_node is not None:
+            self.dec_priority_ref(req.last_node, is_high)
+        super().cache_unfinished_req(req, chunked=chunked)
+        if not self.disable and req.last_node is not None:
+            self.inc_priority_ref(req.last_node, is_high)
+
     # --- Split node override to propagate high_ref/low_ref ---
 
     def _split_node(self, key, child, split_len):

@@ -383,6 +383,8 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_ref_aware_kv_buffer = server_args.enable_ref_aware_kv_buffer
+        self.high_priority_threshold = server_args.high_priority_threshold
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
@@ -840,6 +842,14 @@ class Scheduler(
                     )
 
                     self.tree_cache = HiMambaRadixCache(
+                        params=params, server_args=server_args
+                    )
+                elif server_args.enable_ref_aware_kv_buffer:
+                    from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
+                        RefAwareHiRadixCache,
+                    )
+
+                    self.tree_cache = RefAwareHiRadixCache(
                         params=params, server_args=server_args
                     )
                 else:
@@ -2503,6 +2513,8 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            enable_ref_aware_kv_buffer=self.enable_ref_aware_kv_buffer,
+            high_priority_threshold=self.high_priority_threshold,
         )
 
         if self.chunked_req is not None:
