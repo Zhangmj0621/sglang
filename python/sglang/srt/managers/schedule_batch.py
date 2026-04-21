@@ -2015,8 +2015,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        self._evict_for_decode(num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _evict_for_decode(self, num_tokens: int):
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if server_args.enable_ref_aware_kv_buffer and isinstance(
+            self.tree_cache, RefAwareHiRadixCache
+        ):
+            if self.tree_cache.is_chunk_cache():
+                return
+            allocator = self.tree_cache.token_to_kv_pool_allocator
+            if allocator.available_size() < num_tokens:
+                self.tree_cache._evict_tiered(
+                    num_tokens - allocator.available_size(),
+                    allow_low=True,
+                    allow_high=False,
+                )
+        else:
+            evict_from_tree_cache(self.tree_cache, num_tokens)
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs

@@ -389,6 +389,8 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        enable_ref_aware_kv_buffer: bool = False,
+        high_priority_threshold: int = 1,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -439,6 +441,8 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.enable_ref_aware_kv_buffer = enable_ref_aware_kv_buffer
+        self.high_priority_threshold = high_priority_threshold
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -473,6 +477,18 @@ class PrefillAdder:
                 + self.tree_cache.evictable_size()
             )
         return available_and_evictable - self.rem_total_token_offset
+
+    def _rem_total_tokens_ref_aware(self, is_high: bool):
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        cache = self.tree_cache
+        assert isinstance(cache, RefAwareHiRadixCache)
+        available = self.token_to_kv_pool_allocator.available_size()
+        evictable = cache.evictable_size_by_tier(
+            allow_low=True,
+            allow_high=is_high,
+        )
+        return available + evictable - self.rem_total_token_offset
 
     @property
     def rem_swa_tokens(self):
@@ -596,6 +612,16 @@ class PrefillAdder:
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+
+    def _req_inc_priority_ref(self, req: Req):
+        if not self.enable_ref_aware_kv_buffer:
+            return
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        cache = self.tree_cache
+        if isinstance(cache, RefAwareHiRadixCache):
+            is_high = (req.priority or 0) >= self.high_priority_threshold
+            cache.inc_priority_ref(req.last_node, is_high)
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -805,6 +831,20 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        if self.enable_ref_aware_kv_buffer:
+            req_is_high = (req.priority or 0) >= self.high_priority_threshold
+            ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
+            if total_tokens >= ref_aware_budget:
+                if req_is_high:
+                    from sglang.srt.server_args import get_global_server_args
+                    kicked = self._kick_low_priority_for_high(
+                        req, total_tokens, get_global_server_args()
+                    )
+                    if not kicked:
+                        return AddReqResult.NO_TOKEN
+                else:
+                    return AddReqResult.NO_TOKEN
+
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
@@ -854,11 +894,13 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
+                self._req_inc_priority_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
+                self._req_inc_priority_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -893,6 +935,7 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
+                self._req_inc_priority_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
@@ -966,4 +1009,57 @@ class PrefillAdder:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
+        return True
+
+    def _kick_low_priority_for_high(
+        self, req: Req, total_tokens_needed: int, server_args: ServerArgs
+    ) -> bool:
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        cache = self.tree_cache
+        if not isinstance(cache, RefAwareHiRadixCache):
+            return False
+
+        threshold = self.high_priority_threshold
+
+        low_priority_reqs = []
+        for r in self.running_batch.reqs:
+            if r in self.preempt_list or r.finished():
+                continue
+            if (r.priority or 0) < threshold:
+                total_tokens = len(r.origin_input_ids) + len(r.output_ids)
+                low_priority_reqs.append((total_tokens, r))
+
+        low_priority_reqs.sort(key=lambda x: x[0], reverse=True)
+
+        kicked_reqs = []
+        for _total_tokens, running_req in low_priority_reqs:
+            kicked_reqs.append(running_req)
+            self.rem_total_token_offset -= self._get_running_request_total_token_offset(
+                running_req
+            )
+            ref_aware_budget = self._rem_total_tokens_ref_aware(is_high=True)
+            if total_tokens_needed < ref_aware_budget:
+                break
+
+        if total_tokens_needed >= self._rem_total_tokens_ref_aware(is_high=True):
+            for running_req in kicked_reqs:
+                self.rem_total_token_offset += (
+                    self._get_running_request_total_token_offset(running_req)
+                )
+            return False
+
+        kicked_set = set(kicked_reqs)
+        keep_indices = []
+        release_counter = 0
+        for i, running_req in enumerate(self.running_batch.reqs):
+            if running_req in kicked_set:
+                release_counter += 1
+                self.running_batch.release_req(
+                    i, len(self.running_batch.reqs) - release_counter, server_args
+                )
+            else:
+                keep_indices.append(i)
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.preempt_list.extend(kicked_reqs)
         return True
