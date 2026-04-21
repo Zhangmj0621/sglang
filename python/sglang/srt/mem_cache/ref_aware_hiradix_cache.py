@@ -287,6 +287,95 @@ class RefAwareHiRadixCache(HiRadixCache):
 
         return num_evicted
 
+    # --- Tiered host eviction ---
+
+    def evict_host(self, num_tokens: int, allow_high: bool = True):
+        num_evicted = 0
+        num_evicted += self._evict_host_from_tier(
+            num_tokens - num_evicted, TIER_UNUSED
+        )
+        if num_evicted < num_tokens:
+            num_evicted += self._evict_host_from_tier(
+                num_tokens - num_evicted, TIER_LOW_REF
+            )
+        if allow_high and num_evicted < num_tokens:
+            num_evicted += self._evict_host_from_tier(
+                num_tokens - num_evicted, TIER_HIGH_REF
+            )
+        return num_evicted
+
+    def _evict_host_from_tier(self, num_tokens: int, target_tier: int) -> int:
+        leaves = [
+            n for n in self.evictable_host_leaves
+            if n.evicted and n.host_ref_counter == 0 and _classify_node_tier(n) == target_tier
+        ]
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+
+        num_evicted = 0
+        while num_evicted < num_tokens and len(eviction_heap):
+            _priority, x = heapq.heappop(eviction_heap)
+            if x == self.root_node:
+                break
+            if not x.evicted or x.host_ref_counter > 0:
+                continue
+            if _classify_node_tier(x) != target_tier:
+                continue
+
+            from sglang.srt.disaggregation.kv_events import StorageMedium
+            self._record_remove_event(x, medium=StorageMedium.CPU)
+            num_evicted += self.cache_controller.evict_host(x.host_value)
+
+            key = self.get_child_key_fn(x.key)
+            v = x.parent.children.pop(key, None)
+            assert v == x, f"parent does not have child key, {key}"
+            if x in self.evictable_host_leaves:
+                self.evictable_host_leaves.remove(x)
+            # Clean up ref tracking
+            for ref_info in self.rid_to_ref_info.values():
+                ref_info.nodes.discard(x)
+            self._update_host_leaf_status(x.parent)
+
+            if len(x.parent.children) == 0 and x.parent.evicted:
+                if _classify_node_tier(x.parent) == target_tier:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+        return num_evicted
+
+    def write_backup(self, node: TreeNode, write_back=False) -> int:
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.backuped
+        ):
+            return 0
+
+        host_indices = self.cache_controller.write(
+            device_indices=node.value,
+            node_id=node.id,
+            **self._get_extra_pools(),
+        )
+        if host_indices is None:
+            # Determine eviction permission based on the node's ref tier
+            allow_high = (node.high_ref > 0)
+            self.evict_host(len(node.value), allow_high=allow_high)
+            host_indices = self.cache_controller.write(
+                device_indices=node.value,
+                node_id=node.id,
+                **self._get_extra_pools(),
+            )
+        if host_indices is not None:
+            node.host_value = host_indices.clone()
+            assert len(node.host_value) > 0
+            self.ongoing_write_through[node.id] = node
+            if not write_back:
+                self.inc_lock_ref(node)
+        else:
+            return 0
+
+        return len(host_indices)
+
     # --- Explicit ref management for RL multi-turn ---
 
     def register_ref(self, req: Req):
@@ -295,11 +384,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         is_first_turn = getattr(req, "is_first_turn", False)
 
         if rid not in self.rid_to_ref_info:
-            if not is_first_turn:
-                logger.warning(
-                    "register_ref: rid %s not found but is_first_turn=False, treating as first turn",
-                    rid,
-                )
             self.rid_to_ref_info[rid] = RefInfo(is_high=is_high)
 
         ref_info = self.rid_to_ref_info[rid]
@@ -314,15 +398,12 @@ class RefAwareHiRadixCache(HiRadixCache):
         if len(radix_key) == 0:
             return
 
-        # Walk the tree to find all nodes for this token sequence
         nodes_on_path = self._collect_nodes_on_path(radix_key)
 
-        if is_first_turn or not ref_info.nodes:
-            # First turn: inc ref on ALL nodes in the path
-            new_nodes = set(nodes_on_path) - ref_info.nodes
-        else:
-            # Subsequent turn: inc ref only on NEW nodes (extend part)
-            new_nodes = set(nodes_on_path) - ref_info.nodes
+        # For non-first turn: set difference gives only NEW nodes (extend part).
+        # If previous cache was fully evicted (ref_info.nodes all gone),
+        # set difference = all nodes on path, which correctly re-adds ref to all tokens.
+        new_nodes = set(nodes_on_path) - ref_info.nodes
 
         for node in new_nodes:
             self._inc_priority_ref_single(node, is_high)
