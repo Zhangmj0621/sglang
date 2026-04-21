@@ -61,6 +61,7 @@ if is_flashinfer_available():
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
+    DYNAMIC_CACHE = auto()
 
 
 @dataclass
@@ -157,12 +158,18 @@ class FlashInferAttnBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
+        self.enable_dynamic_kvcache_layout = (
+            model_runner.server_args.enable_dynamic_kvcache_layout
+        )
         if model_runner.sliding_window_size is not None:
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
         elif model_runner.model_config.is_encoder_decoder:
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.CROSS_ATTENTION
+        elif self.enable_dynamic_kvcache_layout:
+            self.num_wrappers = 2
+            self.dispatch_reason = WrapperDispatch.DYNAMIC_CACHE
         else:
             self.num_wrappers = 1
             self.dispatch_reason = None
@@ -779,7 +786,7 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer)
+            self._get_wrapper_idx(layer, forward_batch)
         ]
         cache_loc = (
             forward_batch.out_cache_loc
@@ -893,7 +900,7 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
+            self._get_wrapper_idx(layer, forward_batch)
         ]
         cache_loc = (
             forward_batch.out_cache_loc
@@ -921,7 +928,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    def _get_wrapper_idx(self, layer: RadixAttention):
+    def _get_wrapper_idx(self, layer: RadixAttention, forward_batch=None):
         if self.num_wrappers == 1:
             return 0
 
@@ -929,6 +936,13 @@ class FlashInferAttnBackend(AttentionBackend):
             return layer.sliding_window_size == -1
         if self.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
             return layer.is_cross_attention
+        if self.dispatch_reason == WrapperDispatch.DYNAMIC_CACHE:
+            schedule = (
+                forward_batch.forward_layer_schedule if forward_batch else None
+            )
+            if schedule is not None and not schedule.is_resident(layer.layer_id):
+                return 1  # dynamic wrapper
+            return 0  # primary wrapper
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
 
@@ -952,6 +966,7 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dynamic_req_to_token = model_runner.req_to_token_pool.dynamic_req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
 
         # Dispatch the update function
@@ -959,6 +974,8 @@ class FlashInferIndicesUpdaterDecode:
             self.update = self.update_sliding_window
         elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
             self.update = self.update_cross_attention
+        elif self.attn_backend.dispatch_reason == WrapperDispatch.DYNAMIC_CACHE:
+            self.update = self.update_dynamic_cache
         else:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
@@ -1003,6 +1020,48 @@ class FlashInferIndicesUpdaterDecode:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+
+    def update_dynamic_cache(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_sum: int,
+        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInput],
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: Optional[bool] = None,
+    ):
+        decode_wrappers = decode_wrappers or self.decode_wrappers
+        # wrapper[0]: primary (resident layers)
+        self.call_begin_forward(
+            decode_wrappers[0],
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            self.kv_indptr[0],
+            None,
+            spec_info,
+            seq_lens_cpu,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+        )
+        # wrapper[1]: dynamic (non-resident layers)
+        if self.dynamic_req_to_token is not None:
+            self.call_begin_forward(
+                decode_wrappers[1],
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                self.kv_indptr[1],
+                None,
+                spec_info,
+                seq_lens_cpu,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                req_to_token_override=self.dynamic_req_to_token,
+            )
 
     def update_sliding_window(
         self,
@@ -1104,6 +1163,7 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        req_to_token_override: Optional[torch.Tensor] = None,
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
@@ -1118,14 +1178,19 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
+            req_to_token_buf = (
+                req_to_token_override
+                if req_to_token_override is not None
+                else self.req_to_token
+            )
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
+                req_to_token_buf,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
                 kv_indices,
-                self.req_to_token.shape[1],
+                req_to_token_buf.shape[1],
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -1217,6 +1282,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dynamic_req_to_token = model_runner.req_to_token_pool.dynamic_req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
@@ -1225,6 +1291,8 @@ class FlashInferIndicesUpdaterPrefill:
             self.update = self.update_sliding_window
         elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
             self.update = self.update_cross_attention
+        elif self.attn_backend.dispatch_reason == WrapperDispatch.DYNAMIC_CACHE:
+            self.update = self.update_dynamic_cache
         else:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
@@ -1284,6 +1352,63 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
         )
+
+    def update_dynamic_cache(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        use_ragged: bool,
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInput],
+        fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
+    ):
+        if use_ragged:
+            paged_kernel_lens = prefix_lens
+            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+        else:
+            paged_kernel_lens = seq_lens
+            paged_kernel_lens_sum = seq_lens_sum
+
+        # wrapper[0]: primary (resident layers)
+        self.call_begin_forward(
+            self.prefill_wrapper_ragged,
+            prefill_wrappers[0],
+            req_pool_indices,
+            paged_kernel_lens,
+            paged_kernel_lens_sum,
+            seq_lens,
+            prefix_lens,
+            None,
+            self.kv_indptr[0],
+            self.qo_indptr[0],
+            use_ragged,
+            spec_info,
+            fixed_split_size=fixed_split_size,
+            multi_item_params=multi_item_params,
+        )
+        # wrapper[1]: dynamic (non-resident layers)
+        if self.dynamic_req_to_token is not None:
+            self.call_begin_forward(
+                None,
+                prefill_wrappers[1],
+                req_pool_indices,
+                paged_kernel_lens,
+                paged_kernel_lens_sum,
+                seq_lens,
+                prefix_lens,
+                None,
+                self.kv_indptr[1],
+                self.qo_indptr[1],
+                False,
+                spec_info,
+                fixed_split_size=fixed_split_size,
+                req_to_token_override=self.dynamic_req_to_token,
+            )
 
     def update_sliding_window(
         self,
@@ -1393,6 +1518,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        req_to_token_override: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1410,14 +1536,19 @@ class FlashInferIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
+            req_to_token_buf = (
+                req_to_token_override
+                if req_to_token_override is not None
+                else self.req_to_token
+            )
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
+                req_to_token_buf,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
                 kv_indices,
-                self.req_to_token.shape[1],
+                req_to_token_buf.shape[1],
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]

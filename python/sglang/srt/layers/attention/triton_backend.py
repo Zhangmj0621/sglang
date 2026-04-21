@@ -54,6 +54,9 @@ class ForwardMetadata:
     window_kv_offsets: torch.Tensor
     # Separate attn_logits for SWA layers when v_head_dim differs
     swa_attn_logits: Optional[torch.Tensor] = None
+    # Dynamic KV cache: indices for non-resident layers
+    dynamic_kv_indptr: Optional[torch.Tensor] = None
+    dynamic_kv_indices: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -196,6 +199,29 @@ class TritonAttnBackend(AttentionBackend):
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
 
+    def _get_kv_indices_for_layer(self, layer, forward_batch):
+        """Get kv_indptr/kv_indices with per-layer offset for dynamic layout."""
+        schedule = forward_batch.forward_layer_schedule
+        if schedule is not None:
+            pool_stride = forward_batch.token_to_kv_pool.pool_stride
+            if schedule.is_resident(layer.layer_id):
+                layer_offset = layer.layer_id // schedule.stride
+                base_indptr = self.forward_metadata.kv_indptr
+                base_indices = self.forward_metadata.kv_indices
+                return base_indptr, base_indices + layer_offset * pool_stride
+            else:
+                dyn_pos = schedule.get_dyn_pos(layer.layer_id)
+                dyn_indptr = self.forward_metadata.dynamic_kv_indptr
+                dyn_indices = self.forward_metadata.dynamic_kv_indices
+                if dyn_indptr is not None and dyn_indices is not None:
+                    return dyn_indptr, dyn_indices + dyn_pos * pool_stride
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            return (
+                self.forward_metadata.window_kv_indptr,
+                self.forward_metadata.window_kv_indices,
+            )
+        return self.forward_metadata.kv_indptr, self.forward_metadata.kv_indices
+
         self.cuda_graph_custom_mask = None
 
     def get_num_kv_splits(
@@ -260,6 +286,8 @@ class TritonAttnBackend(AttentionBackend):
         window_num_kv_splits = None
         window_kv_offsets = None
         swa_attn_logits = None
+        dynamic_kv_indptr = None
+        dynamic_kv_indices = None
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -278,6 +306,24 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Dynamic KV cache: build indices from dynamic_req_to_token
+                dynamic_kv_indptr = None
+                dynamic_kv_indices = None
+                if (
+                    forward_batch.forward_layer_schedule is not None
+                    and forward_batch.req_to_token_pool.dynamic_req_to_token is not None
+                ):
+                    dynamic_kv_indptr = kv_indptr  # same topology
+                    dynamic_kv_indices = torch.empty_like(kv_indices)
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        forward_batch.req_to_token_pool.dynamic_req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        dynamic_kv_indptr,
+                        None,
+                        dynamic_kv_indices,
+                        forward_batch.req_to_token_pool.dynamic_req_to_token.stride(0),
+                    )
                 # Sliding window
                 if (
                     self.sliding_window_size is not None
@@ -463,6 +509,8 @@ class TritonAttnBackend(AttentionBackend):
             window_num_kv_splits,
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
+            dynamic_kv_indptr=dynamic_kv_indptr,
+            dynamic_kv_indices=dynamic_kv_indices,
         )
 
     def init_cuda_graph_state(
@@ -702,6 +750,8 @@ class TritonAttnBackend(AttentionBackend):
             window_num_kv_splits,
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
+            dynamic_kv_indptr=dynamic_kv_indptr,
+            dynamic_kv_indices=dynamic_kv_indices,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -914,7 +964,18 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # Normal mode: use original 2-stage kernel
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        # Dynamic KV cache: non-resident layers use dynamic indices
+        schedule = forward_batch.forward_layer_schedule
+        if (
+            schedule is not None
+            and not schedule.is_resident(layer.layer_id)
+            and self.forward_metadata.dynamic_kv_indices is not None
+        ):
+            sliding_window_size = -1
+            kv_indptr = self.forward_metadata.dynamic_kv_indptr
+            kv_indices = self.forward_metadata.dynamic_kv_indices
+            window_kv_offsets = None
+        elif layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             sliding_window_size = (
                 layer.sliding_window_size
             )  # Needed for sliding window mask
@@ -974,6 +1035,7 @@ class TritonAttnBackend(AttentionBackend):
         Both prefix and extend KV are accessed through unified kv_indices.
         """
         bs = forward_batch.batch_size
+        schedule = forward_batch.forward_layer_schedule
 
         # Determine sliding window settings
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -1001,6 +1063,15 @@ class TritonAttnBackend(AttentionBackend):
                     window_start_pos = extend_prefix_lens - window_kv_lens
                 else:
                     window_start_pos = None
+        elif (
+            schedule is not None
+            and not schedule.is_resident(layer.layer_id)
+            and self.forward_metadata.dynamic_kv_indices is not None
+        ):
+            sliding_window_size = -1
+            prefix_kv_indptr = self.forward_metadata.dynamic_kv_indptr
+            prefix_kv_indices = self.forward_metadata.dynamic_kv_indices
+            window_start_pos = None
         else:
             sliding_window_size = -1
             prefix_kv_indptr = self.forward_metadata.kv_indptr
@@ -1129,12 +1200,7 @@ class TritonAttnBackend(AttentionBackend):
                     layer.v_scale,
                 )
 
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
-        else:
-            kv_indptr = self.forward_metadata.kv_indptr
-            kv_indices = self.forward_metadata.kv_indices
+        kv_indptr, kv_indices = self._get_kv_indices_for_layer(layer, forward_batch)
 
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float

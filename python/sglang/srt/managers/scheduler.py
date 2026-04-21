@@ -827,11 +827,20 @@ class Scheduler(
                         params=params, server_args=server_args
                     )
                 else:
-                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                    if server_args.enable_dynamic_kvcache_layout:
+                        from sglang.srt.mem_cache.dynamic_hiradix_cache import (
+                            DynamicHiRadixCache,
+                        )
 
-                    self.tree_cache = HiRadixCache(
-                        params=params, server_args=server_args
-                    )
+                        self.tree_cache = DynamicHiRadixCache(
+                            params=params, server_args=server_args
+                        )
+                    else:
+                        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                        self.tree_cache = HiRadixCache(
+                            params=params, server_args=server_args
+                        )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
@@ -1820,6 +1829,7 @@ class Scheduler(
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
+                is_high_priority=recv_req.is_high_priority,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
@@ -2581,6 +2591,17 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        if self.server_args.enable_dynamic_kvcache_layout:
+            from sglang.srt.managers.dynamic_cache_controller import (
+                ForwardLayerSchedule,
+            )
+
+            slot_width = self.token_to_kv_pool_allocator.high_current_slot_width
+            layer_num = self.token_to_kv_pool_allocator.layer_num
+            new_batch.forward_layer_schedule = ForwardLayerSchedule(
+                layer_num, slot_width
+            )
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
@@ -2693,6 +2714,18 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
+
+        if self.server_args.enable_dynamic_kvcache_layout:
+            from sglang.srt.managers.dynamic_cache_controller import (
+                ForwardLayerSchedule,
+            )
+
+            slot_width = self.token_to_kv_pool_allocator.high_current_slot_width
+            layer_num = self.token_to_kv_pool_allocator.layer_num
+            batch.forward_layer_schedule = ForwardLayerSchedule(
+                layer_num, slot_width
+            )
+
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):

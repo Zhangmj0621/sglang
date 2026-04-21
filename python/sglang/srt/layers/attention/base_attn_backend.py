@@ -91,8 +91,26 @@ class AttentionBackend(ABC):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_decode():
-            return self.forward_decode(
+
+        # Dynamic KV cache layout: compute per-layer flat cache_loc
+        schedule = forward_batch.forward_layer_schedule
+        original_cache_loc = None
+        if schedule is not None:
+            pool_stride = forward_batch.token_to_kv_pool.pool_stride
+            original_cache_loc = forward_batch.out_cache_loc
+            if schedule.is_resident(layer.layer_id):
+                layer_offset = layer.layer_id // schedule.stride
+                forward_batch.out_cache_loc = (
+                    original_cache_loc + layer_offset * pool_stride
+                )
+            else:
+                dyn_pos = schedule.get_dyn_pos(layer.layer_id)
+                forward_batch.out_cache_loc = (
+                    forward_batch.dynamic_indices + dyn_pos * pool_stride
+                )
+
+        if forward_batch.forward_mode.is_decode():
+            result = self.forward_decode(
                 q,
                 k,
                 v,
@@ -102,7 +120,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         elif forward_batch.forward_mode.is_mixed() and is_npu():
-            return self.forward_mixed(
+            result = self.forward_mixed(
                 q,
                 k,
                 v,
@@ -112,7 +130,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         else:
-            return self.forward_extend(
+            result = self.forward_extend(
                 q,
                 k,
                 v,
@@ -121,6 +139,11 @@ class AttentionBackend(ABC):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+
+        if original_cache_loc is not None:
+            forward_batch.out_cache_loc = original_cache_loc
+
+        return result
 
     def forward_decode(
         self,

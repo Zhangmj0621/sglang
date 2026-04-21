@@ -574,6 +574,9 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # Dynamic KV cache layout
+    enable_dynamic_kvcache_layout: bool = False
+
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
@@ -3637,6 +3640,11 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_dynamic_kvcache_layout and not self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-dynamic-kvcache-layout requires --enable-hierarchical-cache to be enabled."
+            )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -5462,6 +5470,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+
+        # Dynamic KV cache layout
+        parser.add_argument(
+            "--enable-dynamic-kvcache-layout",
+            action="store_true",
+            help="Enable dynamic KV cache layout with per-request priority. "
+            "Requires --enable-hierarchical-cache and MHA attention only.",
         )
 
         # Hierarchical sparse attention

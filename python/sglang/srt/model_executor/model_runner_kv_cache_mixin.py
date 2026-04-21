@@ -276,6 +276,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_dynamic_kvcache_layout=self.server_args.enable_dynamic_kvcache_layout,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.

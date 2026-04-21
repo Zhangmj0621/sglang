@@ -509,6 +509,122 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def backup_from_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ):
+        """Backup KV data from device to host for a single layer (D2H).
+
+        Mirrors load_to_device_per_layer with src/dst swapped.
+        """
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=self.k_buffer[layer_id],
+                        v_cache_dst=self.v_buffer[layer_id],
+                        k_cache_src=device_pool.k_buffer[layer_id],
+                        v_cache_src=device_pool.v_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer(
+                        src_k=device_pool.k_buffer[layer_id],
+                        dst_k=self.k_buffer[layer_id],
+                        src_v=device_pool.v_buffer[layer_id],
+                        dst_v=self.v_buffer[layer_id],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                    )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=self.k_data_refs[layer_id],
+                        v_cache_dst=self.v_data_refs[layer_id],
+                        k_cache_src=device_pool.k_buffer[layer_id],
+                        v_cache_src=device_pool.v_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_pf_lf(
+                        src_k=device_pool.k_buffer[layer_id],
+                        dst_k=self.k_buffer,
+                        src_v=device_pool.v_buffer[layer_id],
+                        dst_v=self.v_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
+            elif self.layout == "page_head":
+                transfer_kv_per_layer_ph_lf(
+                    src_k=device_pool.k_buffer[layer_id],
+                    dst_k=self.k_buffer,
+                    src_v=device_pool.v_buffer[layer_id],
+                    dst_v=self.v_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    layer_id=layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim,
+                    page_size=self.page_size,
+                    head_num=self.head_num,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[
+                        device_pool.k_buffer[layer_id],
+                        device_pool.v_buffer[layer_id],
+                    ],
+                    dst_layers=[self.k_buffer[layer_id], self.v_buffer[layer_id]],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[
+                        device_pool.k_buffer[layer_id],
+                        device_pool.v_buffer[layer_id],
+                    ],
+                    dst_ptrs=[self.k_buffer, self.v_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    layer_id=layer_id,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "kernel_ascend":
+            if self.layout == "page_first_direct":
+                transfer_kv_dim_exchange(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    device_k=device_pool.k_buffer,
+                    host_k=self.k_buffer,
+                    device_v=device_pool.v_buffer,
+                    host_v=self.v_buffer,
+                    page_size=self.page_size,
+                    direction=TransferDirection.D2H,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):

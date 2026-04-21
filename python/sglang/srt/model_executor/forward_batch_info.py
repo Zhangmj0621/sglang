@@ -374,6 +374,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
+    # Dynamic KV cache layout (only set when slot_width < layer_num)
+    dynamic_indices: Optional[torch.Tensor] = None
+    forward_layer_schedule: object = None
+
     # For DP attention
     original_global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
@@ -473,6 +477,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
+            dynamic_indices=batch.dynamic_indices,
+            forward_layer_schedule=batch.forward_layer_schedule,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,

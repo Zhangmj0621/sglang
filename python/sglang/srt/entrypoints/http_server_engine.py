@@ -134,6 +134,38 @@ class HttpServerEngineAdapter(EngineBase):
 
         return self._make_request("generate", payload)
 
+    def generate_with_priority(
+        self,
+        prompt=None,
+        sampling_params=None,
+        input_ids=None,
+        image_data=None,
+        return_logprob=False,
+        logprob_start_len=None,
+        top_logprobs_num=None,
+        token_ids_logprob=None,
+        lora_path=None,
+        custom_logit_processor=None,
+        priority=None,
+        is_high_priority=None,
+    ):
+        payload = {
+            "text": prompt,
+            "sampling_params": sampling_params,
+            "input_ids": input_ids,
+            "image_data": image_data,
+            "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
+            "top_logprobs_num": top_logprobs_num,
+            "token_ids_logprob": token_ids_logprob,
+            "lora_path": lora_path,
+            "custom_logit_processor": custom_logit_processor,
+            "priority": priority,
+            "is_high_priority": is_high_priority,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        return self._make_request("generate", payload)
+
     def release_memory_occupation(self):
         return self._make_request("release_memory_occupation")
 

@@ -588,6 +588,7 @@ class Req(ReqDllmMixin):
         disagg_prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
+        is_high_priority: Optional[bool] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
@@ -691,6 +692,7 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        self.is_high_priority = is_high_priority
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -1351,6 +1353,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # Dynamic KV cache indices (only set when using DynamicPagedTokenToKVPoolAllocator)
+    dynamic_indices: torch.Tensor = None
+    # Forward layer schedule for dynamic KV cache streaming
+    forward_layer_schedule: object = None
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -2425,6 +2431,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
+            dynamic_indices=self.dynamic_indices,
+            forward_layer_schedule=self.forward_layer_schedule,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -2618,6 +2626,10 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+
+    # Dynamic KV cache layout
+    dynamic_indices: Optional[torch.Tensor] = None
+    forward_layer_schedule: object = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

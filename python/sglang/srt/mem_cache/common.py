@@ -202,6 +202,7 @@ def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
+    is_high_priority=None,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -210,7 +211,14 @@ def alloc_token_slots(
     if backup_state:
         state = allocator.backup_state()
 
-    out_cache_loc = allocator.alloc(num_tokens)
+    extra_kwargs = {}
+    if is_high_priority is not None:
+        extra_kwargs["is_high_priority"] = is_high_priority
+    out_cache_loc = allocator.alloc(num_tokens, **extra_kwargs)
+
+    dynamic_indices = None
+    if isinstance(out_cache_loc, tuple):
+        out_cache_loc, dynamic_indices = out_cache_loc
 
     if out_cache_loc is None:
         error_msg = (
@@ -223,6 +231,10 @@ def alloc_token_slots(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    if dynamic_indices is not None:
+        if backup_state:
+            return (out_cache_loc, dynamic_indices, state)
+        return (out_cache_loc, dynamic_indices)
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
@@ -261,6 +273,7 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     backup_state: bool = False,
+    is_high_priority=None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -271,6 +284,9 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
+    extra_kwargs = {}
+    if is_high_priority is not None:
+        extra_kwargs["is_high_priority"] = is_high_priority
     out_cache_loc = allocator.alloc_extend(
         prefix_lens,
         prefix_lens_cpu,
@@ -278,7 +294,12 @@ def alloc_paged_token_slots_extend(
         seq_lens_cpu,
         last_loc,
         extend_num_tokens,
+        **extra_kwargs,
     )
+
+    dynamic_indices = None
+    if isinstance(out_cache_loc, tuple):
+        out_cache_loc, dynamic_indices = out_cache_loc
 
     if out_cache_loc is None:
         error_msg = (
@@ -291,6 +312,10 @@ def alloc_paged_token_slots_extend(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    if dynamic_indices is not None:
+        if backup_state:
+            return (out_cache_loc, dynamic_indices, state)
+        return (out_cache_loc, dynamic_indices)
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
@@ -325,6 +350,16 @@ def alloc_req_slots(
     return req_pool_indices
 
 
+def _build_is_high_priority(reqs):
+    """Build is_high_priority list from batch requests, or None if not set."""
+    if any(r.is_high_priority is not None for r in reqs):
+        return [
+            r.is_high_priority if r.is_high_priority is not None else True
+            for r in reqs
+        ]
+    return None
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
@@ -354,9 +389,14 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
+    is_high_priority = _build_is_high_priority(batch.reqs)
+
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        out_cache_loc = alloc_token_slots(
+            batch.tree_cache, batch.extend_num_tokens,
+            is_high_priority=is_high_priority,
+        )
     else:
         # Paged allocation - build last_loc
         last_loc = [
@@ -371,7 +411,11 @@ def alloc_for_extend(
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
+            is_high_priority=is_high_priority,
         )
+
+    if isinstance(out_cache_loc, tuple):
+        out_cache_loc, batch.dynamic_indices = out_cache_loc
 
     # Write to req_to_token_pool
     write_cache_indices(
@@ -388,6 +432,20 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    # Write dynamic indices to parallel table (for non-resident layer attention)
+    if batch.dynamic_indices is not None and batch.req_to_token_pool.dynamic_req_to_token is not None:
+        pt = 0
+        for i in range(req_pool_indices_cpu.shape[0]):
+            req_idx = req_pool_indices_cpu[i].item()
+            prefix_len = prefix_lens_cpu[i].item()
+            seq_len = batch.seq_lens_cpu[i].item()
+            extend_len = seq_len - prefix_len
+            batch.req_to_token_pool.write_dynamic(
+                (req_idx, slice(prefix_len, seq_len)),
+                batch.dynamic_indices[pt : pt + extend_len],
+            )
+            pt += extend_len
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
 
@@ -397,6 +455,7 @@ def alloc_paged_token_slots_decode(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     token_per_req: int = 1,
+    is_high_priority=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -404,7 +463,14 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+    extra_kwargs = {}
+    if is_high_priority is not None:
+        extra_kwargs["is_high_priority"] = is_high_priority
+    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc, **extra_kwargs)
+
+    dynamic_indices = None
+    if isinstance(out_cache_loc, tuple):
+        out_cache_loc, dynamic_indices = out_cache_loc
 
     if out_cache_loc is None:
         error_msg = (
@@ -417,6 +483,8 @@ def alloc_paged_token_slots_decode(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    if dynamic_indices is not None:
+        return (out_cache_loc, dynamic_indices)
     return out_cache_loc
 
 
@@ -432,9 +500,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     bs = batch.seq_lens.shape[0]
 
+    is_high_priority = _build_is_high_priority(batch.reqs)
+
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        out_cache_loc = alloc_token_slots(
+            batch.tree_cache, bs * token_per_req,
+            is_high_priority=is_high_priority,
+        )
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
@@ -447,7 +520,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
             last_loc=last_loc,
             token_per_req=token_per_req,
+            is_high_priority=is_high_priority,
         )
+
+    if isinstance(out_cache_loc, tuple):
+        out_cache_loc, batch.dynamic_indices = out_cache_loc
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
@@ -458,6 +535,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
+
+    if batch.dynamic_indices is not None and batch.req_to_token_pool.dynamic_req_to_token is not None:
+        batch.req_to_token_pool.write_dynamic(
+            (batch.req_pool_indices, locs), batch.dynamic_indices.to(torch.int32)
+        )
 
     return out_cache_loc
 

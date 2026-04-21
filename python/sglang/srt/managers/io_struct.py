@@ -218,6 +218,9 @@ class GenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Whether the request is high priority for KV cache allocation
+    is_high_priority: Optional[bool] = None
+
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -753,6 +756,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Priority for the request
     priority: Optional[int] = None
+
+    # Whether the request is high priority for KV cache allocation
+    is_high_priority: Optional[bool] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
