@@ -484,7 +484,7 @@ class PrefillAdder:
         cache = self.tree_cache
         assert isinstance(cache, RefAwareHiRadixCache)
         available = self.token_to_kv_pool_allocator.available_size()
-        evictable = cache.evictable_size_by_tier(
+        evictable = cache.safe_evictable_size_by_tier(
             allow_low=True,
             allow_high=is_high,
         )

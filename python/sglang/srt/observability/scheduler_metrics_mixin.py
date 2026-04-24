@@ -53,6 +53,10 @@ class PrefillStats:
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
     num_pending_tokens: int = 0
+    num_new_high_priority_reqs: int = 0
+    num_new_low_priority_reqs: int = 0
+    num_new_unknown_priority_reqs: int = 0
+    new_priority_dist: Optional[dict] = None
 
     @classmethod
     def from_adder(
@@ -60,8 +64,16 @@ class PrefillStats:
         adder: PrefillAdder,
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
+        high_priority_threshold: int = 1,
         num_pending_tokens: int = 0,
     ):
+        (
+            num_new_high_priority_reqs,
+            num_new_low_priority_reqs,
+            num_new_unknown_priority_reqs,
+        ) = _count_high_low_priority_reqs(
+            adder.can_run_list, enable_priority_scheduling, high_priority_threshold
+        )
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
@@ -71,7 +83,43 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            num_new_high_priority_reqs=num_new_high_priority_reqs,
+            num_new_low_priority_reqs=num_new_low_priority_reqs,
+            num_new_unknown_priority_reqs=num_new_unknown_priority_reqs,
+            new_priority_dist=QueueCount.from_reqs(
+                adder.can_run_list, enable_priority_scheduling
+            ).by_priority,
         )
+
+
+def _count_high_low_priority_reqs(
+    reqs: List[Req],
+    enable_priority_scheduling: bool,
+    high_priority_threshold: int,
+) -> Tuple[int, int, int]:
+    if not enable_priority_scheduling:
+        return 0, 0, 0
+
+    high_priority_count = 0
+    low_priority_count = 0
+    unknown_priority_count = 0
+
+    for req in reqs:
+        if req.priority is None:
+            unknown_priority_count += 1
+        elif req.priority >= high_priority_threshold:
+            high_priority_count += 1
+        else:
+            low_priority_count += 1
+
+    return high_priority_count, low_priority_count, unknown_priority_count
+
+
+def _format_priority_dist(priority_dist: Optional[dict]) -> str:
+    if not priority_dist:
+        return "{}"
+    items = ", ".join(f"{k}:{v}" for k, v in sorted(priority_dist.items()))
+    return "{" + items + "}"
 
 
 class KvMetrics:
@@ -359,8 +407,16 @@ class SchedulerMetricsMixin:
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.waiting_queue)}, "
+            f"#prefill-high-req: {prefill_stats.num_new_high_priority_reqs}, "
+            f"#prefill-low-req: {prefill_stats.num_new_low_priority_reqs}, "
+            f"#prefill-priority-dist: {_format_priority_dist(prefill_stats.new_priority_dist)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
+        if prefill_stats.num_new_unknown_priority_reqs > 0:
+            msg += (
+                f"#prefill-unknown-priority-req: "
+                f"{prefill_stats.num_new_unknown_priority_reqs}, "
+            )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -507,6 +563,15 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
         num_running_reqs_offline_batch = 0
+        (
+            num_decode_high_priority_reqs,
+            num_decode_low_priority_reqs,
+            num_decode_unknown_priority_reqs,
+        ) = _count_high_low_priority_reqs(
+            batch.reqs,
+            self.enable_priority_scheduling,
+            self.high_priority_threshold,
+        )
 
         pool_stats = self.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
@@ -566,8 +631,16 @@ class SchedulerMetricsMixin:
         msg += (
             f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+            f"#queue-req: {len(self.waiting_queue)}, "
+            f"#decode-high-req: {num_decode_high_priority_reqs}, "
+            f"#decode-low-req: {num_decode_low_priority_reqs}, "
+            f"#decode-priority-dist: {_format_priority_dist(QueueCount.from_reqs(batch.reqs, self.enable_priority_scheduling).by_priority)}"
         )
+        if num_decode_unknown_priority_reqs > 0:
+            msg += (
+                f", #decode-unknown-priority-req: "
+                f"{num_decode_unknown_priority_reqs}"
+            )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency

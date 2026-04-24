@@ -2504,6 +2504,13 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        has_waiting_high_priority = False
+        if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
+            has_waiting_high_priority = any(
+                (req.priority or 0) >= self.high_priority_threshold
+                for req in self.waiting_queue
+            )
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2524,7 +2531,24 @@ class Scheduler(
             high_priority_threshold=self.high_priority_threshold,
         )
 
-        if self.chunked_req is not None:
+        defer_low_priority_chunked_req = (
+            self.chunked_req is not None
+            and self.enable_priority_scheduling
+            and self.enable_ref_aware_kv_buffer
+            and has_waiting_high_priority
+            and (self.chunked_req.priority or 0) < self.high_priority_threshold
+        )
+
+        deferred_chunked_req = None
+        if defer_low_priority_chunked_req:
+            deferred_chunked_req = self.chunked_req
+            self.chunked_req = None
+
+        batch_priority_is_high = None
+        if self.chunked_req is not None and not defer_low_priority_chunked_req:
+            batch_priority_is_high = (
+                (self.chunked_req.priority or 0) >= self.high_priority_threshold
+            )
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -2533,6 +2557,13 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
+                req_is_high = (req.priority or 0) >= self.high_priority_threshold
+                if batch_priority_is_high is None and has_waiting_high_priority and not req_is_high:
+                    break
+                if batch_priority_is_high is not None and req_is_high != batch_priority_is_high:
+                    break
+
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2550,7 +2581,14 @@ class Scheduler(
                         continue
 
             running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            req_slot_capacity = self.req_to_token_pool.available_size()
+            if self.chunked_req is not None and self.chunked_req.req_pool_idx is not None:
+                # A chunked request already owns a req slot and can reuse it in this batch.
+                req_slot_capacity += 1
+
+            if len(adder.can_run_list) >= min(
+                self.get_num_allocatable_reqs(running_bs), req_slot_capacity
+            ):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -2585,6 +2623,16 @@ class Scheduler(
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
+            if (
+                res == AddReqResult.CONTINUE
+                and batch_priority_is_high is None
+                and self.enable_priority_scheduling
+                and self.enable_ref_aware_kv_buffer
+            ):
+                batch_priority_is_high = (
+                    (req.priority or 0) >= self.high_priority_threshold
+                )
+
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -2605,6 +2653,8 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        if deferred_chunked_req is not None:
+            self._add_request_to_queue(deferred_chunked_req)
         if len(can_run_list) == 0:
             return None
 
@@ -2654,6 +2704,7 @@ class Scheduler(
             adder,
             self.running_batch.reqs,
             self.enable_priority_scheduling,
+            high_priority_threshold=self.high_priority_threshold,
             num_pending_tokens=self._get_num_pending_tokens(
                 chunk_deduct=(
                     self.chunked_req.extend_input_len

@@ -1640,9 +1640,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
-        )
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            allow_high = any(
+                (req.priority or 0) >= self.tree_cache.high_priority_threshold
+                for req in reqs
+            )
+            with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
+                out_cache_loc, req_pool_indices_tensor, req_pool_indices = (
+                    alloc_for_extend(self)
+                )
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+                self
+            )
 
         # Set fields
         input_embeds = []
