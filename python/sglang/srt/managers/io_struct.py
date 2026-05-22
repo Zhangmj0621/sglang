@@ -218,9 +218,6 @@ class GenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Whether this is the first turn of a multi-turn rollout (for ref-aware KV cache)
-    is_first_turn: bool = False
-
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -756,9 +753,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Priority for the request
     priority: Optional[int] = None
-
-    # Whether this is the first turn of a multi-turn rollout (for ref-aware KV cache)
-    is_first_turn: bool = False
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None

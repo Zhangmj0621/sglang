@@ -43,7 +43,6 @@ async def send_generate(
     output_len: int,
     rid: str,
     priority: int,
-    is_first_turn: bool,
     request_log_metrics: bool,
 ) -> TurnResult:
     payload = {
@@ -55,7 +54,6 @@ async def send_generate(
             "ignore_eos": True,
         },
         "priority": priority,
-        "is_first_turn": is_first_turn,
     }
     if request_log_metrics:
         payload["log_metrics"] = True
@@ -211,7 +209,6 @@ async def run_one_rollout(
     turn_results = []
 
     for turn in range(num_turns):
-        is_first_turn = turn == 0
         async with semaphore:
             result = await send_generate(
                 generate_url,
@@ -219,7 +216,6 @@ async def run_one_rollout(
                 output_len,
                 rid,
                 priority,
-                is_first_turn,
                 request_log_metrics,
             )
 
