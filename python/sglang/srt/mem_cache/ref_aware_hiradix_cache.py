@@ -633,7 +633,7 @@ class RefAwareHiRadixCache(HiRadixCache):
     def release_ref(self, rid: str) -> Tuple[bool, str]:
         ref_info = self.rid_to_ref_info.pop(rid, None)
         if ref_info is None:
-            return False, f"rid {rid} not found in ref tracking"
+            return True, f"rid {rid} not tracked"
 
         for node in ref_info.nodes:
             self._dec_priority_ref_single(node, ref_info.is_high)

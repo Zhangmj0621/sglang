@@ -341,5 +341,14 @@ class TestUpdateRefPropagatesPriority(unittest.TestCase):
         self.assertEqual(cache.calls, [("r1", 5)])
 
 
+class TestReleaseRefIdempotent(unittest.TestCase):
+    def test_release_unknown_rid_returns_success(self):
+        cache = RefAwareHiRadixCache.__new__(RefAwareHiRadixCache)
+        cache.rid_to_ref_info = {}
+        ok, msg = cache.release_ref("never-registered")
+        self.assertTrue(ok)
+        self.assertIn("not tracked", msg)
+
+
 if __name__ == "__main__":
     unittest.main()
