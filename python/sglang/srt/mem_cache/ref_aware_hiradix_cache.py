@@ -79,15 +79,20 @@ class RefAwareHiRadixCache(HiRadixCache):
         return priority >= self.high_priority_threshold
 
     def _move_node_tier(self, node: TreeNode, old_tier: int, new_tier: int):
+        # Caller (inc/dec_priority_ref / update_ref) has already gated on
+        # `not node.evicted and node.lock_ref == 0`. Assert it instead of
+        # re-checking.
+        assert not node.evicted and node.lock_ref == 0, (
+            "_move_node_tier called for evicted or lock-held node"
+        )
         node_size = len(node.key)
         old_set = self._tier_leaf_set(old_tier)
         new_set = self._tier_leaf_set(new_tier)
         if node in old_set:
             old_set.discard(node)
             new_set.add(node)
-        if not node.evicted and node.lock_ref == 0:
-            self._add_tier_size(old_tier, -node_size)
-            self._add_tier_size(new_tier, node_size)
+        self._add_tier_size(old_tier, -node_size)
+        self._add_tier_size(new_tier, node_size)
 
     def _tier_leaf_set(self, tier: int) -> set:
         if tier == TIER_UNUSED:
