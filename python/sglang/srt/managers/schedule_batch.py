@@ -2042,6 +2042,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 return
             allocator = self.tree_cache.token_to_kv_pool_allocator
             if allocator.available_size() < num_tokens:
+                # Decode-time OOM never evicts high_ref nodes. Prefill admission
+                # already reserved space against safe_evictable_size_by_tier(
+                # allow_high=True), so by construction we should not need
+                # high_ref headroom here. If we do hit OOM, retract is the
+                # recovery path — losing a HP prefix is worse than retracting
+                # a few requests.
                 self.tree_cache._evict_tiered(
                     num_tokens - allocator.available_size(),
                     allow_low=True,
