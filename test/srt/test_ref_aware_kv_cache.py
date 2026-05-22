@@ -350,5 +350,66 @@ class TestReleaseRefIdempotent(unittest.TestCase):
         self.assertIn("not tracked", msg)
 
 
+class TestRefAwareEndToEndAccounting(unittest.TestCase):
+    """register → update → release should leave tier sizes at zero."""
+
+    def _make_cache(self):
+        cache = RefAwareHiRadixCache.__new__(RefAwareHiRadixCache)
+        cache.root_node = TreeNode()
+        cache.root_node.key = RadixKey([])
+        cache.root_node.value = torch.tensor([], dtype=torch.int64)
+        cache.root_node.lock_ref = 1
+        cache.high_priority_threshold = 1
+        cache.unused_evictable_leaves = set()
+        cache.low_ref_evictable_leaves = set()
+        cache.high_ref_evictable_leaves = set()
+        cache.unused_evictable_size_ = 0
+        cache.low_ref_evictable_size_ = 0
+        cache.high_ref_evictable_size_ = 0
+        cache.rid_to_ref_info = {}
+        return cache
+
+    def _append(self, parent, ids):
+        node = TreeNode()
+        node.parent = parent
+        node.key = RadixKey(ids)
+        node.value = torch.tensor(ids, dtype=torch.int64)
+        node.children = {}
+        parent.children[ids[0]] = node
+        return node
+
+    def test_register_update_release_cycle_zeroes_accounting(self):
+        from types import SimpleNamespace
+        cache = self._make_cache()
+        a = self._append(cache.root_node, [1, 2, 3, 4])
+        b = self._append(a, [5, 6, 7, 8])
+        for n in (a, b):
+            cache._account_new_evictable_node(n)
+            cache._update_ref_aware_leaf_status(n)
+
+        # Register as LP first.
+        req = SimpleNamespace(rid="r1", priority=0, last_node=b)
+        cache.register_ref(req)
+        self.assertEqual(cache.unused_evictable_size_, 0)
+        self.assertEqual(cache.low_ref_evictable_size_, 8)
+        self.assertEqual(cache.high_ref_evictable_size_, 0)
+
+        # Promote to HP.
+        ok, _ = cache.update_ref("r1", 5)
+        self.assertTrue(ok)
+        self.assertEqual(cache.low_ref_evictable_size_, 0)
+        self.assertEqual(cache.high_ref_evictable_size_, 8)
+
+        # Release.
+        ok, _ = cache.release_ref("r1")
+        self.assertTrue(ok)
+        self.assertEqual(cache.unused_evictable_size_, 8)
+        self.assertEqual(cache.low_ref_evictable_size_, 0)
+        self.assertEqual(cache.high_ref_evictable_size_, 0)
+        self.assertEqual(cache.rid_to_ref_info, {})
+        self.assertEqual(a.tracked_rids, set())
+        self.assertEqual(b.tracked_rids, set())
+
+
 if __name__ == "__main__":
     unittest.main()
