@@ -3123,12 +3123,29 @@ class Scheduler(
         return ReleaseRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
 
     def handle_update_ref(self, recv_req: UpdateRefReqInput):
-        if self.enable_ref_aware_kv_buffer:
-            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
-            if isinstance(self.tree_cache, RefAwareHiRadixCache):
-                success, msg = self.tree_cache.update_ref(recv_req.rid, recv_req.new_priority)
-                return UpdateRefReqOutput(success=success, message=msg)
-        return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+        if not self.enable_ref_aware_kv_buffer:
+            return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+            return UpdateRefReqOutput(success=False, message="ref-aware KV buffer not enabled")
+
+        # Propagate priority into every in-flight Req with this rid BEFORE
+        # touching tier accounting, so concurrent prefill iterations always
+        # see a (req.priority, tier) pair that is internally consistent.
+        rid = recv_req.rid
+        new_priority = recv_req.new_priority
+        for req in getattr(self.running_batch, "reqs", []) or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        for req in self.waiting_queue or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None and getattr(chunked, "rid", None) == rid:
+            chunked.priority = new_priority
+
+        success, msg = self.tree_cache.update_ref(rid, new_priority)
+        return UpdateRefReqOutput(success=success, message=msg)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

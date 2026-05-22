@@ -301,5 +301,45 @@ class TestRefAwareHostSafety(unittest.TestCase):
         self.assertEqual(cache.cache_controller.evicted_host_lengths, [])
 
 
+class TestUpdateRefPropagatesPriority(unittest.TestCase):
+    def test_update_ref_writes_back_priority_to_running_and_waiting_reqs(self):
+        from types import SimpleNamespace
+        from sglang.srt.managers.io_struct import UpdateRefReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        # Build a minimal scheduler stub that exposes only the fields
+        # handle_update_ref reads.
+        sched = Scheduler.__new__(Scheduler)
+        sched.enable_ref_aware_kv_buffer = True
+
+        class _FakeCache:
+            def __init__(self):
+                self.calls = []
+            def update_ref(self, rid, new_priority):
+                self.calls.append((rid, new_priority))
+                return True, "ok"
+
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        sched.tree_cache = RefAwareHiRadixCache.__new__(RefAwareHiRadixCache)
+        # Patch the bound method so isinstance(cache, RefAwareHiRadixCache) holds.
+        cache = _FakeCache()
+        sched.tree_cache.update_ref = cache.update_ref  # type: ignore
+
+        running = SimpleNamespace(rid="r1", priority=0)
+        waiting = SimpleNamespace(rid="r1", priority=0)
+        chunked = SimpleNamespace(rid="r2", priority=0)
+        sched.running_batch = SimpleNamespace(reqs=[running])
+        sched.waiting_queue = [waiting]
+        sched.chunked_req = chunked
+
+        out = sched.handle_update_ref(UpdateRefReqInput(rid="r1", new_priority=5))
+        self.assertTrue(out.success)
+        self.assertEqual(running.priority, 5)
+        self.assertEqual(waiting.priority, 5)
+        # rid r2 unchanged
+        self.assertEqual(chunked.priority, 0)
+        self.assertEqual(cache.calls, [("r1", 5)])
+
+
 if __name__ == "__main__":
     unittest.main()
