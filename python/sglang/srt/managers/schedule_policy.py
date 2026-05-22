@@ -613,16 +613,6 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
-    def _req_inc_priority_ref(self, req: Req):
-        if not self.enable_ref_aware_kv_buffer:
-            return
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
-
-        cache = self.tree_cache
-        if isinstance(cache, RefAwareHiRadixCache):
-            is_high = (req.priority or 0) >= self.high_priority_threshold
-            cache.inc_priority_ref(req.last_node, is_high)
-
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()

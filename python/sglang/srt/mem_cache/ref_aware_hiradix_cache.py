@@ -78,32 +78,6 @@ class RefAwareHiRadixCache(HiRadixCache):
     def is_high_priority(self, priority: int) -> bool:
         return priority >= self.high_priority_threshold
 
-    # --- Priority ref management ---
-
-    def inc_priority_ref(self, node: TreeNode, is_high: bool):
-        while node != self.root_node:
-            old_tier = _classify_node_tier(node)
-            if is_high:
-                node.high_ref += 1
-            else:
-                node.low_ref += 1
-            new_tier = _classify_node_tier(node)
-            if not node.evicted and node.lock_ref == 0 and old_tier != new_tier:
-                self._move_node_tier(node, old_tier, new_tier)
-            node = node.parent
-
-    def dec_priority_ref(self, node: TreeNode, is_high: bool):
-        while node != self.root_node:
-            old_tier = _classify_node_tier(node)
-            if is_high:
-                node.high_ref = max(0, node.high_ref - 1)
-            else:
-                node.low_ref = max(0, node.low_ref - 1)
-            new_tier = _classify_node_tier(node)
-            if not node.evicted and node.lock_ref == 0 and old_tier != new_tier:
-                self._move_node_tier(node, old_tier, new_tier)
-            node = node.parent
-
     def _move_node_tier(self, node: TreeNode, old_tier: int, new_tier: int):
         node_size = len(node.key)
         old_set = self._tier_leaf_set(old_tier)
