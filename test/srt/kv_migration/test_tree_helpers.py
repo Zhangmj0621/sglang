@@ -58,6 +58,27 @@ def test_collect_host_pages_partial_match_stops():
     assert pages == [100, 101]
 
 
+def test_collect_host_pages_page_size_gt_1():
+    # Test the page_size > 1 branch: token-level indices are downsampled
+    # and divided by page_size to get page indices.
+    # 8 token-level indices with page_size=2 means 4 pages.
+    root = TreeNode()
+    root.key = RadixKey([])
+    child = _make_node(
+        [10, 11, 12, 13, 14, 15, 16, 17],
+        host_indices=[200, 201, 202, 203, 204, 205, 206, 207],
+        parent=root,
+    )
+    root.children = {10: child}
+    cache = FakeTreeCache(root)
+    pages = collect_host_pages(
+        cache, RadixKey([10, 11, 12, 13, 14, 15, 16, 17]), page_size=2
+    )
+    # host_idx[::2] = [200, 202, 204, 206]
+    # divided by page_size=2 = [100, 101, 102, 103]
+    assert pages == [100, 101, 102, 103]
+
+
 def test_collect_host_pages_not_backuped_raises():
     root = TreeNode()
     root.key = RadixKey([])
