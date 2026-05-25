@@ -3,4 +3,4 @@
 See docs/superpowers/specs/2026-05-25-kv-migration-http-design.md.
 """
 
-# from sglang.srt.kv_migration.manager import KVMigrationManager  # uncommented in Task 8
+from sglang.srt.kv_migration.manager import KVMigrationManager  # noqa: F401
