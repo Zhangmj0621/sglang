@@ -1348,6 +1348,49 @@ class HiRadixCache(RadixCache):
 
         return matched_length
 
+    def _insert_host_only(
+        self,
+        parent_node: "TreeNode",
+        suffix_key: "RadixKey",
+        host_value: "torch.Tensor",
+    ) -> "TreeNode":
+        """Attach a new TreeNode under `parent_node` for `suffix_key` with
+        `host_value` only (`value=None`, evicted-but-backuped state).
+
+        Used by KVMigrationManager.commit when KV pages have been transferred
+        directly into the host pool by RDMA — there is no device copy yet.
+        Subsequent /generate on this server triggers HiCache's standard
+        host→device load path.
+
+        Caller is responsible for ensuring `parent_node` is the correct attach
+        point along the full key path (typically the `last_host_node` from a
+        recent `match_prefix`); this function does not validate.
+
+        Returns the new (deepest) node so the caller can lock-ref it if needed.
+        """
+        assert len(suffix_key) > 0, "suffix_key must be non-empty"
+        assert len(suffix_key) == len(host_value), (
+            f"suffix_key length ({len(suffix_key)}) must equal "
+            f"host_value length ({len(host_value)})"
+        )
+
+        new_node = TreeNode(priority=parent_node.priority)
+        new_node.parent = parent_node
+        new_node.key = suffix_key
+        new_node.value = None
+        new_node.host_value = host_value.clone()
+        new_node.hash_value = None  # KV migration does not use storage-tier hashes
+
+        child_key = self.get_child_key_fn(suffix_key)
+        parent_node.children[child_key] = new_node
+
+        # Mirror the leaf bookkeeping from `_insert_helper_host` (lines 1342-1344)
+        self._update_host_leaf_status(new_node)
+        self._update_leaf_status(parent_node)
+        self._update_host_leaf_status(parent_node)
+
+        return new_node
+
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
