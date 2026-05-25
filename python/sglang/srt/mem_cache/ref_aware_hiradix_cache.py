@@ -136,6 +136,16 @@ class RefAwareHiRadixCache(HiRadixCache):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).add(node)
 
+    def _insert_host_only(self, parent_node, suffix_key, host_value):
+        """Override that ensures RefAware tier sets stay consistent for the
+        new evicted-but-backuped node. Parent class already updates leaf sets
+        via the overridden `_update_leaf_status`; this override is defensive
+        so the new node is explicitly processed by `_update_ref_aware_leaf_status`
+        (no-op for evicted nodes, but keeps the contract explicit)."""
+        new_last_node = super()._insert_host_only(parent_node, suffix_key, host_value)
+        self._update_ref_aware_leaf_status(new_last_node)
+        return new_last_node
+
     # --- Override inc_lock_ref / dec_lock_ref ---
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
