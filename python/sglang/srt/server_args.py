@@ -578,6 +578,10 @@ class ServerArgs:
     enable_ref_aware_kv_buffer: bool = False
     high_priority_threshold: int = 1
 
+    # KV cache migration over HTTP (peer-to-peer between sglang servers)
+    enable_kv_migration: bool = False
+    kv_migration_watchdog_timeout: float = 60.0
+
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
@@ -5653,6 +5657,17 @@ class ServerArgs:
             type=int,
             default=ServerArgs.high_priority_threshold,
             help="Requests with priority >= this threshold are classified as high-priority for ref-aware eviction. Default: 1.",
+        )
+        parser.add_argument(
+            "--enable-kv-migration",
+            action="store_true",
+            help="Enable HTTP-driven KV cache migration between sglang servers.",
+        )
+        parser.add_argument(
+            "--kv-migration-watchdog-timeout",
+            type=float,
+            default=ServerArgs.kv_migration_watchdog_timeout,
+            help="Seconds before an unsubmitted migration's pending allocation is rolled back.",
         )
 
         # Hierarchical sparse attention
