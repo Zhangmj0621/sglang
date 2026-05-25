@@ -1212,6 +1212,93 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class GetTransferSessionInfoReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class GetTransferSessionInfoReqOutput(BaseReq):
+    success: bool
+    tp_rank: int = -1
+    pp_rank: int = -1
+    session_id: str = ""
+    host_kv_data_ptrs: List[int] = field(default_factory=list)
+    host_kv_item_lens: List[int] = field(default_factory=list)
+    page_size: int = 0
+    message: str = ""
+
+
+@dataclass
+class GetRequestExtraTokenSizeReqInput(BaseReq):
+    input_ids: List[int]
+    extra_key: Optional[str] = None
+
+
+@dataclass
+class GetRequestExtraTokenSizeReqOutput(BaseReq):
+    success: bool
+    extra_token_size: int = 0
+    matched_token_size: int = 0
+    total_token_size: int = 0
+    message: str = ""
+
+
+@dataclass
+class AllocateTokenForTransferReqInput(BaseReq):
+    input_ids: List[int]
+    extra_key: Optional[str] = None
+    extra_token_size: int = 0
+    migration_id: Optional[str] = None  # set by HTTP layer to share id across ranks
+
+
+@dataclass
+class AllocateTokenForTransferReqOutput(BaseReq):
+    success: bool
+    migration_id: str = ""
+    tp_rank: int = -1
+    pp_rank: int = -1
+    kv_indices: List[int] = field(default_factory=list)
+    message: str = ""
+
+
+@dataclass
+class TransferRequestKVCacheTarget:
+    tp: int
+    pp: int
+    session_id: str
+    host_kv_data_ptrs: List[int]
+    host_kv_item_lens: List[int]
+    kv_indices: List[int]
+
+
+@dataclass
+class TransferRequestKVCacheReqInput(BaseReq):
+    input_ids: List[int]
+    extra_key: Optional[str] = None
+    matched_token_size: int = 0
+    extra_token_size: int = 0
+    target_per_rank: List[TransferRequestKVCacheTarget] = field(default_factory=list)
+
+
+@dataclass
+class TransferRequestKVCacheReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class CommitTransferRequestKVCacheReqInput(BaseReq):
+    migration_id: str = ""
+
+
+@dataclass
+class CommitTransferRequestKVCacheReqOutput(BaseReq):
+    success: bool
+    matched_after_commit: int = 0
+    message: str = ""
+
+
+@dataclass
 class ReleaseRefReqInput(BaseReq):
     rid: str = ""
 
