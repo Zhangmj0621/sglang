@@ -15,6 +15,8 @@ the prefill/decode pipeline state machine.
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -136,3 +138,133 @@ class KVMigrationManager:
         self, recv_req: GetRequestExtraTokenSizeReqInput
     ) -> GetRequestExtraTokenSizeReqOutput:
         return self.match_extra(recv_req.input_ids, recv_req.extra_key)
+
+    # -- allocate (target side) --
+
+    def allocate(
+        self, recv_req: AllocateTokenForTransferReqInput
+    ) -> AllocateTokenForTransferReqOutput:
+        from sglang.srt.kv_migration.tree_helpers import (
+            dec_host_refs,
+            inc_host_refs_along_path,
+        )
+
+        page = self.page_size
+        total_aligned = (len(recv_req.input_ids) // page) * page
+
+        full_key = RadixKey(
+            recv_req.input_ids[:total_aligned], recv_req.extra_key
+        ).page_aligned(page)
+        match = self.tree_cache.match_prefix(MatchPrefixParams(key=full_key))
+        matched_aligned = len(match.device_indices) + match.host_hit_length
+
+        if matched_aligned + recv_req.extra_token_size != total_aligned:
+            return AllocateTokenForTransferReqOutput(
+                success=False,
+                tp_rank=self.tp_rank,
+                pp_rank=self.pp_rank,
+                message=(
+                    f"matched_aligned ({matched_aligned}) + extra_token_size "
+                    f"({recv_req.extra_token_size}) != total_aligned ({total_aligned})"
+                ),
+            )
+
+        # Lock matched device portion
+        self.tree_cache.inc_lock_ref(match.last_device_node)
+        # Lock matched host portion (returns the touched nodes for later release)
+        host_locked = inc_host_refs_along_path(
+            match.last_host_node, self.tree_cache.root_node
+        )
+
+        host_tail = self.host_pool.alloc(recv_req.extra_token_size)
+        if host_tail is None:
+            self.tree_cache.dec_lock_ref(match.last_device_node)
+            dec_host_refs(host_locked)
+            return AllocateTokenForTransferReqOutput(
+                success=False,
+                tp_rank=self.tp_rank,
+                pp_rank=self.pp_rank,
+                message=f"host pool alloc OOM: requested {recv_req.extra_token_size} tokens",
+            )
+
+        migration_id = recv_req.migration_id or uuid.uuid4().hex
+        self.pending[migration_id] = PendingMigration(
+            input_ids=list(recv_req.input_ids),
+            extra_key=recv_req.extra_key,
+            full_key=full_key,
+            matched_aligned=matched_aligned,
+            matched_node=match.last_device_node,
+            host_locked_nodes=host_locked,
+            host_tail_indices=host_tail,
+            created_at=time.monotonic(),
+        )
+
+        return AllocateTokenForTransferReqOutput(
+            success=True,
+            migration_id=migration_id,
+            tp_rank=self.tp_rank,
+            pp_rank=self.pp_rank,
+            kv_indices=host_tail.cpu().tolist(),
+        )
+
+    # -- commit (target side) --
+
+    def commit(
+        self, recv_req: CommitTransferRequestKVCacheReqInput
+    ) -> CommitTransferRequestKVCacheReqOutput:
+        from sglang.srt.kv_migration.tree_helpers import dec_host_refs
+
+        p = self.pending.pop(recv_req.migration_id, None)
+        if p is None:
+            return CommitTransferRequestKVCacheReqOutput(
+                success=False,
+                message=f"migration_id {recv_req.migration_id} not found (timed out?)",
+            )
+
+        # Re-match to find the current attach point (tolerates concurrent tree changes).
+        match = self.tree_cache.match_prefix(MatchPrefixParams(key=p.full_key))
+        attached_offset = len(match.device_indices) + match.host_hit_length
+
+        if attached_offset > p.matched_aligned:
+            # Tree raced ahead: another path already inserted (some of) this prefix.
+            self.host_pool.free(p.host_tail_indices)
+            self.tree_cache.dec_lock_ref(p.matched_node)
+            dec_host_refs(p.host_locked_nodes)
+            return CommitTransferRequestKVCacheReqOutput(
+                success=True,
+                matched_after_commit=attached_offset,
+                message="tree raced ahead during migration window; tail freed",
+            )
+        if attached_offset < p.matched_aligned:
+            # Matched portion shrank despite our locks — should not happen.
+            self.host_pool.free(p.host_tail_indices)
+            self.tree_cache.dec_lock_ref(p.matched_node)
+            dec_host_refs(p.host_locked_nodes)
+            return CommitTransferRequestKVCacheReqOutput(
+                success=False,
+                message=(
+                    f"matched portion shrank from {p.matched_aligned} "
+                    f"to {attached_offset} during migration window"
+                ),
+            )
+
+        suffix_key = p.full_key[attached_offset:]
+        try:
+            self.tree_cache._insert_host_only(
+                match.last_host_node, suffix_key, p.host_tail_indices
+            )
+        except Exception as e:
+            # Re-park pending so the watchdog (Task 10) can reclaim it.
+            self.pending[recv_req.migration_id] = p
+            return CommitTransferRequestKVCacheReqOutput(
+                success=False,
+                message=f"_insert_host_only failed: {e!r}",
+            )
+
+        self.tree_cache.dec_lock_ref(p.matched_node)
+        dec_host_refs(p.host_locked_nodes)
+
+        return CommitTransferRequestKVCacheReqOutput(
+            success=True,
+            matched_after_commit=attached_offset + len(suffix_key),
+        )

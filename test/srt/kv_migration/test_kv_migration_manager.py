@@ -195,3 +195,184 @@ def test_match_extra_full_match():
     assert out.total_token_size == 192
     assert out.matched_token_size == 192
     assert out.extra_token_size == 0
+
+
+# ---------- allocate / commit tests ----------
+
+import time as _time
+
+from sglang.srt.kv_migration.io_types import PendingMigration
+from sglang.srt.managers.io_struct import (
+    AllocateTokenForTransferReqInput,
+    CommitTransferRequestKVCacheReqInput,
+)
+from sglang.srt.mem_cache.radix_cache import RadixKey
+
+
+def test_allocate_returns_migration_id_and_indices():
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=64, page_size=64,
+        device_indices_len=32, host_hit_length=32,
+    )
+    mgr.host_pool.alloc.return_value = torch.tensor(
+        list(range(2000, 2128)), dtype=torch.int64
+    )
+    mgr.tree_cache.inc_lock_ref = MagicMock()
+    mgr.pending = {}
+
+    out = mgr.allocate(
+        AllocateTokenForTransferReqInput(
+            input_ids=list(range(192)), extra_key=None, extra_token_size=128,
+        )
+    )
+    assert out.success is True
+    assert out.migration_id != ""
+    assert len(out.kv_indices) == 128
+    assert out.kv_indices[0] == 2000
+    assert out.kv_indices[-1] == 2127
+    assert out.migration_id in mgr.pending
+    mgr.tree_cache.inc_lock_ref.assert_called_once()
+
+
+def test_allocate_uses_explicit_migration_id_when_provided_v2():
+    """HTTP layer mints a shared id across ranks; manager should reuse it."""
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=64, page_size=64,
+        device_indices_len=32, host_hit_length=32,
+    )
+    mgr.host_pool.alloc.return_value = torch.tensor(
+        list(range(64)), dtype=torch.int64
+    )
+    mgr.tree_cache.inc_lock_ref = MagicMock()
+    mgr.pending = {}
+
+    explicit_id = "shared-mig-id-from-http"
+    out = mgr.allocate(
+        AllocateTokenForTransferReqInput(
+            input_ids=list(range(128)),  # total_aligned = 128
+            extra_key=None,
+            extra_token_size=64,         # matched=64, so 64+64=128 ✓
+            migration_id=explicit_id,
+        )
+    )
+    assert out.success is True
+    assert out.migration_id == explicit_id
+    assert explicit_id in mgr.pending
+
+
+def test_allocate_oom_returns_failure_and_rolls_back_locks():
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=64, page_size=64,
+        device_indices_len=32, host_hit_length=32,
+    )
+    mgr.host_pool.alloc.return_value = None  # OOM
+    mgr.tree_cache.inc_lock_ref = MagicMock()
+    mgr.tree_cache.dec_lock_ref = MagicMock()
+    mgr.pending = {}
+
+    out = mgr.allocate(
+        AllocateTokenForTransferReqInput(
+            input_ids=list(range(128)),
+            extra_key=None,
+            extra_token_size=64,
+        )
+    )
+    assert out.success is False
+    assert "alloc" in out.message.lower() or "oom" in out.message.lower()
+    assert mgr.pending == {}
+    mgr.tree_cache.dec_lock_ref.assert_called_once()
+
+
+def test_allocate_size_mismatch_returns_failure():
+    """matched_aligned + extra_token_size must equal total_aligned."""
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=64, page_size=64,
+        device_indices_len=32, host_hit_length=32,
+    )
+    mgr.tree_cache.inc_lock_ref = MagicMock()
+    mgr.tree_cache.dec_lock_ref = MagicMock()
+    mgr.pending = {}
+
+    # total_aligned for len=128 is 128; matched=64; client claims extra=999
+    out = mgr.allocate(
+        AllocateTokenForTransferReqInput(
+            input_ids=list(range(128)),
+            extra_key=None,
+            extra_token_size=999,  # doesn't sum to total_aligned
+        )
+    )
+    assert out.success is False
+    assert "matched_aligned" in out.message or "extra_token_size" in out.message
+
+
+def test_commit_inserts_and_releases():
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=64, page_size=64,
+        device_indices_len=32, host_hit_length=32,
+    )
+    new_last = MagicMock()
+    mgr.tree_cache._insert_host_only = MagicMock(return_value=new_last)
+    mgr.tree_cache.dec_lock_ref = MagicMock()
+
+    mig_id = "test-mig"
+    locked_nodes = [MagicMock(host_ref_counter=1) for _ in range(2)]
+    mgr.pending[mig_id] = PendingMigration(
+        input_ids=list(range(192)),
+        extra_key=None,
+        full_key=RadixKey(list(range(128))),  # 128 tokens, matched_aligned=64, suffix=64
+        matched_aligned=64,
+        matched_node=MagicMock(),
+        host_locked_nodes=locked_nodes,
+        host_tail_indices=torch.tensor(list(range(2000, 2064)), dtype=torch.int64),
+        created_at=_time.monotonic(),
+    )
+
+    out = mgr.commit(CommitTransferRequestKVCacheReqInput(migration_id=mig_id))
+    assert out.success is True
+    assert mig_id not in mgr.pending
+    mgr.tree_cache._insert_host_only.assert_called_once()
+    mgr.tree_cache.dec_lock_ref.assert_called_once()
+    # host_ref_counter should have been decremented on each locked node
+    for n in locked_nodes:
+        assert n.host_ref_counter == 0
+
+
+def test_commit_unknown_migration_id_fails():
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=64, page_size=64,
+    )
+    mgr.pending = {}
+    out = mgr.commit(CommitTransferRequestKVCacheReqInput(migration_id="ghost"))
+    assert out.success is False
+    assert "ghost" in out.message or "not found" in out.message
+
+
+def test_commit_race_ahead_frees_tail_and_returns_success():
+    """Another path inserted the same prefix during the migration window:
+    attached_offset > matched_aligned → free our tail, return success."""
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=128, page_size=64,    # AT COMMIT: deeper match
+        device_indices_len=64, host_hit_length=64,
+    )
+    mgr.tree_cache.dec_lock_ref = MagicMock()
+    mgr.tree_cache._insert_host_only = MagicMock()
+
+    mig_id = "raced"
+    tail = torch.tensor(list(range(2000, 2064)), dtype=torch.int64)
+    mgr.pending[mig_id] = PendingMigration(
+        input_ids=list(range(128)),
+        extra_key=None,
+        full_key=RadixKey(list(range(128))),
+        matched_aligned=64,                   # AT ALLOCATE: was 64
+        matched_node=MagicMock(),
+        host_locked_nodes=[MagicMock(host_ref_counter=1)],
+        host_tail_indices=tail,
+        created_at=_time.monotonic(),
+    )
+
+    out = mgr.commit(CommitTransferRequestKVCacheReqInput(migration_id=mig_id))
+    assert out.success is True
+    assert "raced" in out.message.lower() or "ahead" in out.message.lower()
+    mgr.host_pool.free.assert_called_once()
+    # _insert_host_only must NOT have been called in this path
+    mgr.tree_cache._insert_host_only.assert_not_called()
