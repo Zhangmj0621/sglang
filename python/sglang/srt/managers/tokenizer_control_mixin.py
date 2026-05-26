@@ -19,6 +19,8 @@ from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AllocateTokenForTransferReqInput,
+    AllocateTokenForTransferReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
@@ -26,6 +28,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitTransferRequestKVCacheReqInput,
+    CommitTransferRequestKVCacheReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -45,6 +49,10 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
+    GetRequestExtraTokenSizeReqInput,
+    GetRequestExtraTokenSizeReqOutput,
+    GetTransferSessionInfoReqInput,
+    GetTransferSessionInfoReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -74,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    TransferRequestKVCacheReqInput,
+    TransferRequestKVCacheReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -127,6 +137,11 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
+    ("get_transfer_session_info", GetTransferSessionInfoReqOutput),
+    ("get_request_extra_token_size", GetRequestExtraTokenSizeReqOutput),
+    ("allocate_token_for_transfer", AllocateTokenForTransferReqOutput),
+    ("transfer_request_kvcache", TransferRequestKVCacheReqOutput),
+    ("commit_transfer_request_kvcache", CommitTransferRequestKVCacheReqOutput),
 ]
 
 
@@ -265,6 +280,58 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    # -- KV migration (Task 12) --
+
+    async def get_transfer_session_info(self: TokenizerManager):
+        """Returns one GetTransferSessionInfoReqOutput per scheduler rank.
+        The HTTP layer assembles the topology table from this list.
+        """
+        self.auto_create_handle_loop()
+        return await self.get_transfer_session_info_communicator(
+            GetTransferSessionInfoReqInput()
+        )
+
+    async def get_request_extra_token_size(
+        self: TokenizerManager, obj: GetRequestExtraTokenSizeReqInput
+    ) -> GetRequestExtraTokenSizeReqOutput:
+        self.auto_create_handle_loop()
+        # All ranks should agree on the same extra/matched/total. Return rank 0.
+        return (await self.get_request_extra_token_size_communicator(obj))[0]
+
+    async def allocate_token_for_transfer(
+        self: TokenizerManager, obj: AllocateTokenForTransferReqInput
+    ):
+        """Returns one AllocateTokenForTransferReqOutput per rank."""
+        self.auto_create_handle_loop()
+        return await self.allocate_token_for_transfer_communicator(obj)
+
+    async def transfer_request_kvcache(
+        self: TokenizerManager, obj: TransferRequestKVCacheReqInput
+    ) -> TransferRequestKVCacheReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.transfer_request_kvcache_communicator(obj)
+        success = all(r.success for r in results)
+        message = (
+            "" if success else "; ".join(r.message for r in results if not r.success)
+        )
+        return TransferRequestKVCacheReqOutput(success=success, message=message)
+
+    async def commit_transfer_request_kvcache(
+        self: TokenizerManager, obj: CommitTransferRequestKVCacheReqInput
+    ) -> CommitTransferRequestKVCacheReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.commit_transfer_request_kvcache_communicator(obj)
+        success = all(r.success for r in results)
+        return CommitTransferRequestKVCacheReqOutput(
+            success=success,
+            matched_after_commit=(
+                results[0].matched_after_commit if success and results else 0
+            ),
+            message=(
+                "" if success else "; ".join(r.message for r in results if not r.success)
+            ),
+        )
 
     async def release_ref(self: TokenizerManager, obj: ReleaseRefReqInput):
         self.auto_create_handle_loop()
