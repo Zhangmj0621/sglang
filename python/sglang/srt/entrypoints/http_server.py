@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -110,15 +111,18 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    AllocateTokenForTransferReqInput,
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    CommitTransferRequestKVCacheReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetRequestExtraTokenSizeReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -131,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ReleaseRefReqInput,
     ResumeMemoryOccupationReqInput,
+    TransferRequestKVCacheReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -784,6 +789,144 @@ async def release_ref_request(obj: ReleaseRefReqInput, request: Request):
     """Release ref tracking for a completed multi-turn rollout."""
     success, message = await _global_state.tokenizer_manager.release_ref(obj)
     return ORJSONResponse({"success": success, "message": message})
+
+
+# -----------------------------------------------------------------------------
+# KV cache migration (peer-to-peer between sglang servers)
+# -----------------------------------------------------------------------------
+
+
+@app.get("/get_transfer_session_ids")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_transfer_session_ids():
+    """Returns this server's per-rank Mooncake session_ids and host pool layout.
+    The framework caches this once per server at startup and uses it to build
+    `target_per_rank` for /transfer_request_kvcache calls.
+    """
+    rank_results = await _global_state.tokenizer_manager.get_transfer_session_info()
+    if not rank_results or not all(r.success for r in rank_results):
+        msg = (
+            rank_results[0].message
+            if rank_results
+            else "kv migration not initialized"
+        )
+        return ORJSONResponse(
+            {"success": False, "message": msg},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    server_args = _global_state.tokenizer_manager.server_args
+    page_size = rank_results[0].page_size
+    return ORJSONResponse(
+        {
+            "topology": {
+                "tp_size": server_args.tp_size,
+                "pp_size": server_args.pp_size,
+                "page_size": page_size,
+            },
+            "ranks": [
+                {
+                    "tp": r.tp_rank,
+                    "pp": r.pp_rank,
+                    "session_id": r.session_id,
+                    "host_kv_data_ptrs": r.host_kv_data_ptrs,
+                    "host_kv_item_lens": r.host_kv_item_lens,
+                }
+                for r in rank_results
+            ],
+        }
+    )
+
+
+@app.post("/get_request_extra_token_size")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_request_extra_token_size(obj: GetRequestExtraTokenSizeReqInput):
+    """Compute page-aligned KV cache length missing on this server for a given
+    input_ids. Used by the framework before /allocate to size the transfer.
+    """
+    ret = await _global_state.tokenizer_manager.get_request_extra_token_size(obj)
+    if not ret.success:
+        return ORJSONResponse(
+            {"success": False, "message": ret.message},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    return ORJSONResponse(
+        {
+            "success": True,
+            "extra_token_size": ret.extra_token_size,
+            "matched_token_size": ret.matched_token_size,
+            "total_token_size": ret.total_token_size,
+        }
+    )
+
+
+@app.post("/allocate_token_for_transfer_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def allocate_token_for_transfer_request(obj: AllocateTokenForTransferReqInput):
+    """Pre-allocate `extra_token_size` host pool pages on this server. Returns a
+    `migration_id` and per-rank kv_indices; the framework then calls
+    /transfer_request_kvcache on the source with those indices, and finally
+    /commit_transfer_request_kvcache here to attach the migrated KV into the tree.
+    """
+    # The HTTP layer mints one migration_id and shares it across all ranks so
+    # /commit can target a single id (not per-rank ids).
+    if not obj.migration_id:
+        obj.migration_id = uuid.uuid4().hex
+    rank_results = await _global_state.tokenizer_manager.allocate_token_for_transfer(
+        obj
+    )
+    if not all(r.success for r in rank_results):
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": "; ".join(
+                    r.message for r in rank_results if not r.success
+                ),
+            },
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    return ORJSONResponse(
+        {
+            "success": True,
+            "migration_id": obj.migration_id,
+            "per_rank_kv_indices": [
+                {"tp": r.tp_rank, "pp": r.pp_rank, "kv_indices": r.kv_indices}
+                for r in rank_results
+            ],
+        }
+    )
+
+
+@app.post("/transfer_request_kvcache")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def transfer_request_kvcache(obj: TransferRequestKVCacheReqInput):
+    """Source-side endpoint: RDMA-write the requested KV pages from this
+    server's host pool into the target's pre-allocated host pool slots.
+    Synchronously blocks until the transfer completes.
+    """
+    ret = await _global_state.tokenizer_manager.transfer_request_kvcache(obj)
+    if not ret.success:
+        return ORJSONResponse(
+            {"success": False, "message": ret.message},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    return ORJSONResponse({"success": True})
+
+
+@app.post("/commit_transfer_request_kvcache")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def commit_transfer_request_kvcache(obj: CommitTransferRequestKVCacheReqInput):
+    """Target-side endpoint (after /transfer succeeded): attach the newly
+    written host pool pages into the radix tree as evicted-but-backuped nodes.
+    """
+    ret = await _global_state.tokenizer_manager.commit_transfer_request_kvcache(obj)
+    if not ret.success:
+        return ORJSONResponse(
+            {"success": False, "message": ret.message},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    return ORJSONResponse(
+        {"success": True, "matched_after_commit": ret.matched_after_commit}
+    )
 
 
 @app.post("/update_ref")
