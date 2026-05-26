@@ -85,6 +85,8 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AllocateTokenForTransferReqInput,
+    AllocateTokenForTransferReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BaseBatchReq,
@@ -95,6 +97,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitTransferRequestKVCacheReqInput,
+    CommitTransferRequestKVCacheReqOutput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
@@ -110,6 +114,10 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
+    GetRequestExtraTokenSizeReqInput,
+    GetRequestExtraTokenSizeReqOutput,
+    GetTransferSessionInfoReqInput,
+    GetTransferSessionInfoReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -140,6 +148,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TransferRequestKVCacheReqInput,
+    TransferRequestKVCacheReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateRefReqInput,
@@ -909,6 +919,22 @@ class Scheduler(
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
 
+        # KV migration manager (per-rank). Gated by --enable-kv-migration; only
+        # supported when a HiRadixCache-with-host-pool is in use (RefAware or plain).
+        self.kv_migration_manager = None
+        self._kv_migration_last_watchdog = 0.0
+        if server_args.enable_kv_migration:
+            host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+            if host_pool is None:
+                logger.warning(
+                    "kv-migration: --enable-kv-migration was set but the active "
+                    "tree_cache (%s) has no host pool; manager will not be initialized.",
+                    type(self.tree_cache).__name__,
+                )
+            else:
+                from sglang.srt.kv_migration import KVMigrationManager
+                self.kv_migration_manager = KVMigrationManager(self)
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -1353,6 +1379,26 @@ class Scheduler(
                 ),
                 (ReleaseRefReqInput, self.handle_release_ref),
                 (UpdateRefReqInput, self.handle_update_ref),
+                (
+                    GetTransferSessionInfoReqInput,
+                    self._kv_migration_get_session_info,
+                ),
+                (
+                    GetRequestExtraTokenSizeReqInput,
+                    self._kv_migration_get_extra_token_size,
+                ),
+                (
+                    AllocateTokenForTransferReqInput,
+                    self._kv_migration_allocate,
+                ),
+                (
+                    TransferRequestKVCacheReqInput,
+                    self._kv_migration_transfer,
+                ),
+                (
+                    CommitTransferRequestKVCacheReqInput,
+                    self._kv_migration_commit,
+                ),
             ]
         )
 
@@ -1730,6 +1776,7 @@ class Scheduler(
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        self._kv_migration_tick()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -3146,6 +3193,67 @@ class Scheduler(
 
         success, msg = self.tree_cache.update_ref(rid, new_priority)
         return UpdateRefReqOutput(success=success, message=msg)
+
+    # -- KV migration wrappers (Task 11) --
+
+    def _kv_migration_get_session_info(
+        self, recv_req: GetTransferSessionInfoReqInput
+    ) -> GetTransferSessionInfoReqOutput:
+        if self.kv_migration_manager is None:
+            return GetTransferSessionInfoReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.get_session_info(recv_req)
+
+    def _kv_migration_get_extra_token_size(
+        self, recv_req: GetRequestExtraTokenSizeReqInput
+    ) -> GetRequestExtraTokenSizeReqOutput:
+        if self.kv_migration_manager is None:
+            return GetRequestExtraTokenSizeReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.get_extra_token_size_wrapped(recv_req)
+
+    def _kv_migration_allocate(
+        self, recv_req: AllocateTokenForTransferReqInput
+    ) -> AllocateTokenForTransferReqOutput:
+        if self.kv_migration_manager is None:
+            return AllocateTokenForTransferReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.allocate(recv_req)
+
+    def _kv_migration_transfer(
+        self, recv_req: TransferRequestKVCacheReqInput
+    ):
+        """Returns either a sync output (immediate failure) or None to signal
+        that the response will be emitted later via `poll_pending_futures`."""
+        if self.kv_migration_manager is None:
+            return TransferRequestKVCacheReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.transfer(recv_req)
+
+    def _kv_migration_commit(
+        self, recv_req: CommitTransferRequestKVCacheReqInput
+    ) -> CommitTransferRequestKVCacheReqOutput:
+        if self.kv_migration_manager is None:
+            return CommitTransferRequestKVCacheReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.commit(recv_req)
+
+    def _kv_migration_tick(self) -> None:
+        """Called once per scheduler iteration. Drains completed transfer
+        futures and runs the watchdog at most once per second."""
+        if self.kv_migration_manager is None:
+            return
+        for output, recv_req in self.kv_migration_manager.poll_pending_futures():
+            self.send_to_tokenizer.send_output(output, recv_req)
+        now = time.monotonic()
+        if now - self._kv_migration_last_watchdog > 1.0:
+            self.kv_migration_manager.watchdog_tick()
+            self._kv_migration_last_watchdog = now
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

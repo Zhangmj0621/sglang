@@ -353,6 +353,10 @@ class KVMigrationManager:
                 {
                     "matched_node": match.last_device_node,
                     "host_locked": host_locked,
+                    # `recv_req` is opaque to the manager; scheduler stores the
+                    # original request here so it can route the deferred output
+                    # via `send_to_tokenizer.send_output(output, recv_req)`.
+                    "recv_req": recv_req,
                 },
             )
         )
@@ -362,14 +366,20 @@ class KVMigrationManager:
 
     # -- main-loop tick helpers --
 
-    def poll_pending_futures(self) -> List[TransferRequestKVCacheReqOutput]:
-        """Called once per scheduler tick. Returns ZMQ responses for completed
-        transfer futures and releases their source-side locks. The scheduler is
-        responsible for sending each returned output back to the tokenizer.
+    def poll_pending_futures(
+        self,
+    ) -> List[Tuple[TransferRequestKVCacheReqOutput, "TransferRequestKVCacheReqInput"]]:
+        """Called once per scheduler tick. Returns a list of
+        `(output, recv_req)` pairs for transfer futures that completed since
+        the last tick. Source-side locks are released here. The scheduler is
+        responsible for routing each output back to the tokenizer via
+        `send_to_tokenizer.send_output(output, recv_req)`.
         """
         from sglang.srt.kv_migration.tree_helpers import dec_host_refs
 
-        ready: List[TransferRequestKVCacheReqOutput] = []
+        ready: List[
+            Tuple[TransferRequestKVCacheReqOutput, "TransferRequestKVCacheReqInput"]
+        ] = []
         still_pending: List[Tuple[Future, dict]] = []
         for future, meta in self.pending_futures:
             if not future.done():
@@ -379,18 +389,15 @@ class KVMigrationManager:
             dec_host_refs(meta["host_locked"])
             try:
                 ret = future.result()
-                ready.append(
-                    TransferRequestKVCacheReqOutput(
-                        success=(ret == 0),
-                        message=("" if ret == 0 else f"batch_transfer_sync ret={ret}"),
-                    )
+                output = TransferRequestKVCacheReqOutput(
+                    success=(ret == 0),
+                    message=("" if ret == 0 else f"batch_transfer_sync ret={ret}"),
                 )
             except Exception as e:
-                ready.append(
-                    TransferRequestKVCacheReqOutput(
-                        success=False, message=f"transfer raised: {e!r}"
-                    )
+                output = TransferRequestKVCacheReqOutput(
+                    success=False, message=f"transfer raised: {e!r}"
                 )
+            ready.append((output, meta["recv_req"]))
         self.pending_futures = still_pending
         return ready
 
