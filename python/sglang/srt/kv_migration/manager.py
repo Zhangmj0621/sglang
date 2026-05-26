@@ -268,3 +268,161 @@ class KVMigrationManager:
             success=True,
             matched_after_commit=attached_offset + len(suffix_key),
         )
+
+    # -- transfer (source side) --
+
+    def transfer(
+        self, recv_req: TransferRequestKVCacheReqInput
+    ) -> Optional[TransferRequestKVCacheReqOutput]:
+        """Submit the RDMA transfer to `transfer_executor` and return None.
+
+        The scheduler tick polls `pending_futures` and emits the response when
+        the future completes. Synchronous failures (no target for this rank,
+        source missing pages, write_through invariant violation) return a
+        ready `TransferRequestKVCacheReqOutput` immediately.
+        """
+        from sglang.srt.kv_migration.io_types import TransferTarget
+        from sglang.srt.kv_migration.transfer_worker import do_host_to_host_rdma
+        from sglang.srt.kv_migration.tree_helpers import (
+            collect_host_pages,
+            inc_host_refs_along_path,
+        )
+
+        # Find the per-rank target entry
+        my_target = None
+        for t in recv_req.target_per_rank:
+            if t.tp == self.tp_rank and t.pp == self.pp_rank:
+                my_target = TransferTarget(
+                    tp=t.tp,
+                    pp=t.pp,
+                    session_id=t.session_id,
+                    host_kv_data_ptrs=list(t.host_kv_data_ptrs),
+                    host_kv_item_lens=list(t.host_kv_item_lens),
+                    kv_indices=list(t.kv_indices),
+                )
+                break
+        if my_target is None:
+            return TransferRequestKVCacheReqOutput(
+                success=False,
+                message=f"no target entry for rank tp={self.tp_rank} pp={self.pp_rank}",
+            )
+
+        page = self.page_size
+        total_aligned = recv_req.matched_token_size + recv_req.extra_token_size
+        full_key = RadixKey(
+            recv_req.input_ids[:total_aligned], recv_req.extra_key
+        ).page_aligned(page)
+
+        try:
+            src_host_pages = collect_host_pages(self.tree_cache, full_key, page)
+        except AssertionError as e:
+            return TransferRequestKVCacheReqOutput(success=False, message=str(e))
+
+        required_pages = total_aligned // page
+        if len(src_host_pages) < required_pages:
+            return TransferRequestKVCacheReqOutput(
+                success=False,
+                message=(
+                    f"source missing pages: have {len(src_host_pages)}, "
+                    f"need {required_pages} (possibly evicted)"
+                ),
+            )
+
+        send_start_page = recv_req.matched_token_size // page
+        send_end_page = total_aligned // page
+        src_send_pages = src_host_pages[send_start_page:send_end_page]
+
+        # Lock source side for the duration of the RDMA write
+        match = self.tree_cache.match_prefix(MatchPrefixParams(key=full_key))
+        self.tree_cache.inc_lock_ref(match.last_device_node)
+        host_locked = inc_host_refs_along_path(
+            match.last_host_node, self.tree_cache.root_node
+        )
+
+        future = self.transfer_executor.submit(
+            do_host_to_host_rdma,
+            self.engine,
+            my_target,
+            self.host_kv_data_ptrs,
+            self.host_kv_item_lens,
+            src_send_pages,
+        )
+        self.pending_futures.append(
+            (
+                future,
+                {
+                    "matched_node": match.last_device_node,
+                    "host_locked": host_locked,
+                },
+            )
+        )
+        # None signals the caller that the response will be emitted via
+        # `poll_pending_futures` once the future completes.
+        return None
+
+    # -- main-loop tick helpers --
+
+    def poll_pending_futures(self) -> List[TransferRequestKVCacheReqOutput]:
+        """Called once per scheduler tick. Returns ZMQ responses for completed
+        transfer futures and releases their source-side locks. The scheduler is
+        responsible for sending each returned output back to the tokenizer.
+        """
+        from sglang.srt.kv_migration.tree_helpers import dec_host_refs
+
+        ready: List[TransferRequestKVCacheReqOutput] = []
+        still_pending: List[Tuple[Future, dict]] = []
+        for future, meta in self.pending_futures:
+            if not future.done():
+                still_pending.append((future, meta))
+                continue
+            self.tree_cache.dec_lock_ref(meta["matched_node"])
+            dec_host_refs(meta["host_locked"])
+            try:
+                ret = future.result()
+                ready.append(
+                    TransferRequestKVCacheReqOutput(
+                        success=(ret == 0),
+                        message=("" if ret == 0 else f"batch_transfer_sync ret={ret}"),
+                    )
+                )
+            except Exception as e:
+                ready.append(
+                    TransferRequestKVCacheReqOutput(
+                        success=False, message=f"transfer raised: {e!r}"
+                    )
+                )
+        self.pending_futures = still_pending
+        return ready
+
+    def watchdog_tick(self) -> None:
+        """Roll back any pending allocate that has been waiting past
+        `watchdog_timeout_s` for a commit."""
+        from sglang.srt.kv_migration.tree_helpers import dec_host_refs
+
+        now = time.monotonic()
+        timed_out = [
+            mig_id
+            for mig_id, p in self.pending.items()
+            if now - p.created_at > self.watchdog_timeout_s
+        ]
+        for mig_id in timed_out:
+            p = self.pending.pop(mig_id)
+            try:
+                self.host_pool.free(p.host_tail_indices)
+            except Exception as e:
+                logger.warning(
+                    "kv-migration watchdog: host_pool.free failed for %s: %r",
+                    mig_id, e,
+                )
+            try:
+                self.tree_cache.dec_lock_ref(p.matched_node)
+            except Exception as e:
+                logger.warning(
+                    "kv-migration watchdog: dec_lock_ref failed for %s: %r",
+                    mig_id, e,
+                )
+            dec_host_refs(p.host_locked_nodes)
+            logger.warning(
+                "kv-migration watchdog rolled back %s after %.1fs",
+                mig_id, now - p.created_at,
+            )
