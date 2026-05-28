@@ -278,13 +278,21 @@ class KVMigrationManager:
 
         The scheduler tick polls `pending_futures` and emits the response when
         the future completes. Synchronous failures (no target for this rank,
-        source missing pages, write_through invariant violation) return a
-        ready `TransferRequestKVCacheReqOutput` immediately.
+        source missing pages, write_through invariant violation, missing
+        finish_event coverage) return a ready response immediately.
+
+        Before submission we also snapshot the CUDA `finish_event` of any
+        device→host write_through DMA still in flight on the source side that
+        covers our send window. The worker thread `synchronize()`s these
+        before issuing the RDMA, so host pages are guaranteed to contain
+        post-DMA bytes (not pre-DMA garbage). See spec on the host-readiness
+        race for context.
         """
         from sglang.srt.kv_migration.io_types import TransferTarget
         from sglang.srt.kv_migration.transfer_worker import do_host_to_host_rdma
         from sglang.srt.kv_migration.tree_helpers import (
-            collect_host_pages,
+            collect_path_with_pages,
+            dec_host_refs,
             inc_host_refs_along_path,
         )
 
@@ -313,8 +321,13 @@ class KVMigrationManager:
             recv_req.input_ids[:total_aligned], recv_req.extra_key
         ).page_aligned(page)
 
+        # Drain anything already-done so the in-flight set is minimal.
+        self.tree_cache.flush_write_through_acks()
+
         try:
-            src_host_pages = collect_host_pages(self.tree_cache, full_key, page)
+            src_host_pages, path_nodes = collect_path_with_pages(
+                self.tree_cache, full_key, page
+            )
         except AssertionError as e:
             return TransferRequestKVCacheReqOutput(success=False, message=str(e))
 
@@ -339,6 +352,31 @@ class KVMigrationManager:
             match.last_host_node, self.tree_cache.root_node
         )
 
+        # Identify path nodes whose token range overlaps the send window.
+        send_start_token = recv_req.matched_token_size
+        send_end_token = total_aligned
+        send_window_node_ids: set = set()
+        cumulative = 0
+        for n in path_nodes:
+            n_tokens = len(n.host_value)
+            n_start = cumulative
+            n_end = cumulative + n_tokens
+            if n_end > send_start_token and n_start < send_end_token:
+                send_window_node_ids.add(n.id)
+            cumulative = n_end
+
+        wait_events, missing = self._snapshot_inflight_events(send_window_node_ids)
+        if missing:
+            self.tree_cache.dec_lock_ref(match.last_device_node)
+            dec_host_refs(host_locked)
+            return TransferRequestKVCacheReqOutput(
+                success=False,
+                message=(
+                    f"finish_event missing for {len(missing)} in-flight "
+                    f"node(s); node_ids={sorted(missing)[:5]}"
+                ),
+            )
+
         future = self.transfer_executor.submit(
             do_host_to_host_rdma,
             self.engine,
@@ -346,6 +384,7 @@ class KVMigrationManager:
             self.host_kv_data_ptrs,
             self.host_kv_item_lens,
             src_send_pages,
+            wait_events,
         )
         self.pending_futures.append(
             (
@@ -363,6 +402,41 @@ class KVMigrationManager:
         # None signals the caller that the response will be emitted via
         # `poll_pending_futures` once the future completes.
         return None
+
+    def _snapshot_inflight_events(
+        self, send_window_node_ids: set
+    ) -> Tuple[list, set]:
+        """Return `(wait_events, missing_ids)` for nodes in `send_window_node_ids`
+        that are still in `tree_cache.ongoing_write_through`.
+
+        `wait_events` is a list of CUDA finish_events (deduplicated, in
+        ack_write_queue order). `missing_ids` is the subset of in-flight
+        send-window node ids whose finish_event was not found in
+        `ack_write_queue` — should be empty in steady state; non-empty
+        signals a controller invariant violation.
+        """
+        inflight = self.tree_cache.ongoing_write_through
+        send_inflight: set = send_window_node_ids & set(inflight.keys())
+        if not send_inflight:
+            return [], set()
+
+        wait_events: list = []
+        covered: set = set()
+        seen_event_ids: set = set()
+        for ack in self.tree_cache.cache_controller.ack_write_queue:
+            ack_node_ids = set(ack.node_ids)
+            overlap = send_inflight & ack_node_ids
+            if not overlap:
+                continue
+            ev = ack.finish_event
+            ev_id = id(ev)
+            if ev_id not in seen_event_ids:
+                wait_events.append(ev)
+                seen_event_ids.add(ev_id)
+            covered |= overlap
+
+        missing = send_inflight - covered
+        return wait_events, missing
 
     # -- main-loop tick helpers --
 

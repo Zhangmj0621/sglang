@@ -2,26 +2,31 @@
 
 from __future__ import annotations
 
-from typing import List, TYPE_CHECKING
+from typing import List, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 
 
-def collect_host_pages(
+def collect_path_with_pages(
     tree_cache: "HiRadixCache",
     key: "RadixKey",
     page_size: int,
-) -> List[int]:
-    """Walk root → matched leaf along `key`, returning the host pool page
-    indices of every matched token. Asserts each matched node is backuped
-    (write_through invariant).
+) -> Tuple[List[int], List["TreeNode"]]:
+    """Walk root → matched leaf along `key`. Return:
+      - `pages`: host pool page indices for every matched token
+      - `path_nodes`: TreeNode visited (in root→leaf order, root excluded)
 
-    Stops early if a child diverges mid-key. Returns the page indices
-    collected up to that point.
+    `path_nodes[i]` covers the page slice
+        pages[ sum(len(n.host_value) for n in path_nodes[:i]) // page_size :
+               sum(len(n.host_value) for n in path_nodes[:i+1]) // page_size ]
+
+    Asserts each matched node is backuped (write_through invariant).
+    Stops early if a child diverges mid-key.
     """
     pages: List[int] = []
+    path_nodes: List["TreeNode"] = []
     node = tree_cache.root_node
     remaining = key
     while len(remaining) > 0:
@@ -37,15 +42,25 @@ def collect_host_pages(
             f"node.key.token_ids[:8]={list(child.key.token_ids[:8])}"
         )
         host_idx = child.host_value[:prefix_len].tolist()
-        # token-level → page-level: take every page_size-th token, divide
         if page_size == 1:
             pages.extend(int(p) for p in host_idx)
         else:
             pages.extend(int(p) // page_size for p in host_idx[::page_size])
+        path_nodes.append(child)
         if prefix_len < len(child.key):
             break
         node = child
         remaining = remaining[prefix_len:]
+    return pages, path_nodes
+
+
+def collect_host_pages(
+    tree_cache: "HiRadixCache",
+    key: "RadixKey",
+    page_size: int,
+) -> List[int]:
+    """Backward-compat wrapper around `collect_path_with_pages`."""
+    pages, _ = collect_path_with_pages(tree_cache, key, page_size)
     return pages
 
 

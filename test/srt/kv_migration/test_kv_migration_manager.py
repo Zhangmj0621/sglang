@@ -376,3 +376,133 @@ def test_commit_race_ahead_frees_tail_and_returns_success():
     mgr.host_pool.free.assert_called_once()
     # _insert_host_only must NOT have been called in this path
     mgr.tree_cache._insert_host_only.assert_not_called()
+
+
+# ---------- write_through host-readiness race: wait_events plumbing ----------
+
+from types import SimpleNamespace
+
+
+def test_worker_synchronizes_wait_events_before_rdma():
+    """do_host_to_host_rdma must call .synchronize() on every wait_event
+    BEFORE submitting batch_transfer_sync — otherwise we'd RDMA pre-DMA bytes."""
+    call_order = []
+
+    ev1 = MagicMock()
+    ev1.synchronize.side_effect = lambda: call_order.append("sync1")
+    ev2 = MagicMock()
+    ev2.synchronize.side_effect = lambda: call_order.append("sync2")
+
+    engine = MagicMock()
+    engine.batch_transfer_sync.side_effect = (
+        lambda *a, **k: call_order.append("rdma") or 0
+    )
+
+    target = TransferTarget(
+        tp=0, pp=0, session_id="peer:1234",
+        host_kv_data_ptrs=[1000],
+        host_kv_item_lens=[64],
+        kv_indices=[5],
+    )
+    ret = do_host_to_host_rdma(
+        engine=engine, target=target,
+        src_kv_data_ptrs=[10000], src_kv_item_lens=[64],
+        src_send_pages=[1],
+        wait_events=[ev1, ev2],
+    )
+    assert ret == 0
+    # Both events must be synchronized; RDMA must come last.
+    assert call_order == ["sync1", "sync2", "rdma"]
+
+
+def test_worker_no_wait_events_default_unchanged():
+    """Default wait_events=() preserves existing call shape."""
+    engine = MagicMock()
+    engine.batch_transfer_sync.return_value = 0
+    target = TransferTarget(
+        tp=0, pp=0, session_id="peer:1234",
+        host_kv_data_ptrs=[1000], host_kv_item_lens=[64], kv_indices=[5],
+    )
+    ret = do_host_to_host_rdma(
+        engine=engine, target=target,
+        src_kv_data_ptrs=[10000], src_kv_item_lens=[64],
+        src_send_pages=[1],
+    )
+    assert ret == 0
+
+
+def _build_manager_with_writethrough_state(ongoing_ids, ack_queue):
+    """Manager stub exposing only what _snapshot_inflight_events needs."""
+    from sglang.srt.kv_migration.manager import KVMigrationManager
+
+    mgr = KVMigrationManager.__new__(KVMigrationManager)
+    fake_tree = MagicMock()
+    fake_tree.ongoing_write_through = {nid: MagicMock() for nid in ongoing_ids}
+    fake_tree.cache_controller = MagicMock()
+    fake_tree.cache_controller.ack_write_queue = ack_queue
+    mgr.tree_cache = fake_tree
+    return mgr
+
+
+def _ack(node_ids, finish_event=None):
+    """Build a HiCacheAck-shaped namespace (start_event, finish_event, node_ids)."""
+    if finish_event is None:
+        finish_event = MagicMock()
+    return SimpleNamespace(
+        start_event=MagicMock(),
+        finish_event=finish_event,
+        node_ids=list(node_ids),
+    )
+
+
+def test_snapshot_inflight_events_returns_events_for_send_window():
+    ev_a = MagicMock()
+    ev_b = MagicMock()
+    mgr = _build_manager_with_writethrough_state(
+        ongoing_ids={1, 2, 3, 4},
+        ack_queue=[
+            _ack(node_ids=[1, 2], finish_event=ev_a),
+            _ack(node_ids=[3], finish_event=ev_b),
+            _ack(node_ids=[4], finish_event=MagicMock()),  # not in send window
+        ],
+    )
+    # send window covers nodes 1, 2, 3 — node 4 is on a different path
+    wait_events, missing = mgr._snapshot_inflight_events({1, 2, 3})
+    assert missing == set()
+    assert ev_a in wait_events
+    assert ev_b in wait_events
+    assert len(wait_events) == 2  # ev_a appears once even though it covers 1+2
+
+
+def test_snapshot_inflight_events_skips_already_drained_nodes():
+    """Nodes whose write_through already completed (not in ongoing_write_through)
+    must not contribute to wait_events even if their old ack entry lingers."""
+    mgr = _build_manager_with_writethrough_state(
+        ongoing_ids=set(),  # everything drained
+        ack_queue=[_ack(node_ids=[1, 2, 3])],  # stale entries
+    )
+    wait_events, missing = mgr._snapshot_inflight_events({1, 2, 3})
+    assert wait_events == []
+    assert missing == set()
+
+
+def test_snapshot_inflight_events_reports_missing_when_ack_entry_absent():
+    """Invariant violation: node is in ongoing_write_through but its
+    finish_event is nowhere in ack_write_queue."""
+    mgr = _build_manager_with_writethrough_state(
+        ongoing_ids={1, 2},
+        ack_queue=[_ack(node_ids=[1])],  # node 2 has no ack entry
+    )
+    wait_events, missing = mgr._snapshot_inflight_events({1, 2})
+    assert missing == {2}
+    assert len(wait_events) == 1
+
+
+def test_snapshot_inflight_events_empty_send_window_short_circuits():
+    mgr = _build_manager_with_writethrough_state(
+        ongoing_ids={1, 2, 3},
+        ack_queue=[_ack(node_ids=[1, 2, 3])],
+    )
+    wait_events, missing = mgr._snapshot_inflight_events(set())
+    assert wait_events == []
+    assert missing == set()

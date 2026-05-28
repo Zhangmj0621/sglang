@@ -51,6 +51,7 @@ def do_host_to_host_rdma(
     src_kv_data_ptrs: Sequence[int],
     src_kv_item_lens: Sequence[int],
     src_send_pages: Sequence[int],
+    wait_events: Sequence = (),
 ) -> int:
     """Build (src_addr, dst_addr, length) blocks for every layer and submit one
     `batch_transfer_sync`. Returns 0 on success, non-zero on engine failure.
@@ -59,6 +60,11 @@ def do_host_to_host_rdma(
     followed by V layers — same scheme as MHATokenToKVPool.kv_data_ptrs).
 
     Caller must ensure `len(src_send_pages) == len(target.kv_indices)`.
+
+    `wait_events` is a list of CUDA events guarding any in-flight device→host
+    write_through DMA on the source side; each is synchronized before the
+    RDMA submission to guarantee host pages contain final data, not pre-DMA
+    bytes. Synchronizing already-completed events is a cheap no-op.
     """
     assert len(src_send_pages) == len(target.kv_indices), (
         f"src/dst page count mismatch: "
@@ -70,6 +76,9 @@ def do_host_to_host_rdma(
     assert list(src_kv_item_lens) == list(target.host_kv_item_lens), (
         "per-layer page byte size must match between src and target host pools"
     )
+
+    for ev in wait_events:
+        ev.synchronize()
 
     if len(src_send_pages) == 0:
         return 0
