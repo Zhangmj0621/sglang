@@ -38,11 +38,11 @@ def collect_path_with_pages(
     path_nodes: List["TreeNode"] = []
     node = tree_cache.root_node
     remaining = key
-    while len(remaining) > 0:
-        first = remaining.token_ids[0]
-        if first not in node.children:
-            break
-        child = node.children[first]
+    if len(remaining) == 0:
+        return pages, path_nodes
+    child_key = tree_cache.get_child_key_fn(remaining)
+    while len(remaining) > 0 and child_key in node.children:
+        child = node.children[child_key]
         prefix_len = tree_cache.key_match_fn(child.key, remaining)
         if prefix_len == 0:
             break
@@ -65,6 +65,8 @@ def collect_path_with_pages(
             break
         node = child
         remaining = remaining[prefix_len:]
+        if len(remaining) > 0:
+            child_key = tree_cache.get_child_key_fn(remaining)
     return pages, path_nodes
 
 

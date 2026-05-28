@@ -11,7 +11,7 @@ from sglang.srt.kv_migration.tree_helpers import (
     dec_host_refs,
     inc_host_refs_along_path,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode, get_child_key
 
 
 def _make_node(token_ids, host_indices, value=None, parent=None):
@@ -26,9 +26,14 @@ def _make_node(token_ids, host_indices, value=None, parent=None):
 class FakeTreeCache:
     """Minimal stand-in for HiRadixCache: only what tree_helpers needs."""
 
-    def __init__(self, root):
+    def __init__(self, root, page_size: int = 1):
         self.root_node = root
-        self.page_size = 1
+        self.page_size = page_size
+
+    def get_child_key_fn(self, key):
+        # Mirrors HiRadixCache.__init__: page_size=1 → token_ids[0],
+        # page_size>1 → tuple(token_ids[:page_size]).
+        return get_child_key(key, page_size=self.page_size)
 
     @staticmethod
     def key_match_fn(node_key, query_key):
@@ -70,8 +75,10 @@ def test_collect_host_pages_page_size_gt_1():
         host_indices=[200, 201, 202, 203, 204, 205, 206, 207],
         parent=root,
     )
-    root.children = {10: child}
-    cache = FakeTreeCache(root)
+    # With page_size=2, the children-dict key is `tuple(token_ids[:2])`,
+    # not the leading int. Match the real HiRadixCache layout.
+    root.children = {(10, 11): child}
+    cache = FakeTreeCache(root, page_size=2)
     pages = collect_host_pages(
         cache, RadixKey([10, 11, 12, 13, 14, 15, 16, 17]), page_size=2
     )
