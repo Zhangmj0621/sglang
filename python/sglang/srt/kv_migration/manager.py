@@ -269,8 +269,29 @@ class KVMigrationManager:
                 match.last_host_node, suffix_key, p.host_tail_indices
             )
         except Exception as e:
-            # Re-park pending so the watchdog (Task 10) can reclaim it.
-            self.pending[recv_req.migration_id] = p
+            # Cannot safely free host_tail here: _insert_host_only attaches
+            # `new_node` to the tree (parent.children[k] = new_node) BEFORE
+            # the leaf-status updates that may raise. If we re-parked the
+            # pending and the watchdog freed `host_tail_indices`, those
+            # indices would simultaneously live in the tree (via
+            # new_node.host_value, a clone with identical values) and on
+            # `host_pool.free_slots` — a future alloc would hand out the
+            # same slots, aliasing the tree's host bytes.
+            #
+            # The conservative choice is to release locks (the migration is
+            # over) and intentionally leak the host tail. This is a real
+            # leak only if `_insert_host_only` actually raises, which it
+            # does not under normal conditions (the leaf-status updates are
+            # pure dict/set manipulations); we log loudly so an incident
+            # would be visible.
+            self.tree_cache.dec_lock_ref(p.matched_node)
+            dec_host_refs(p.host_locked_nodes)
+            logger.error(
+                "kv-migration: _insert_host_only raised for %s; leaking "
+                "%d host tokens because the tree may already reference "
+                "them. exception=%r",
+                recv_req.migration_id, len(p.host_tail_indices), e,
+            )
             return CommitTransferRequestKVCacheReqOutput(
                 success=False,
                 message=f"_insert_host_only failed: {e!r}",
