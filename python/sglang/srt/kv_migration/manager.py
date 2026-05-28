@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -149,6 +148,22 @@ class KVMigrationManager:
             inc_host_refs_along_path,
         )
 
+        # migration_id MUST be minted at the HTTP layer (uuid.uuid4().hex) and
+        # broadcast via FanOutCommunicator so every rank uses the same id —
+        # otherwise per-rank `pending` dicts would key on different ids and
+        # `commit` would race-fail on some ranks while succeeding on others.
+        if not recv_req.migration_id:
+            return AllocateTokenForTransferReqOutput(
+                success=False,
+                tp_rank=self.tp_rank,
+                pp_rank=self.pp_rank,
+                message=(
+                    "AllocateTokenForTransferReqInput.migration_id is required; "
+                    "the HTTP layer must mint it once and pass the same value "
+                    "to every rank"
+                ),
+            )
+
         page = self.page_size
         total_aligned = (len(recv_req.input_ids) // page) * page
 
@@ -187,7 +202,7 @@ class KVMigrationManager:
                 message=f"host pool alloc OOM: requested {recv_req.extra_token_size} tokens",
             )
 
-        migration_id = recv_req.migration_id or uuid.uuid4().hex
+        migration_id = recv_req.migration_id
         self.pending[migration_id] = PendingMigration(
             input_ids=list(recv_req.input_ids),
             extra_key=recv_req.extra_key,

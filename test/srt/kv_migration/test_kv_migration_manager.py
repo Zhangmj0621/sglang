@@ -223,15 +223,41 @@ def test_allocate_returns_migration_id_and_indices():
     out = mgr.allocate(
         AllocateTokenForTransferReqInput(
             input_ids=list(range(192)), extra_key=None, extra_token_size=128,
+            migration_id="mig-from-http",
         )
     )
     assert out.success is True
-    assert out.migration_id != ""
+    assert out.migration_id == "mig-from-http"
     assert len(out.kv_indices) == 128
     assert out.kv_indices[0] == 2000
     assert out.kv_indices[-1] == 2127
     assert out.migration_id in mgr.pending
     mgr.tree_cache.inc_lock_ref.assert_called_once()
+
+
+def test_allocate_rejects_missing_migration_id():
+    """migration_id must be minted by the HTTP layer. If a request reaches
+    the manager without one, all ranks would mint divergent UUIDs and the
+    pending dict would be keyed inconsistently — reject loudly instead."""
+    mgr = _build_manager_with_fake_tree(
+        matched_aligned=64, page_size=64,
+        device_indices_len=32, host_hit_length=32,
+    )
+    mgr.tree_cache.inc_lock_ref = MagicMock()
+    mgr.pending = {}
+
+    out = mgr.allocate(
+        AllocateTokenForTransferReqInput(
+            input_ids=list(range(192)), extra_key=None, extra_token_size=128,
+            # migration_id intentionally omitted
+        )
+    )
+    assert out.success is False
+    assert "migration_id" in out.message
+    # Must short-circuit before any allocation or lock acquisition.
+    assert mgr.pending == {}
+    mgr.tree_cache.inc_lock_ref.assert_not_called()
+    mgr.host_pool.alloc.assert_not_called()
 
 
 def test_allocate_uses_explicit_migration_id_when_provided_v2():
@@ -275,6 +301,7 @@ def test_allocate_oom_returns_failure_and_rolls_back_locks():
             input_ids=list(range(128)),
             extra_key=None,
             extra_token_size=64,
+            migration_id="mig-oom",
         )
     )
     assert out.success is False
@@ -299,6 +326,7 @@ def test_allocate_size_mismatch_returns_failure():
             input_ids=list(range(128)),
             extra_key=None,
             extra_token_size=999,  # doesn't sum to total_aligned
+            migration_id="mig-mismatch",
         )
     )
     assert out.success is False
