@@ -324,12 +324,13 @@ class KVMigrationManager:
         # Drain anything already-done so the in-flight set is minimal.
         self.tree_cache.flush_write_through_acks()
 
-        try:
-            src_host_pages, path_nodes = collect_path_with_pages(
-                self.tree_cache, full_key, page
-            )
-        except AssertionError as e:
-            return TransferRequestKVCacheReqOutput(success=False, message=str(e))
+        # `force_backup=True` actively pushes any device-only matched node to
+        # host (write_backup schedules an async DMA, finish_event registered
+        # in ack_write_queue). The wait_events snapshot below picks those up
+        # and the worker thread synchronizes before issuing the RDMA.
+        src_host_pages, path_nodes = collect_path_with_pages(
+            self.tree_cache, full_key, page, force_backup=True
+        )
 
         required_pages = total_aligned // page
         if len(src_host_pages) < required_pages:

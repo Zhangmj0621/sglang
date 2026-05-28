@@ -13,17 +13,26 @@ def collect_path_with_pages(
     tree_cache: "HiRadixCache",
     key: "RadixKey",
     page_size: int,
+    force_backup: bool = False,
 ) -> Tuple[List[int], List["TreeNode"]]:
     """Walk root → matched leaf along `key`. Return:
-      - `pages`: host pool page indices for every matched token
+      - `pages`: host pool page indices for every host-resident matched token
       - `path_nodes`: TreeNode visited (in root→leaf order, root excluded)
 
-    `path_nodes[i]` covers the page slice
-        pages[ sum(len(n.host_value) for n in path_nodes[:i]) // page_size :
-               sum(len(n.host_value) for n in path_nodes[:i+1]) // page_size ]
+    Stops at the first child that is either (a) absent / divergent, or
+    (b) not host-backuped. A node may be device-resident but not backuped
+    when its initial `write_backup` was never triggered or failed (host
+    pool OOM).
 
-    Asserts each matched node is backuped (write_through invariant).
-    Stops early if a child diverges mid-key.
+    With `force_backup=True` (used by the KV-migration source path), an
+    unbacked child gets `tree_cache.write_backup(child)` invoked: this
+    schedules a device→host DMA and sets `child.host_value` immediately
+    (so subsequent path nodes pass their parent-must-be-backuped check).
+    The caller is responsible for synchronizing the resulting CUDA
+    `finish_event` before reading host bytes — see
+    `KVMigrationManager._snapshot_inflight_events`. If `write_backup`
+    returns 0 (host pool OOM survives the internal evict_host retry),
+    the walk stops there and the caller surfaces a page shortfall.
     """
     pages: List[int] = []
     path_nodes: List["TreeNode"] = []
@@ -37,10 +46,15 @@ def collect_path_with_pages(
         prefix_len = tree_cache.key_match_fn(child.key, remaining)
         if prefix_len == 0:
             break
-        assert child.backuped, (
-            f"source node not backuped (write_through invariant violated); "
-            f"node.key.token_ids[:8]={list(child.key.token_ids[:8])}"
-        )
+        if not child.backuped:
+            if not force_backup:
+                break
+            # write_backup sets child.host_value (so child.backuped becomes
+            # True) and registers a finish_event in cache_controller.ack_write_queue.
+            n_written = tree_cache.write_backup(child)
+            if n_written == 0 or not child.backuped:
+                # host pool OOM even after internal retry; cannot migrate further
+                break
         host_idx = child.host_value[:prefix_len].tolist()
         if page_size == 1:
             pages.extend(int(p) for p in host_idx)
