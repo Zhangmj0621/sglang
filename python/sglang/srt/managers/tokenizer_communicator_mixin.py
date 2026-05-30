@@ -41,6 +41,20 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
+    AllocateTokenForTransferReqInput,
+    AllocateTokenForTransferReqOutput,
+    CommitTransferRequestKVCacheReqInput,
+    CommitTransferRequestKVCacheReqOutput,
+    GetRequestExtraTokenSizeReqInput,
+    GetRequestExtraTokenSizeReqOutput,
+    GetTransferSessionInfoReqInput,
+    GetTransferSessionInfoReqOutput,
+    TransferRequestKVCacheReqInput,
+    TransferRequestKVCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
@@ -205,6 +219,27 @@ class TokenizerCommunicatorMixin:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.release_ref_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_ref_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_transfer_session_info_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_request_extra_token_size_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.allocate_token_for_transfer_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.transfer_request_kvcache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.commit_transfer_request_kvcache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -309,6 +344,34 @@ class TokenizerCommunicatorMixin:
                     self.flush_cache_communicator.handle_recv,
                 ),
                 (
+                    ReleaseRefReqOutput,
+                    self.release_ref_communicator.handle_recv,
+                ),
+                (
+                    UpdateRefReqOutput,
+                    self.update_ref_communicator.handle_recv,
+                ),
+                (
+                    GetTransferSessionInfoReqOutput,
+                    self.get_transfer_session_info_communicator.handle_recv,
+                ),
+                (
+                    GetRequestExtraTokenSizeReqOutput,
+                    self.get_request_extra_token_size_communicator.handle_recv,
+                ),
+                (
+                    AllocateTokenForTransferReqOutput,
+                    self.allocate_token_for_transfer_communicator.handle_recv,
+                ),
+                (
+                    TransferRequestKVCacheReqOutput,
+                    self.transfer_request_kvcache_communicator.handle_recv,
+                ),
+                (
+                    CommitTransferRequestKVCacheReqOutput,
+                    self.commit_transfer_request_kvcache_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -345,6 +408,68 @@ class TokenizerCommunicatorMixin:
 
     async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+
+    async def release_ref(self: TokenizerManager, obj: ReleaseRefReqInput):
+        self.auto_create_handle_loop()
+        results = await self.release_ref_communicator(obj)
+        return _Communicator.merge_results(results)
+
+    async def update_ref(self: TokenizerManager, obj: UpdateRefReqInput):
+        self.auto_create_handle_loop()
+        results = await self.update_ref_communicator(obj)
+        return _Communicator.merge_results(results)
+
+    # -- KV migration --
+
+    async def get_transfer_session_info(self: TokenizerManager):
+        """Returns one GetTransferSessionInfoReqOutput per scheduler rank.
+        The HTTP layer assembles the topology table from this list.
+        """
+        self.auto_create_handle_loop()
+        return await self.get_transfer_session_info_communicator(
+            GetTransferSessionInfoReqInput()
+        )
+
+    async def get_request_extra_token_size(
+        self: TokenizerManager, obj: GetRequestExtraTokenSizeReqInput
+    ) -> GetRequestExtraTokenSizeReqOutput:
+        self.auto_create_handle_loop()
+        # All ranks should agree on the same extra/matched/total. Return rank 0.
+        return (await self.get_request_extra_token_size_communicator(obj))[0]
+
+    async def allocate_token_for_transfer(
+        self: TokenizerManager, obj: AllocateTokenForTransferReqInput
+    ):
+        """Returns one AllocateTokenForTransferReqOutput per rank."""
+        self.auto_create_handle_loop()
+        return await self.allocate_token_for_transfer_communicator(obj)
+
+    async def transfer_request_kvcache(
+        self: TokenizerManager, obj: TransferRequestKVCacheReqInput
+    ) -> TransferRequestKVCacheReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.transfer_request_kvcache_communicator(obj)
+        success = all(r.success for r in results)
+        message = (
+            "" if success else "; ".join(r.message for r in results if not r.success)
+        )
+        return TransferRequestKVCacheReqOutput(success=success, message=message)
+
+    async def commit_transfer_request_kvcache(
+        self: TokenizerManager, obj: CommitTransferRequestKVCacheReqInput
+    ) -> CommitTransferRequestKVCacheReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.commit_transfer_request_kvcache_communicator(obj)
+        success = all(r.success for r in results)
+        return CommitTransferRequestKVCacheReqOutput(
+            success=success,
+            matched_after_commit=(
+                results[0].matched_after_commit if success and results else 0
+            ),
+            message=(
+                "" if success else "; ".join(r.message for r in results if not r.success)
+            ),
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

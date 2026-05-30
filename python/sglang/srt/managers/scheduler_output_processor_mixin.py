@@ -44,6 +44,20 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _maybe_register_ref(self, req):
+        """Track a finished request's cached prefix for ref-aware eviction.
+
+        Called only after `release_kv_cache` has inserted the request's prefix
+        into the tree (so `req.last_node` / the tree path are up to date).
+        """
+        if getattr(self, "enable_ref_aware_kv_buffer", False):
+            from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
+                RefAwareHiRadixCache,
+            )
+
+            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                self.tree_cache.register_ref(req)
+
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
@@ -97,6 +111,7 @@ class SchedulerOutputProcessorMixin:
                     thread_finish_flag=True,
                 )
                 release_kv_cache(req, self.tree_cache)
+                self._maybe_register_ref(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -184,6 +199,7 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
+                        self._maybe_register_ref(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
@@ -318,6 +334,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self._maybe_register_ref(req)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -405,6 +422,7 @@ class SchedulerOutputProcessorMixin:
                 req.check_finished()
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
+                    self._maybe_register_ref(req)
                     req.time_stats.completion_time = time.perf_counter()
                     break
 
@@ -483,8 +501,10 @@ class SchedulerOutputProcessorMixin:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)
+                        self._maybe_register_ref(req)
                 else:
                     release_kv_cache(req, self.tree_cache)
+                    self._maybe_register_ref(req)
 
                 req.time_stats.completion_time = time.perf_counter()
 

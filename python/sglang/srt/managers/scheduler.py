@@ -76,6 +76,8 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AllocateTokenForTransferReqInput,
+    AllocateTokenForTransferReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BaseBatchReq,
@@ -85,6 +87,8 @@ from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    CommitTransferRequestKVCacheReqInput,
+    CommitTransferRequestKVCacheReqOutput,
     CloseSessionReqInput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -102,6 +106,10 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadsReqInput,
+    GetRequestExtraTokenSizeReqInput,
+    GetRequestExtraTokenSizeReqOutput,
+    GetTransferSessionInfoReqInput,
+    GetTransferSessionInfoReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -116,6 +124,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -127,8 +137,12 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TransferRequestKVCacheReqInput,
+    TransferRequestKVCacheReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -159,6 +173,7 @@ from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,
     SchedulerMetricsMixin,
+    _count_high_low_priority_reqs,
 )
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -324,6 +339,8 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_ref_aware_kv_buffer = server_args.enable_ref_aware_kv_buffer
+        self.high_priority_threshold = server_args.high_priority_threshold
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
@@ -697,9 +714,20 @@ class Scheduler(
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
-                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                if server_args.enable_ref_aware_kv_buffer:
+                    from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
+                        RefAwareHiRadixCache,
+                    )
 
-                self.tree_cache = HiRadixCache(params=params, server_args=server_args)
+                    self.tree_cache = RefAwareHiRadixCache(
+                        params=params, server_args=server_args
+                    )
+                else:
+                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                    self.tree_cache = HiRadixCache(
+                        params=params, server_args=server_args
+                    )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
@@ -725,6 +753,23 @@ class Scheduler(
                 )
             else:
                 self.tree_cache = RadixCache(params)
+
+        # KV migration manager (per-rank). Gated by --enable-kv-migration; only
+        # supported when a HiRadixCache-with-host-pool is in use (RefAware or plain).
+        self.kv_migration_manager = None
+        self._kv_migration_last_watchdog = 0.0
+        if server_args.enable_kv_migration:
+            host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+            if host_pool is None:
+                logger.warning(
+                    "kv-migration: --enable-kv-migration was set but the active "
+                    "tree_cache (%s) has no host pool; manager will not be initialized.",
+                    type(self.tree_cache).__name__,
+                )
+            else:
+                from sglang.srt.kv_migration import KVMigrationManager
+
+                self.kv_migration_manager = KVMigrationManager(self)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -1085,6 +1130,28 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (ReleaseRefReqInput, self.handle_release_ref),
+                (UpdateRefReqInput, self.handle_update_ref),
+                (
+                    GetTransferSessionInfoReqInput,
+                    self._kv_migration_get_session_info,
+                ),
+                (
+                    GetRequestExtraTokenSizeReqInput,
+                    self._kv_migration_get_extra_token_size,
+                ),
+                (
+                    AllocateTokenForTransferReqInput,
+                    self._kv_migration_allocate,
+                ),
+                (
+                    TransferRequestKVCacheReqInput,
+                    self._kv_migration_transfer,
+                ),
+                (
+                    CommitTransferRequestKVCacheReqInput,
+                    self._kv_migration_commit,
+                ),
             ]
         )
 
@@ -1873,6 +1940,7 @@ class Scheduler(
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._kv_migration_tick()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -2026,6 +2094,13 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        has_waiting_high_priority = False
+        if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
+            has_waiting_high_priority = any(
+                (req.priority or 0) >= self.high_priority_threshold
+                for req in self.waiting_queue
+            )
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2040,9 +2115,29 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            enable_ref_aware_kv_buffer=self.enable_ref_aware_kv_buffer,
+            high_priority_threshold=self.high_priority_threshold,
         )
 
-        if self.chunked_req is not None:
+        defer_low_priority_chunked_req = (
+            self.chunked_req is not None
+            and self.enable_priority_scheduling
+            and self.enable_ref_aware_kv_buffer
+            and has_waiting_high_priority
+            and (self.chunked_req.priority or 0) < self.high_priority_threshold
+        )
+
+        deferred_chunked_req = None
+        if defer_low_priority_chunked_req:
+            deferred_chunked_req = self.chunked_req
+            self.chunked_req = None
+
+        batch_priority_is_high = None
+        if self.chunked_req is not None and not defer_low_priority_chunked_req:
+            if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
+                batch_priority_is_high = (
+                    self.chunked_req.priority or 0
+                ) >= self.high_priority_threshold
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -2051,6 +2146,20 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
+                req_is_high = (req.priority or 0) >= self.high_priority_threshold
+                if (
+                    batch_priority_is_high is None
+                    and has_waiting_high_priority
+                    and not req_is_high
+                ):
+                    break
+                if (
+                    batch_priority_is_high is not None
+                    and req_is_high != batch_priority_is_high
+                ):
+                    break
+
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2068,7 +2177,17 @@ class Scheduler(
                         continue
 
             running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_allocatable = self.get_num_allocatable_reqs(running_bs)
+            if self.enable_ref_aware_kv_buffer:
+                req_slot_capacity = self.req_to_token_pool.available_size()
+                if (
+                    self.chunked_req is not None
+                    and self.chunked_req.req_pool_idx is not None
+                ):
+                    # A chunked request already owns a req slot and can reuse it in this batch.
+                    req_slot_capacity += 1
+                num_allocatable = min(num_allocatable, req_slot_capacity)
+            if len(adder.can_run_list) >= num_allocatable:
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -2102,6 +2221,16 @@ class Scheduler(
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
+            if (
+                res == AddReqResult.CONTINUE
+                and batch_priority_is_high is None
+                and self.enable_priority_scheduling
+                and self.enable_ref_aware_kv_buffer
+            ):
+                batch_priority_is_high = (
+                    req.priority or 0
+                ) >= self.high_priority_threshold
+
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -2115,6 +2244,8 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        if deferred_chunked_req is not None:
+            self._add_request_to_queue(deferred_chunked_req)
         if len(can_run_list) == 0:
             return None
 
@@ -2172,12 +2303,24 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward
+        (
+            _num_new_high_priority_reqs,
+            _num_new_low_priority_reqs,
+            _num_new_unknown_priority_reqs,
+        ) = _count_high_low_priority_reqs(
+            can_run_list,
+            self.enable_priority_scheduling,
+            self.high_priority_threshold,
+        )
         new_batch.prefill_stats = PrefillStats(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             running_bs=len(self.running_batch.reqs),
             num_new_seqs=len(can_run_list),
+            num_new_high_priority_reqs=_num_new_high_priority_reqs,
+            num_new_low_priority_reqs=_num_new_low_priority_reqs,
+            num_new_unknown_priority_reqs=_num_new_unknown_priority_reqs,
         )
 
         # Mixed-style chunked prefill
@@ -2477,6 +2620,108 @@ class Scheduler(
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
+
+    def handle_release_ref(self, recv_req: ReleaseRefReqInput):
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
+                RefAwareHiRadixCache,
+            )
+
+            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                success, msg = self.tree_cache.release_ref(recv_req.rid)
+                return ReleaseRefReqOutput(success=success, message=msg)
+        return ReleaseRefReqOutput(
+            success=False, message="ref-aware KV buffer not enabled"
+        )
+
+    def handle_update_ref(self, recv_req: UpdateRefReqInput):
+        if not self.enable_ref_aware_kv_buffer:
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
+
+        # Propagate priority into every in-flight Req with this rid BEFORE
+        # touching tier accounting, so concurrent prefill iterations always
+        # see a (req.priority, tier) pair that is internally consistent.
+        rid = recv_req.rid
+        new_priority = recv_req.new_priority
+        for req in getattr(self.running_batch, "reqs", []) or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        for req in self.waiting_queue or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None and getattr(chunked, "rid", None) == rid:
+            chunked.priority = new_priority
+
+        success, msg = self.tree_cache.update_ref(rid, new_priority)
+        return UpdateRefReqOutput(success=success, message=msg)
+
+    # -- KV migration wrappers --
+
+    def _kv_migration_get_session_info(
+        self, recv_req: GetTransferSessionInfoReqInput
+    ) -> GetTransferSessionInfoReqOutput:
+        if self.kv_migration_manager is None:
+            return GetTransferSessionInfoReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.get_session_info(recv_req)
+
+    def _kv_migration_get_extra_token_size(
+        self, recv_req: GetRequestExtraTokenSizeReqInput
+    ) -> GetRequestExtraTokenSizeReqOutput:
+        if self.kv_migration_manager is None:
+            return GetRequestExtraTokenSizeReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.get_extra_token_size_wrapped(recv_req)
+
+    def _kv_migration_allocate(
+        self, recv_req: AllocateTokenForTransferReqInput
+    ) -> AllocateTokenForTransferReqOutput:
+        if self.kv_migration_manager is None:
+            return AllocateTokenForTransferReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.allocate(recv_req)
+
+    def _kv_migration_transfer(self, recv_req: TransferRequestKVCacheReqInput):
+        """Returns either a sync output (immediate failure) or None to signal
+        that the response will be emitted later via `poll_pending_futures`."""
+        if self.kv_migration_manager is None:
+            return TransferRequestKVCacheReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.transfer(recv_req)
+
+    def _kv_migration_commit(
+        self, recv_req: CommitTransferRequestKVCacheReqInput
+    ) -> CommitTransferRequestKVCacheReqOutput:
+        if self.kv_migration_manager is None:
+            return CommitTransferRequestKVCacheReqOutput(
+                success=False, message="kv migration not enabled"
+            )
+        return self.kv_migration_manager.commit(recv_req)
+
+    def _kv_migration_tick(self) -> None:
+        """Called once per scheduler iteration. Drains completed transfer
+        futures and runs the watchdog at most once per second."""
+        if self.kv_migration_manager is None:
+            return
+        for output, recv_req in self.kv_migration_manager.poll_pending_futures():
+            self.send_to_tokenizer.send_output(output, recv_req)
+        now = time.monotonic()
+        if now - self._kv_migration_last_watchdog > 1.0:
+            self.kv_migration_manager.watchdog_tick()
+            self._kv_migration_last_watchdog = now
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

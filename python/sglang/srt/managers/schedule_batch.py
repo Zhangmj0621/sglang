@@ -1500,9 +1500,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
-        )
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            allow_high = any(
+                (req.priority or 0) >= self.tree_cache.high_priority_threshold
+                for req in reqs
+            )
+            with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
+                out_cache_loc, req_pool_indices_tensor, req_pool_indices = (
+                    alloc_for_extend(self)
+                )
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+                self
+            )
 
         # Set fields
         input_embeds = []
@@ -1833,8 +1845,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        self._evict_for_decode(num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _evict_for_decode(self, num_tokens: int):
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if server_args.enable_ref_aware_kv_buffer and isinstance(
+            self.tree_cache, RefAwareHiRadixCache
+        ):
+            if self.tree_cache.is_chunk_cache():
+                return
+            allocator = self.tree_cache.token_to_kv_pool_allocator
+            if allocator.available_size() < num_tokens:
+                # Decode-time OOM never evicts high_ref nodes. Prefill admission
+                # already reserved space against safe_evictable_size_by_tier(
+                # allow_high=True), so by construction we should not need
+                # high_ref headroom here. If we do hit OOM, retract is the
+                # recovery path -- losing a HP prefix is worse than retracting
+                # a few requests.
+                self.tree_cache._evict_tiered(
+                    num_tokens - allocator.available_size(),
+                    allow_low=True,
+                    allow_high=False,
+                )
+        else:
+            evict_from_tree_cache(self.tree_cache, num_tokens)
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
