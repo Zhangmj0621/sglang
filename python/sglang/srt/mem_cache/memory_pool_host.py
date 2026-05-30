@@ -369,6 +369,37 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def get_contiguous_buf_infos(self):
+        """Per-layer host buffer info for RDMA registration / page transfer.
+
+        Returns three lists, each with ``2 * layer_num`` entries (all K layers
+        followed by all V layers, matching ``MHATokenToKVPool`` ordering):
+        ``(data_ptrs, data_lens, item_lens)`` where ``item_lens`` is the byte
+        size of a single page. Page index ``p`` of layer ``i`` lives at
+        ``data_ptrs[i] + p * item_lens[i]``.
+
+        Only the ``layer_first`` host layout keeps each layer contiguous with
+        pages laid out back-to-back, which is what KV migration's page-indexed
+        addressing assumes.
+        """
+        if self.layout != "layer_first":
+            raise NotImplementedError(
+                "KV migration host transfer only supports layout='layer_first', "
+                f"got '{self.layout}'"
+            )
+        k_buffer = self.k_buffer
+        v_buffer = self.v_buffer
+        kv_data_ptrs = [
+            k_buffer[i].data_ptr() for i in range(self.layer_num)
+        ] + [v_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [
+            k_buffer[i].nbytes for i in range(self.layer_num)
+        ] + [v_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            k_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
+        ] + [v_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
     def load_to_device_per_layer(
         self,
         device_pool,
