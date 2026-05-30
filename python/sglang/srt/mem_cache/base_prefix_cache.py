@@ -88,6 +88,20 @@ class EvictResult:
     mamba_num_evicted: int = 0
 
 
+@dataclasses.dataclass
+class IncLockRefResult:
+    """Result of an inc_lock_ref operation (RefAware tier accounting)."""
+
+    delta: int = 0
+
+
+@dataclasses.dataclass
+class DecLockRefResult:
+    """Result of a dec_lock_ref operation (RefAware tier accounting)."""
+
+    delta: int = 0
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 

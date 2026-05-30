@@ -93,6 +93,34 @@ class RadixKey:
         preview = self.token_ids[:10]
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
+    def page_aligned(self, page_size: int) -> "RadixKey":
+        """Return a RadixKey truncated to a multiple of ``page_size`` tokens."""
+        if page_size <= 1:
+            return self
+        aligned_len = len(self.token_ids) // page_size * page_size
+        if aligned_len == len(self.token_ids):
+            return self
+        return RadixKey(
+            self.token_ids[:aligned_len], self.extra_key, is_bigram=self.is_bigram
+        )
+
+    def maybe_to_bigram_view(
+        self, is_eagle: bool, value: Optional["torch.Tensor"] = None
+    ) -> Tuple["RadixKey", Optional["torch.Tensor"]]:
+        """Return a (possibly bigram-converted) key plus a length-matched value.
+
+        Mirrors ``RadixCache.maybe_bigram_convert`` but as a RadixKey method so
+        RefAwareHiRadixCache's insert path can reuse it without a cache handle.
+        """
+        if is_eagle and not self.is_bigram:
+            new_key = RadixKey(
+                convert_to_bigram_key(self.token_ids), self.extra_key, is_bigram=True
+            )
+            if value is not None:
+                value = value[: len(new_key)]
+            return new_key, value
+        return self, value
+
 
 class TreeNode:
 
@@ -117,6 +145,10 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # ref-aware tiered eviction counters (RefAwareHiRadixCache)
+        self.high_ref = 0
+        self.low_ref = 0
+        self.tracked_rids: set = set()
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -678,6 +710,9 @@ class RadixCache(BasePrefixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
+        new_node.high_ref = child.high_ref
+        new_node.low_ref = child.low_ref
+        new_node.tracked_rids = set(child.tracked_rids)
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
         child.parent = new_node
