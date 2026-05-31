@@ -613,6 +613,10 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.backuped
+        ):
+            return 0
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -624,7 +628,7 @@ class HiRadixCache(RadixCache):
                 node_id=node.id,
             )
         if host_indices is not None:
-            node.host_value = host_indices
+            node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
@@ -763,7 +767,7 @@ class HiRadixCache(RadixCache):
             return
 
         for child in node.children.values():
-            if child.evicted:
+            if child.backuped:
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                 return
@@ -791,8 +795,10 @@ class HiRadixCache(RadixCache):
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
-                    num_evicted += self.write_backup(x, write_back=True)
-                    write_back_nodes.append(x)
+                    written = self.write_backup(x, write_back=True)
+                    num_evicted += written
+                    if written > 0:
+                        write_back_nodes.append(x)
                 else:
                     num_evicted += self._evict_regular(x)
             else:
@@ -831,6 +837,7 @@ class HiRadixCache(RadixCache):
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
+        assert len(node.children) == 0, f"non-leaf evicted as regular, {node.id=}"
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
@@ -914,7 +921,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)]
+            node.value = device_indices[offset : offset + len(node.host_value)].clone()
             offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
@@ -1380,7 +1387,7 @@ class HiRadixCache(RadixCache):
                 if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
-                    node.value = value[:prefix_len]
+                    node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
