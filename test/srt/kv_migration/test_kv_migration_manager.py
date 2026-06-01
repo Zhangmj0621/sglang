@@ -225,8 +225,10 @@ def test_allocate_returns_migration_id_and_indices():
         device_indices_len=32,
         host_hit_length=32,
     )
+    # Page-aligned contiguous token run: 128 tokens == 2 pages (page_size 64),
+    # starting at page-aligned token index 2048 (== page 32).
     mgr.host_pool.alloc.return_value = torch.tensor(
-        list(range(2000, 2128)), dtype=torch.int64
+        list(range(2048, 2176)), dtype=torch.int64
     )
     mgr.tree_cache.inc_lock_ref = MagicMock()
     mgr.pending = {}
@@ -241,10 +243,12 @@ def test_allocate_returns_migration_id_and_indices():
     )
     assert out.success is True
     assert out.migration_id == "mig-from-http"
-    assert len(out.kv_indices) == 128
-    assert out.kv_indices[0] == 2000
-    assert out.kv_indices[-1] == 2127
+    # kv_indices are PAGE indices (token_idx // page_size), one per page.
+    assert len(out.kv_indices) == 2
+    assert out.kv_indices == [32, 33]
     assert out.migration_id in mgr.pending
+    # The pending entry keeps the token-level indices for commit/free.
+    assert len(mgr.pending["mig-from-http"].host_tail_indices) == 128
     mgr.tree_cache.inc_lock_ref.assert_called_once()
 
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
 
 from sglang.srt.kv_migration.io_types import PendingMigration
@@ -60,10 +60,16 @@ class KVMigrationManager:
             self.host_pool is not None
         ), "KV migration requires HiRadixCache with host pool"
 
-        # Engine + memory registration (one-time at startup)
+        # Engine + memory registration (one-time at startup).
+        # Pass the configured IB device(s) through; without it Mooncake falls
+        # back to auto-discovery and may select unrelated NICs (e.g. a storage
+        # RoCE bond like mlx5_bond_0), causing cross-NIC QP handshake timeouts.
+        # `--mooncake-ib-device` accepts a single/CSV device list or a per-GPU
+        # JSON map (see get_ib_devices_for_gpu).
         self.engine: "MooncakeTransferEngine" = init_mooncake_transfer_engine(
             hostname=scheduler.server_args.host,
             gpu_id=scheduler.gpu_id,
+            ib_device=scheduler.server_args.mooncake_ib_device,
         )
         h_ptrs, h_lens, h_item_lens = self.host_pool.get_contiguous_buf_infos()
         self.host_kv_data_ptrs: List[int] = list(h_ptrs)
@@ -82,8 +88,6 @@ class KVMigrationManager:
         )
 
         self.pending: Dict[str, PendingMigration] = {}
-        # (future, meta-dict). Polled per scheduler tick.
-        self.pending_futures: List[Tuple[Future, dict]] = []
         self.watchdog_timeout_s: float = (
             scheduler.server_args.kv_migration_watchdog_timeout
         )
@@ -217,12 +221,25 @@ class KVMigrationManager:
             created_at=time.monotonic(),
         )
 
+        # `kv_indices` returned to the controller are PAGE indices, not token
+        # indices: the RDMA in do_host_to_host_rdma addresses whole pages
+        # (item_len == one page's bytes), and the source side likewise emits
+        # page indices via collect_path_with_pages. The host pool allocates
+        # page-aligned contiguous token runs, so page_idx = token_idx // page.
+        # (The token-level `host_tail` stays in `pending` for commit/free, which
+        # operate on the per-token radix host_value.)
+        host_tail_tokens = host_tail.cpu().tolist()
+        if page == 1:
+            page_indices = [int(t) for t in host_tail_tokens]
+        else:
+            page_indices = [int(t) // page for t in host_tail_tokens[::page]]
+
         return AllocateTokenForTransferReqOutput(
             success=True,
             migration_id=migration_id,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
-            kv_indices=host_tail.cpu().tolist(),
+            kv_indices=page_indices,
         )
 
     # -- commit (target side) --
@@ -314,13 +331,17 @@ class KVMigrationManager:
 
     def transfer(
         self, recv_req: TransferRequestKVCacheReqInput
-    ) -> Optional[TransferRequestKVCacheReqOutput]:
-        """Submit the RDMA transfer to `transfer_executor` and return None.
+    ) -> TransferRequestKVCacheReqOutput:
+        """Run the RDMA transfer for this rank's shard and return its result.
 
-        The scheduler tick polls `pending_futures` and emits the response when
-        the future completes. Synchronous failures (no target for this rank,
-        source missing pages, missing finish_event coverage) return a ready
-        response immediately.
+        This is synchronous: the RDMA runs on `transfer_executor` (so the CUDA
+        finish_event waits happen off the GIL-heavy path) but we block on the
+        result before returning. The scheduler must call this on every rank and
+        gather the per-rank outputs to the tokenizer head -- a TP/PP-sharded KV
+        cache is only fully migrated once every rank's shard has transferred.
+
+        Synchronous failures (no target for this rank, source missing pages,
+        missing finish_event coverage) return a failure response immediately.
 
         Before submission we also snapshot the CUDA `finish_event` of any
         device->host write_through DMA still in flight on the source side that
@@ -427,22 +448,21 @@ class KVMigrationManager:
             src_send_pages,
             wait_events,
         )
-        self.pending_futures.append(
-            (
-                future,
-                {
-                    "matched_node": match.last_device_node,
-                    "host_locked": host_locked,
-                    # `recv_req` is opaque to the manager; scheduler stores the
-                    # original request here so it can route the deferred output
-                    # via `send_to_tokenizer.send_output(output, recv_req)`.
-                    "recv_req": recv_req,
-                },
+        try:
+            ret = future.result()
+            output = TransferRequestKVCacheReqOutput(
+                success=(ret == 0),
+                message=("" if ret == 0 else f"batch_transfer_sync ret={ret}"),
             )
-        )
-        # None signals the caller that the response will be emitted via
-        # `poll_pending_futures` once the future completes.
-        return None
+        except Exception as e:
+            output = TransferRequestKVCacheReqOutput(
+                success=False, message=f"transfer raised: {e!r}"
+            )
+        finally:
+            # Release the source-side locks held for the duration of the write.
+            self.tree_cache.dec_lock_ref(match.last_device_node)
+            dec_host_refs(host_locked)
+        return output
 
     def _snapshot_inflight_events(
         self, send_window_node_ids: set
@@ -480,41 +500,6 @@ class KVMigrationManager:
         return wait_events, missing
 
     # -- main-loop tick helpers --
-
-    def poll_pending_futures(
-        self,
-    ) -> List[Tuple[TransferRequestKVCacheReqOutput, "TransferRequestKVCacheReqInput"]]:
-        """Called once per scheduler tick. Returns a list of
-        `(output, recv_req)` pairs for transfer futures that completed since
-        the last tick. Source-side locks are released here. The scheduler is
-        responsible for routing each output back to the tokenizer via
-        `send_to_tokenizer.send_output(output, recv_req)`.
-        """
-        from sglang.srt.kv_migration.tree_helpers import dec_host_refs
-
-        ready: List[
-            Tuple[TransferRequestKVCacheReqOutput, "TransferRequestKVCacheReqInput"]
-        ] = []
-        still_pending: List[Tuple[Future, dict]] = []
-        for future, meta in self.pending_futures:
-            if not future.done():
-                still_pending.append((future, meta))
-                continue
-            self.tree_cache.dec_lock_ref(meta["matched_node"])
-            dec_host_refs(meta["host_locked"])
-            try:
-                ret = future.result()
-                output = TransferRequestKVCacheReqOutput(
-                    success=(ret == 0),
-                    message=("" if ret == 0 else f"batch_transfer_sync ret={ret}"),
-                )
-            except Exception as e:
-                output = TransferRequestKVCacheReqOutput(
-                    success=False, message=f"transfer raised: {e!r}"
-                )
-            ready.append((output, meta["recv_req"]))
-        self.pending_futures = still_pending
-        return ready
 
     def watchdog_tick(self) -> None:
         """Roll back any pending allocate that has been waiting past

@@ -225,20 +225,26 @@ class TokenizerCommunicatorMixin:
         self.update_ref_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        # KV migration is per-rank: every TP/PP scheduler rank produces its own
+        # output (session id, allocated kv_indices, transfer/commit status), and
+        # the scheduler head gathers them and emits one message per rank. So the
+        # fan-out is the number of scheduler ranks, not dp_size (only the head
+        # can reply to the tokenizer, hence the gather).
+        kv_migration_fan_out = server_args.tp_size * server_args.pp_size
         self.get_transfer_session_info_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, kv_migration_fan_out
         )
         self.get_request_extra_token_size_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, kv_migration_fan_out
         )
         self.allocate_token_for_transfer_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, kv_migration_fan_out
         )
         self.transfer_request_kvcache_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, kv_migration_fan_out
         )
         self.commit_transfer_request_kvcache_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, kv_migration_fan_out
         )
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size

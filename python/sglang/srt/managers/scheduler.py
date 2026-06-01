@@ -2666,58 +2666,89 @@ class Scheduler(
 
     # -- KV migration wrappers --
 
+    def _is_kv_migration_head(self) -> bool:
+        """Only this rank owns a real send_to_tokenizer socket; every other
+        rank's send_output is a no-op (see SenderWrapper(None) in init). So
+        per-rank migration outputs must be gathered to this rank before they can
+        reach the tokenizer."""
+        return (
+            self.pp_rank == 0
+            and self.attn_tp_rank == 0
+            and self.attn_cp_rank == 0
+        )
+
+    def _kv_migration_reply(self, local_output, recv_req):
+        """Collective: gather this rank's migration output with every other
+        rank's, then have the tokenizer head emit one message per rank. All
+        ranks run the same broadcast request in lockstep, so the all_gather is
+        deadlock-free. Returns None so the generic dispatch path does not also
+        send the (rank-local, possibly dropped) output."""
+        gathered = self.world_group.all_gather_object(local_output)
+        if self._is_kv_migration_head():
+            for out in gathered:
+                self.send_to_tokenizer.send_output(out, recv_req)
+        return None
+
     def _kv_migration_get_session_info(
         self, recv_req: GetTransferSessionInfoReqInput
-    ) -> GetTransferSessionInfoReqOutput:
+    ):
         if self.kv_migration_manager is None:
-            return GetTransferSessionInfoReqOutput(
+            local = GetTransferSessionInfoReqOutput(
                 success=False, message="kv migration not enabled"
             )
-        return self.kv_migration_manager.get_session_info(recv_req)
+        else:
+            local = self.kv_migration_manager.get_session_info(recv_req)
+        return self._kv_migration_reply(local, recv_req)
 
     def _kv_migration_get_extra_token_size(
         self, recv_req: GetRequestExtraTokenSizeReqInput
-    ) -> GetRequestExtraTokenSizeReqOutput:
+    ):
         if self.kv_migration_manager is None:
-            return GetRequestExtraTokenSizeReqOutput(
+            local = GetRequestExtraTokenSizeReqOutput(
                 success=False, message="kv migration not enabled"
             )
-        return self.kv_migration_manager.get_extra_token_size_wrapped(recv_req)
+        else:
+            local = self.kv_migration_manager.get_extra_token_size_wrapped(recv_req)
+        return self._kv_migration_reply(local, recv_req)
 
     def _kv_migration_allocate(
         self, recv_req: AllocateTokenForTransferReqInput
-    ) -> AllocateTokenForTransferReqOutput:
+    ):
         if self.kv_migration_manager is None:
-            return AllocateTokenForTransferReqOutput(
+            local = AllocateTokenForTransferReqOutput(
                 success=False, message="kv migration not enabled"
             )
-        return self.kv_migration_manager.allocate(recv_req)
+        else:
+            local = self.kv_migration_manager.allocate(recv_req)
+        return self._kv_migration_reply(local, recv_req)
 
     def _kv_migration_transfer(self, recv_req: TransferRequestKVCacheReqInput):
-        """Returns either a sync output (immediate failure) or None to signal
-        that the response will be emitted later via `poll_pending_futures`."""
         if self.kv_migration_manager is None:
-            return TransferRequestKVCacheReqOutput(
+            local = TransferRequestKVCacheReqOutput(
                 success=False, message="kv migration not enabled"
             )
-        return self.kv_migration_manager.transfer(recv_req)
+        else:
+            local = self.kv_migration_manager.transfer(recv_req)
+        return self._kv_migration_reply(local, recv_req)
 
     def _kv_migration_commit(
         self, recv_req: CommitTransferRequestKVCacheReqInput
-    ) -> CommitTransferRequestKVCacheReqOutput:
+    ):
         if self.kv_migration_manager is None:
-            return CommitTransferRequestKVCacheReqOutput(
+            local = CommitTransferRequestKVCacheReqOutput(
                 success=False, message="kv migration not enabled"
             )
-        return self.kv_migration_manager.commit(recv_req)
+        else:
+            local = self.kv_migration_manager.commit(recv_req)
+        return self._kv_migration_reply(local, recv_req)
 
     def _kv_migration_tick(self) -> None:
-        """Called once per scheduler iteration. Drains completed transfer
-        futures and runs the watchdog at most once per second."""
+        """Called once per scheduler iteration. Runs the migration watchdog at
+        most once per second (rolling back pending allocations that never got a
+        commit). Transfers are synchronous, so there are no deferred futures to
+        drain here."""
         if self.kv_migration_manager is None:
             return
-        for output, recv_req in self.kv_migration_manager.poll_pending_futures():
-            self.send_to_tokenizer.send_output(output, recv_req)
         now = time.monotonic()
         if now - self._kv_migration_last_watchdog > 1.0:
             self.kv_migration_manager.watchdog_tick()
