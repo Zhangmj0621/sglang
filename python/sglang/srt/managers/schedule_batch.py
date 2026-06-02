@@ -1845,34 +1845,65 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        self._evict_for_decode(num_tokens)
+        self._evict_for_decode(num_tokens, selected_indices)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
-    def _evict_for_decode(self, num_tokens: int):
+    def _evict_for_decode(
+        self, num_tokens: int, selected_indices: Optional[List[int]] = None
+    ):
         from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
         from sglang.srt.server_args import get_global_server_args
 
         server_args = get_global_server_args()
-        if server_args.enable_ref_aware_kv_buffer and isinstance(
-            self.tree_cache, RefAwareHiRadixCache
+        if not (
+            server_args.enable_ref_aware_kv_buffer
+            and isinstance(self.tree_cache, RefAwareHiRadixCache)
         ):
-            if self.tree_cache.is_chunk_cache():
-                return
-            allocator = self.tree_cache.token_to_kv_pool_allocator
-            if allocator.available_size() < num_tokens:
-                # Decode-time OOM never evicts high_ref nodes. Prefill admission
-                # already reserved space against safe_evictable_size_by_tier(
-                # allow_high=True), so by construction we should not need
-                # high_ref headroom here. If we do hit OOM, retract is the
-                # recovery path -- losing a HP prefix is worse than retracting
-                # a few requests.
-                self.tree_cache._evict_tiered(
-                    num_tokens - allocator.available_size(),
-                    allow_low=True,
-                    allow_high=False,
-                )
-        else:
             evict_from_tree_cache(self.tree_cache, num_tokens)
+            return
+
+        if self.tree_cache.is_chunk_cache():
+            return
+
+        allocator = self.tree_cache.token_to_kv_pool_allocator
+        if allocator.available_size() >= num_tokens:
+            return
+
+        # Phase 1: reclaim only idle non-high tiers (unused + low_ref). These
+        # are safe to drop on behalf of any request, high or low priority.
+        self.tree_cache._evict_tiered(
+            num_tokens - allocator.available_size(),
+            allow_low=True,
+            allow_high=False,
+        )
+
+        shortfall = num_tokens - allocator.available_size()
+        if shortfall <= 0:
+            return
+
+        # Phase 2: a remaining shortfall may dip into idle (lock_ref == 0)
+        # high_ref prefixes -- evicting one only forces a later recompute/reload,
+        # it never drops in-use state. But the eviction must be bounded to what
+        # the HIGH-priority requests in this batch actually need: a low-priority
+        # shortfall must NOT sacrifice an idle HP prefix. Freed slots are
+        # fungible, so we cap high_ref eviction at the HP requests' own decode
+        # demand; any demand beyond that is left for retract to resolve.
+        threshold = self.tree_cache.high_priority_threshold
+        scope = (
+            range(len(self.reqs)) if selected_indices is None else selected_indices
+        )
+        hp_indices = [i for i in scope if (self.reqs[i].priority or 0) >= threshold]
+        if not hp_indices:
+            return
+
+        hp_tokens = self.new_tokens_required_next_decode(hp_indices)
+        high_target = min(shortfall, hp_tokens)
+        if high_target > 0:
+            self.tree_cache._evict_tiered(
+                high_target,
+                allow_low=False,
+                allow_high=True,
+            )
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -1894,8 +1925,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
+            # Retract low-priority requests first. The loop pops victims from
+            # the tail of sorted_indices, and reverse=True keeps the highest
+            # key at the front, so ranking high-priority (is_high=True) above
+            # low-priority (False) makes every LP req a retract candidate
+            # before any HP req. Within a priority class the original heuristic
+            # stands: keep the most-decoded / shortest-input reqs and retract
+            # the least-progressed ones first (cheapest work to redo).
+            threshold = getattr(server_args, "high_priority_threshold", 1)
             sorted_indices.sort(
                 key=lambda i: (
+                    (self.reqs[i].priority or 0) >= threshold,
                     len(self.reqs[i].output_ids),
                     -len(self.reqs[i].origin_input_ids),
                 ),
