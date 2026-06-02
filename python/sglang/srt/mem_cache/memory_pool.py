@@ -155,9 +155,16 @@ class ReqToTokenPool:
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
         chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         if not any(r.is_dllm() for r in reqs):
-            assert (
-                len(chunked) <= 1
-            ), "only one chunked request may reuse req_pool_idx in a batch"
+            assert len(chunked) <= 1, (
+                "only one chunked request may reuse req_pool_idx in a batch; "
+                f"got {len(chunked)}: "
+                + ", ".join(
+                    f"(rid={reqs[i].rid}, is_chunked={reqs[i].is_chunked}, "
+                    f"kv_committed_len={reqs[i].kv_committed_len}, "
+                    f"priority={getattr(reqs[i], 'priority', None)})"
+                    for i in chunked
+                )
+            )
         assert all(
             reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
         ), "request has req_pool_idx but is not chunked"

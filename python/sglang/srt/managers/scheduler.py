@@ -2119,26 +2119,40 @@ class Scheduler(
             high_priority_threshold=self.high_priority_threshold,
         )
 
-        defer_low_priority_chunked_req = (
-            self.chunked_req is not None
-            and self.enable_priority_scheduling
-            and self.enable_ref_aware_kv_buffer
-            and has_waiting_high_priority
-            and (self.chunked_req.priority or 0) < self.high_priority_threshold
-        )
-
+        # Yield the in-flight low-priority chunked prefill to waiting high-priority
+        # work ONLY under KV-cache pressure, i.e. when continuing its next chunk
+        # would leave no budget to admit a high-priority request. When memory
+        # suffices we keep running it alongside the high-priority requests. On
+        # yield we drop (not cache) its partial KV since we are reclaiming memory,
+        # and release its req slot so it re-enters the queue as a clean prefill.
         deferred_chunked_req = None
-        if defer_low_priority_chunked_req:
-            deferred_chunked_req = self.chunked_req
-            self.chunked_req = None
-
         batch_priority_is_high = None
-        if self.chunked_req is not None and not defer_low_priority_chunked_req:
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+
+            if (
+                self.enable_priority_scheduling
+                and self.enable_ref_aware_kv_buffer
+                and has_waiting_high_priority
+                and (self.chunked_req.priority or 0) < self.high_priority_threshold
+            ):
+                chunk_cost = adder.ceil_paged_tokens(
+                    min(self.chunked_req.extend_input_len, chunked_prefill_size)
+                )
+                high_budget = adder._rem_total_tokens_ref_aware(is_high=True)
+                if high_budget - chunk_cost <= 0:
+                    deferred_chunked_req = self.chunked_req
+                    self.chunked_req = None
+                    release_kv_cache(
+                        deferred_chunked_req, self.tree_cache, is_insert=False
+                    )
+                    deferred_chunked_req.reset_for_retract()
+
+        if self.chunked_req is not None:
             if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
                 batch_priority_is_high = (
                     self.chunked_req.priority or 0
                 ) >= self.high_priority_threshold
-            self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
