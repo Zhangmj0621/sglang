@@ -852,7 +852,17 @@ class Scheduler(
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
-        self.try_preemption = self.enable_priority_scheduling
+        # Under ref-aware KV buffer, high-priority preemption is handled by the
+        # cache's own _kick_low_priority_for_high (in add_one_req), so the
+        # generic per-round preempt_to_schedule (which re-sorts the whole running
+        # batch every prefill round and can retract running reqs) is redundant.
+        # Disabling it here avoids that per-round O(R log R) sort + retraction
+        # churn -- a likely cause of the GPU-utilization drop. batch_is_full is
+        # still cleared naturally when a running req finishes (see the filter
+        # step in get_next_batch_to_run), so prefill resumes without it.
+        self.try_preemption = self.enable_priority_scheduling and (
+            not self.enable_ref_aware_kv_buffer
+        )
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
