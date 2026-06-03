@@ -63,6 +63,10 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.unused_evictable_size_: int = 0
         self.low_ref_evictable_size_: int = 0
         self.high_ref_evictable_size_: int = 0
+        # Backuped subset of high_ref_evictable_size_: tokens that are high-ref,
+        # device-resident, unlocked AND already have a host copy. Maintained
+        # incrementally so the host-safe admission budget stays O(1).
+        self.high_ref_backuped_size_: int = 0
         self.rid_to_ref_info: Dict[str, RefInfo] = {}
         self._evict_scope_stack: list[tuple[bool, bool]] = []
         super().__init__(params=params, server_args=server_args)
@@ -74,6 +78,7 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.unused_evictable_size_ = 0
         self.low_ref_evictable_size_ = 0
         self.high_ref_evictable_size_ = 0
+        self.high_ref_backuped_size_ = 0
         self.rid_to_ref_info.clear()
         self._evict_scope_stack.clear()
         super().reset()
@@ -96,6 +101,11 @@ class RefAwareHiRadixCache(HiRadixCache):
             new_set.add(node)
         self._add_tier_size(old_tier, -node_size)
         self._add_tier_size(new_tier, node_size)
+        if node.backuped:
+            if old_tier == TIER_HIGH_REF:
+                self.high_ref_backuped_size_ -= node_size
+            if new_tier == TIER_HIGH_REF:
+                self.high_ref_backuped_size_ += node_size
 
     def _tier_leaf_set(self, tier: int) -> set:
         if tier == TIER_UNUSED:
@@ -116,7 +126,10 @@ class RefAwareHiRadixCache(HiRadixCache):
     def _account_new_evictable_node(self, node: TreeNode):
         if node in (None, self.root_node) or node.evicted or node.lock_ref > 0:
             return
-        self._add_tier_size(_classify_node_tier(node), len(node.key))
+        tier = _classify_node_tier(node)
+        self._add_tier_size(tier, len(node.key))
+        if tier == TIER_HIGH_REF and node.backuped:
+            self.high_ref_backuped_size_ += len(node.key)
 
     # --- Override leaf status tracking ---
 
@@ -167,6 +180,8 @@ class RefAwareHiRadixCache(HiRadixCache):
                     if node in tier_set:
                         tier_set.discard(node)
                     self._add_tier_size(tier, -len(node.key))
+                    if tier == TIER_HIGH_REF and node.backuped:
+                        self.high_ref_backuped_size_ -= len(node.key)
             node.lock_ref += 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -186,6 +201,8 @@ class RefAwareHiRadixCache(HiRadixCache):
                 if not node.evicted:
                     tier = _classify_node_tier(node)
                     self._add_tier_size(tier, len(node.key))
+                    if tier == TIER_HIGH_REF and node.backuped:
+                        self.high_ref_backuped_size_ += len(node.key)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -200,6 +217,8 @@ class RefAwareHiRadixCache(HiRadixCache):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
+        if tier == TIER_HIGH_REF and node.backuped:
+            self.high_ref_backuped_size_ -= len(node.key)
         for rid in node.tracked_rids:
             ref_info = self.rid_to_ref_info.get(rid)
             if ref_info is not None:
@@ -219,134 +238,30 @@ class RefAwareHiRadixCache(HiRadixCache):
             total += self.high_ref_evictable_size_
         return total
 
-    def _tier_rank(self, tier: int, allow_low: bool = True, allow_high: bool = False):
-        if tier == TIER_UNUSED:
-            return 0
-        if tier == TIER_LOW_REF:
-            return 1 if allow_low else None
-        if tier == TIER_HIGH_REF:
-            return 2 if allow_high else None
-        return None
-
-    def host_evictable_size_by_tier(
-        self, allow_low: bool = True, allow_high: bool = False
-    ) -> int:
-        removed_nodes = set()
-        eviction_heap = []
-
-        for node in self.evictable_host_leaves:
-            tier = _classify_node_tier(node)
-            tier_rank = self._tier_rank(tier, allow_low=allow_low, allow_high=allow_high)
-            if (
-                tier_rank is None
-                or not node.evicted
-                or node.host_ref_counter > 0
-                or node.host_value is None
-            ):
-                continue
-            heapq.heappush(
-                eviction_heap,
-                ((tier_rank, self._get_tier_priority(node, tier)), node),
-            )
-
-        num_evicted = 0
-        while eviction_heap:
-            (_priority, x) = heapq.heappop(eviction_heap)
-
-            if (
-                x in removed_nodes
-                or x == self.root_node
-                or not x.evicted
-                or x.host_ref_counter > 0
-                or x.host_value is None
-            ):
-                continue
-
-            tier = _classify_node_tier(x)
-            tier_rank = self._tier_rank(tier, allow_low=allow_low, allow_high=allow_high)
-            if tier_rank is None:
-                continue
-
-            num_evicted += len(x.host_value)
-            removed_nodes.add(x)
-
-            parent = x.parent
-            if parent in (None, self.root_node):
-                continue
-
-            if (
-                parent.evicted
-                and parent.host_ref_counter == 0
-                and parent.host_value is not None
-                and all(child in removed_nodes for child in parent.children.values())
-            ):
-                parent_tier = _classify_node_tier(parent)
-                parent_rank = self._tier_rank(
-                    parent_tier, allow_low=allow_low, allow_high=allow_high
-                )
-                if parent_rank is not None:
-                    heapq.heappush(
-                        eviction_heap,
-                        (
-                            (parent_rank, self._get_tier_priority(parent, parent_tier)),
-                            parent,
-                        ),
-                    )
-
-        return num_evicted
-
     def high_ref_host_safe_evictable_size(self) -> int:
+        """O(1) safe lower bound on high-ref device tokens that can be freed
+        without dropping any high-ref prefix. Matches the eviction behaviour in
+        `_evict_from_tier` for the high tier.
+
+        Backuped high-ref nodes are always freeable (drop the device copy, the
+        host copy persists). Unbackuped high-ref nodes are never dropped:
+        - write_through: they are skipped during eviction (the proactive
+          write-through path backs them up over time), so they do not count.
+        - write_back: they may be spilled on demand, bounded by the currently
+          free host room. We deliberately ignore host space reclaimable by
+          evicting low-priority host entries, keeping this a safe lower bound
+          (never over-admits -> no prefill OOM).
+        """
         if self.cache_controller.write_policy != "write_back":
-            return self.high_ref_evictable_size_
+            return self.high_ref_backuped_size_
 
-        host_budget = self.cache_controller.mem_pool_host.available_size()
-        host_budget += self.host_evictable_size_by_tier(
-            allow_low=True,
-            allow_high=False,
-        )
-
-        num_evicted = 0
-        virtually_evicted = set()
-        eviction_heap = [
-            ((0, self._get_tier_priority(node, TIER_HIGH_REF)), node)
-            for node in self.high_ref_evictable_leaves
-        ]
-        heapq.heapify(eviction_heap)
-
-        while eviction_heap:
-            (_priority, x) = heapq.heappop(eviction_heap)
-            if (
-                x in virtually_evicted
-                or x.lock_ref > 0
-                or x.evicted
-                or _classify_node_tier(x) != TIER_HIGH_REF
-            ):
-                continue
-
-            spill_cost = 0 if x.backuped else len(x.value)
-            if spill_cost > host_budget:
-                continue
-
-            host_budget -= spill_cost
-            num_evicted += len(x.key)
-            virtually_evicted.add(x)
-
-            parent = x.parent
-            if (
-                parent not in (None, self.root_node)
-                and parent.lock_ref == 0
-                and _classify_node_tier(parent) == TIER_HIGH_REF
-                and all(
-                    child.evicted or child in virtually_evicted
-                    for child in parent.children.values()
-                )
-            ):
-                heapq.heappush(
-                    eviction_heap,
-                    ((0, self._get_tier_priority(parent, TIER_HIGH_REF)), parent),
-                )
-
-        return num_evicted
+        unbackuped = self.high_ref_evictable_size_ - self.high_ref_backuped_size_
+        if unbackuped < 0:
+            unbackuped = 0
+        host_room = self.cache_controller.mem_pool_host.available_size()
+        if host_room < 0:
+            host_room = 0
+        return self.high_ref_backuped_size_ + min(unbackuped, host_room)
 
     def safe_evictable_size_by_tier(
         self, allow_low: bool = True, allow_high: bool = False
@@ -437,10 +352,24 @@ class RefAwareHiRadixCache(HiRadixCache):
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
+                    # Spill to host on demand (write_backup evicts low-priority
+                    # host entries first if needed, never high-ref ones). Under
+                    # write_back, ongoing_write_through holds only these spill
+                    # nodes, so the blocking writing_check below is safe.
                     written = self.write_backup(x, write_back=True)
-                    num_evicted += written
                     if written > 0:
+                        num_evicted += written
                         write_back_nodes.append(x)
+                    # written == 0: host full, no low host to reclaim -> skip
+                    # (fall through; node stays resident, never dropped).
+                elif target_tier == TIER_HIGH_REF:
+                    # write_through: a high-ref prefix must never be dropped.
+                    # The proactive write-through path backs it up to host
+                    # asynchronously; until it is backuped we simply skip it
+                    # here. We must NOT call writing_check(write_back=True) under
+                    # write_through, as that would steal the locked write-through
+                    # nodes from ongoing_write_through without releasing them.
+                    continue
                 else:
                     num_evicted += self._evict_regular(x)
             else:
@@ -457,7 +386,7 @@ class RefAwareHiRadixCache(HiRadixCache):
                         new_priority = self._get_tier_priority(x.parent, target_tier)
                         heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-        if self.cache_controller.write_policy == "write_back":
+        if write_back_nodes:
             self.writing_check(write_back=True)
             for node in write_back_nodes:
                 assert node.backuped
@@ -545,9 +474,22 @@ class RefAwareHiRadixCache(HiRadixCache):
                 node_id=node.id,
             )
         if host_indices is not None:
+            was_backuped = node.backuped
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
+            # A high-ref device node that just gained a host copy now counts
+            # toward the host-safe (free to evict) subset, as long as it is
+            # still resident and unlocked. If unlocked here but locked right
+            # after (write_through path calls inc_lock_ref below), inc_lock_ref
+            # removes it again, keeping the counter consistent.
+            if (
+                not was_backuped
+                and not node.evicted
+                and node.lock_ref == 0
+                and _classify_node_tier(node) == TIER_HIGH_REF
+            ):
+                self.high_ref_backuped_size_ += len(node.key)
             if not write_back:
                 self.inc_lock_ref(node)
         else:
@@ -644,6 +586,8 @@ class RefAwareHiRadixCache(HiRadixCache):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
+        if tier == TIER_HIGH_REF and node.backuped:
+            self.high_ref_backuped_size_ -= len(node.key)
         return super()._evict_backuped(node)
 
     def release_ref(self, rid: str) -> Tuple[bool, str]:

@@ -2126,21 +2126,35 @@ class Scheduler(
         # yield we drop (not cache) its partial KV since we are reclaiming memory,
         # and release its req slot so it re-enters the queue as a clean prefill.
         deferred_chunked_req = None
-        batch_priority_is_high = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
 
-            if (
-                self.enable_priority_scheduling
-                and self.enable_ref_aware_kv_buffer
-                and has_waiting_high_priority
-                and (self.chunked_req.priority or 0) < self.high_priority_threshold
-            ):
-                chunk_cost = adder.ceil_paged_tokens(
-                    min(self.chunked_req.extend_input_len, chunked_prefill_size)
-                )
-                high_budget = adder._rem_total_tokens_ref_aware(is_high=True)
-                if high_budget - chunk_cost <= 0:
+            if self.enable_ref_aware_kv_buffer:
+                chunk_is_high = (
+                    self.chunked_req.priority or 0
+                ) >= self.high_priority_threshold
+                # Memory the chunk's own priority tier can reclaim. A low-priority
+                # chunk cannot evict high-ref KV, so high-ref is excluded here.
+                own_budget = adder._rem_total_tokens_ref_aware(chunk_is_high)
+                # If even one page beyond the allocator's per-request overhead is
+                # not reclaimable in this tier, the chunk cannot make progress.
+                # Retract it (drop partial KV, re-queue) instead of forcing it
+                # through against memory it cannot evict -> would OOM at alloc.
+                must_yield = own_budget <= adder.page_size
+                # A low-priority chunk also yields to a waiting high-priority
+                # request when continuing it would starve that request.
+                if (
+                    not must_yield
+                    and has_waiting_high_priority
+                    and not chunk_is_high
+                ):
+                    chunk_cost = adder.ceil_paged_tokens(
+                        min(self.chunked_req.extend_input_len, chunked_prefill_size)
+                    )
+                    high_budget = adder._rem_total_tokens_ref_aware(is_high=True)
+                    must_yield = high_budget - chunk_cost <= 0
+
+                if must_yield:
                     deferred_chunked_req = self.chunked_req
                     self.chunked_req = None
                     release_kv_cache(
@@ -2149,10 +2163,6 @@ class Scheduler(
                     deferred_chunked_req.reset_for_retract()
 
         if self.chunked_req is not None:
-            if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
-                batch_priority_is_high = (
-                    self.chunked_req.priority or 0
-                ) >= self.high_priority_threshold
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2160,20 +2170,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
-                req_is_high = (req.priority or 0) >= self.high_priority_threshold
-                if (
-                    batch_priority_is_high is None
-                    and has_waiting_high_priority
-                    and not req_is_high
-                ):
-                    break
-                if (
-                    batch_priority_is_high is not None
-                    and req_is_high != batch_priority_is_high
-                ):
-                    break
-
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2234,16 +2230,6 @@ class Scheduler(
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
-
-            if (
-                res == AddReqResult.CONTINUE
-                and batch_priority_is_high is None
-                and self.enable_priority_scheduling
-                and self.enable_ref_aware_kv_buffer
-            ):
-                batch_priority_is_high = (
-                    req.priority or 0
-                ) >= self.high_priority_threshold
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
