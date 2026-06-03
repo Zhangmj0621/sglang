@@ -2145,12 +2145,21 @@ class Scheduler(
                 ) >= self.high_priority_threshold
                 # Memory the chunk's own priority tier can reclaim. A low-priority
                 # chunk cannot evict high-ref KV, so high-ref is excluded here.
-                own_budget = adder._rem_total_tokens_ref_aware(chunk_is_high)
+                # Must use the SAME integer formula as add_chunked_req
+                # (int(rem) - page_size); _rem_total_tokens_ref_aware is a float
+                # (rem_total_token_offset scales by new_token_ratio). A float
+                # compare here would let a budget in (page_size, page_size+1)
+                # skip the yield, yet add_chunked_req would then truncate the
+                # chunk to 0 tokens and emit a 0-token extend batch -> crash.
+                own_budget = (
+                    int(adder._rem_total_tokens_ref_aware(chunk_is_high))
+                    - adder.page_size
+                )
                 # If even one page beyond the allocator's per-request overhead is
                 # not reclaimable in this tier, the chunk cannot make progress.
                 # Retract it (drop partial KV, re-queue) instead of forcing it
                 # through against memory it cannot evict -> would OOM at alloc.
-                must_yield = own_budget <= adder.page_size
+                must_yield = own_budget <= 0
                 # A low-priority chunk also yields to a waiting high-priority
                 # request when continuing it would starve that request.
                 if (
