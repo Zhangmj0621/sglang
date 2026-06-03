@@ -677,7 +677,7 @@ class RefAwareHiRadixCache(HiRadixCache):
         new_node = super()._split_node(key, child, split_len)
         new_node.high_ref = child.high_ref
         new_node.low_ref = child.low_ref
-        # new_node inherits tracked_rids from child (already done in RadixCache._split_node)
+        new_node.tracked_rids = set(child.tracked_rids)
         # Update rid_to_ref_info: add new_node to each tracking rid's node set
         for rid in new_node.tracked_rids:
             ref_info = self.rid_to_ref_info.get(rid)
