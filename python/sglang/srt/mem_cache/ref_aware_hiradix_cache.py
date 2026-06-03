@@ -63,10 +63,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.unused_evictable_size_: int = 0
         self.low_ref_evictable_size_: int = 0
         self.high_ref_evictable_size_: int = 0
-        # Backuped subset of high_ref_evictable_size_: tokens that are high-ref,
-        # device-resident, unlocked AND already have a host copy. Maintained
-        # incrementally so the host-safe admission budget stays O(1).
-        self.high_ref_backuped_size_: int = 0
         self.rid_to_ref_info: Dict[str, RefInfo] = {}
         self._evict_scope_stack: list[tuple[bool, bool]] = []
         super().__init__(params=params, server_args=server_args)
@@ -78,7 +74,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.unused_evictable_size_ = 0
         self.low_ref_evictable_size_ = 0
         self.high_ref_evictable_size_ = 0
-        self.high_ref_backuped_size_ = 0
         self.rid_to_ref_info.clear()
         self._evict_scope_stack.clear()
         super().reset()
@@ -101,11 +96,6 @@ class RefAwareHiRadixCache(HiRadixCache):
             new_set.add(node)
         self._add_tier_size(old_tier, -node_size)
         self._add_tier_size(new_tier, node_size)
-        if node.backuped:
-            if old_tier == TIER_HIGH_REF:
-                self.high_ref_backuped_size_ -= node_size
-            if new_tier == TIER_HIGH_REF:
-                self.high_ref_backuped_size_ += node_size
 
     def _tier_leaf_set(self, tier: int) -> set:
         if tier == TIER_UNUSED:
@@ -126,10 +116,7 @@ class RefAwareHiRadixCache(HiRadixCache):
     def _account_new_evictable_node(self, node: TreeNode):
         if node in (None, self.root_node) or node.evicted or node.lock_ref > 0:
             return
-        tier = _classify_node_tier(node)
-        self._add_tier_size(tier, len(node.key))
-        if tier == TIER_HIGH_REF and node.backuped:
-            self.high_ref_backuped_size_ += len(node.key)
+        self._add_tier_size(_classify_node_tier(node), len(node.key))
 
     # --- Override leaf status tracking ---
 
@@ -180,8 +167,6 @@ class RefAwareHiRadixCache(HiRadixCache):
                     if node in tier_set:
                         tier_set.discard(node)
                     self._add_tier_size(tier, -len(node.key))
-                    if tier == TIER_HIGH_REF and node.backuped:
-                        self.high_ref_backuped_size_ -= len(node.key)
             node.lock_ref += 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -201,8 +186,6 @@ class RefAwareHiRadixCache(HiRadixCache):
                 if not node.evicted:
                     tier = _classify_node_tier(node)
                     self._add_tier_size(tier, len(node.key))
-                    if tier == TIER_HIGH_REF and node.backuped:
-                        self.high_ref_backuped_size_ += len(node.key)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -217,8 +200,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
-        if tier == TIER_HIGH_REF and node.backuped:
-            self.high_ref_backuped_size_ -= len(node.key)
         for rid in node.tracked_rids:
             ref_info = self.rid_to_ref_info.get(rid)
             if ref_info is not None:
@@ -239,29 +220,12 @@ class RefAwareHiRadixCache(HiRadixCache):
         return total
 
     def high_ref_host_safe_evictable_size(self) -> int:
-        """O(1) safe lower bound on high-ref device tokens that can be freed
-        without dropping any high-ref prefix. Matches the eviction behaviour in
-        `_evict_from_tier` for the high tier.
-
-        Backuped high-ref nodes are always freeable (drop the device copy, the
-        host copy persists). Unbackuped high-ref nodes are never dropped:
-        - write_through: they are skipped during eviction (the proactive
-          write-through path backs them up over time), so they do not count.
-        - write_back: they may be spilled on demand, bounded by the currently
-          free host room. We deliberately ignore host space reclaimable by
-          evicting low-priority host entries, keeping this a safe lower bound
-          (never over-admits -> no prefill OOM).
-        """
-        if self.cache_controller.write_policy != "write_back":
-            return self.high_ref_backuped_size_
-
-        unbackuped = self.high_ref_evictable_size_ - self.high_ref_backuped_size_
-        if unbackuped < 0:
-            unbackuped = 0
-        host_room = self.cache_controller.mem_pool_host.available_size()
-        if host_room < 0:
-            host_room = 0
-        return self.high_ref_backuped_size_ + min(unbackuped, host_room)
+        # A high-priority eviction scope (allow_high) can free every high-ref
+        # device node -- backuped ones via `_evict_backuped` (host copy kept),
+        # the rest via `_evict_regular`. So the admission budget equals the full
+        # high-ref evictable size, keeping admission consistent with what
+        # eviction can actually reclaim. O(1) counter read.
+        return self.high_ref_evictable_size_
 
     def safe_evictable_size_by_tier(
         self, allow_low: bool = True, allow_high: bool = False
@@ -284,12 +248,29 @@ class RefAwareHiRadixCache(HiRadixCache):
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
+        protected_size = self.protected_size()
+        pool_size = getattr(self.token_to_kv_pool_allocator, "size", None)
+        # Conservation: every device token is free, evictable (unlocked) or
+        # protected (locked). A positive `leaked` means tokens went missing
+        # (true leak); if `protected` accounts for the gap it is just heavy
+        # concurrent locking, not a leak. `tier_sum` should equal evictable.
+        tier_sum = (
+            self.unused_evictable_size_
+            + self.low_ref_evictable_size_
+            + self.high_ref_evictable_size_
+        )
+        leaked = (
+            pool_size - (available_size + evictable_size + protected_size)
+            if pool_size is not None
+            else None
+        )
         return (
             f"Available tokens: {available_size + evictable_size} "
             f"({available_size=} + {evictable_size=}, "
             f"unused_evictable_size={self.unused_evictable_size_}, "
             f"low_ref_evictable_size={self.low_ref_evictable_size_}, "
-            f"high_ref_evictable_size={self.high_ref_evictable_size_})\n"
+            f"high_ref_evictable_size={self.high_ref_evictable_size_}, "
+            f"{protected_size=}, {pool_size=}, {tier_sum=}, {leaked=})\n"
         )
 
     def evict(self, params: EvictParams) -> EvictResult:
@@ -352,25 +333,17 @@ class RefAwareHiRadixCache(HiRadixCache):
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
-                    # Spill to host on demand (write_backup evicts low-priority
-                    # host entries first if needed, never high-ref ones). Under
-                    # write_back, ongoing_write_through holds only these spill
-                    # nodes, so the blocking writing_check below is safe.
                     written = self.write_backup(x, write_back=True)
+                    num_evicted += written
                     if written > 0:
-                        num_evicted += written
                         write_back_nodes.append(x)
-                    # written == 0: host full, no low host to reclaim -> skip
-                    # (fall through; node stays resident, never dropped).
-                elif target_tier == TIER_HIGH_REF:
-                    # write_through: a high-ref prefix must never be dropped.
-                    # The proactive write-through path backs it up to host
-                    # asynchronously; until it is backuped we simply skip it
-                    # here. We must NOT call writing_check(write_back=True) under
-                    # write_through, as that would steal the locked write-through
-                    # nodes from ongoing_write_through without releasing them.
-                    continue
                 else:
+                    # write_through: free the device copy directly. For a high
+                    # tier this only runs in a high-priority eviction scope
+                    # (allow_high; a low-priority batch never enters this tier),
+                    # so admission (which budgets all high-ref as reclaimable)
+                    # stays consistent with what eviction can actually free.
+                    # No host DMA / sync on this path.
                     num_evicted += self._evict_regular(x)
             else:
                 num_evicted += self._evict_backuped(x)
@@ -386,7 +359,7 @@ class RefAwareHiRadixCache(HiRadixCache):
                         new_priority = self._get_tier_priority(x.parent, target_tier)
                         heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-        if write_back_nodes:
+        if self.cache_controller.write_policy == "write_back":
             self.writing_check(write_back=True)
             for node in write_back_nodes:
                 assert node.backuped
@@ -465,31 +438,21 @@ class RefAwareHiRadixCache(HiRadixCache):
             node_id=node.id,
         )
         if host_indices is None:
-            # Never evict host-side high_ref nodes to make room for a spill.
-            # Otherwise a newly admitted high-priority request can cause another
-            # referenced high-priority prefix to be dropped from DRAM entirely.
-            self.evict_host(len(node.value), allow_high=False)
+            # Make room on host by evicting the most-recently-idle host entries,
+            # high_ref included (MRU via _get_tier_priority): the earliest-idle
+            # high_ref prefixes are the likeliest to be reused next, so keep
+            # them. This keeps the async write-through flowing so device high_ref
+            # stays backuped (device eviction then takes the host-safe
+            # `_evict_backuped` path instead of dropping).
+            self.evict_host(len(node.value), allow_high=True)
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
             )
         if host_indices is not None:
-            was_backuped = node.backuped
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
-            # A high-ref device node that just gained a host copy now counts
-            # toward the host-safe (free to evict) subset, as long as it is
-            # still resident and unlocked. If unlocked here but locked right
-            # after (write_through path calls inc_lock_ref below), inc_lock_ref
-            # removes it again, keeping the counter consistent.
-            if (
-                not was_backuped
-                and not node.evicted
-                and node.lock_ref == 0
-                and _classify_node_tier(node) == TIER_HIGH_REF
-            ):
-                self.high_ref_backuped_size_ += len(node.key)
             if not write_back:
                 self.inc_lock_ref(node)
         else:
@@ -586,8 +549,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
-        if tier == TIER_HIGH_REF and node.backuped:
-            self.high_ref_backuped_size_ -= len(node.key)
         return super()._evict_backuped(node)
 
     def release_ref(self, rid: str) -> Tuple[bool, str]:
