@@ -604,6 +604,22 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _can_admit_ref_aware_req(
+        self, req: Req, req_is_high: bool, total_tokens: int
+    ) -> bool:
+        ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
+        if total_tokens < ref_aware_budget:
+            return True
+
+        if not req_is_high:
+            return False
+
+        from sglang.srt.server_args import get_global_server_args
+
+        return self._kick_low_priority_for_high(
+            req, total_tokens, get_global_server_args()
+        )
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
@@ -772,18 +788,8 @@ class PrefillAdder:
 
         if self.enable_ref_aware_kv_buffer:
             req_is_high = (req.priority or 0) >= self.high_priority_threshold
-            ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
-            if total_tokens >= ref_aware_budget:
-                if req_is_high:
-                    from sglang.srt.server_args import get_global_server_args
-
-                    kicked = self._kick_low_priority_for_high(
-                        req, total_tokens, get_global_server_args()
-                    )
-                    if not kicked:
-                        return AddReqResult.NO_TOKEN
-                else:
-                    return AddReqResult.NO_TOKEN
+            if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
+                return AddReqResult.NO_TOKEN
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -793,6 +799,10 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
+            if self.enable_ref_aware_kv_buffer:
+                if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
+                    return AddReqResult.NO_TOKEN
+
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
