@@ -160,6 +160,12 @@ class KVMigrationManager:
         # otherwise per-rank `pending` dicts would key on different ids and
         # `commit` would race-fail on some ranks while succeeding on others.
         if not recv_req.migration_id:
+            logger.warning(
+                "[kv-migration] allocate rejected: missing migration_id "
+                "(tp=%d pp=%d)",
+                self.tp_rank,
+                self.pp_rank,
+            )
             return AllocateTokenForTransferReqOutput(
                 success=False,
                 tp_rank=self.tp_rank,
@@ -181,6 +187,16 @@ class KVMigrationManager:
         matched_aligned = len(match.device_indices) + match.host_hit_length
 
         if matched_aligned + recv_req.extra_token_size != total_aligned:
+            logger.warning(
+                "[kv-migration] allocate size mismatch (tp=%d pp=%d): "
+                "matched_aligned=%d + extra_token_size=%d != total_aligned=%d "
+                "(tree changed between get_extra and allocate)",
+                self.tp_rank,
+                self.pp_rank,
+                matched_aligned,
+                recv_req.extra_token_size,
+                total_aligned,
+            )
             return AllocateTokenForTransferReqOutput(
                 success=False,
                 tp_rank=self.tp_rank,
@@ -200,13 +216,27 @@ class KVMigrationManager:
 
         host_tail = self.host_pool.alloc(recv_req.extra_token_size)
         if host_tail is None:
+            # Host pool full: mirror HiRadixCache.write_backup -- evict cold
+            # host leaves and retry once. evict_host skips nodes with
+            # host_ref_counter > 0, so the prefix we locked just above (both the
+            # matched host path and the device node) is never evicted.
+            self.tree_cache.evict_host(recv_req.extra_token_size)
+            host_tail = self.host_pool.alloc(recv_req.extra_token_size)
+        if host_tail is None:
             self.tree_cache.dec_lock_ref(match.last_device_node)
             dec_host_refs(host_locked)
+            logger.warning(
+                "[kv-migration] allocate OOM after evict_host (tp=%d pp=%d): "
+                "requested %d tokens",
+                self.tp_rank,
+                self.pp_rank,
+                recv_req.extra_token_size,
+            )
             return AllocateTokenForTransferReqOutput(
                 success=False,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
-                message=f"host pool alloc OOM: requested {recv_req.extra_token_size} tokens",
+                message=f"host pool alloc OOM after evict: requested {recv_req.extra_token_size} tokens",
             )
 
         migration_id = recv_req.migration_id

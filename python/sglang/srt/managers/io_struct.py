@@ -204,6 +204,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Whether to return per-request cache hit metrics in meta_info.
+    return_cache_hit_metrics: bool = False
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
@@ -639,6 +641,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            return_cache_hit_metrics=self.return_cache_hit_metrics,
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)

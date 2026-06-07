@@ -1532,7 +1532,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 # Add detailed cache breakdown if available
                 if (
-                    hasattr(recv_obj, "cached_tokens_details")
+                    getattr(state.obj, "return_cache_hit_metrics", False)
+                    and hasattr(recv_obj, "cached_tokens_details")
                     and recv_obj.cached_tokens_details
                 ):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[

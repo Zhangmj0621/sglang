@@ -662,6 +662,8 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        self.cache_hit_hbm_tokens = 0
+        self.cache_hit_host_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -899,6 +901,8 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
+        self.cache_hit_hbm_tokens = 0
+        self.cache_hit_host_tokens = 0
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
@@ -921,6 +925,8 @@ class Req(ReqDllmMixin):
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.cache_hit_hbm_tokens = len(match_result.device_indices)
+            self.cache_hit_host_tokens = match_result.host_hit_length
             self.cache_protected_len = len(self.prefix_indices)
 
         if (
@@ -1560,11 +1566,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     #
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
+                    host_total = getattr(
+                        req, "cache_hit_host_tokens", req.host_hit_length
+                    )
                     # Clamp storage to host_total to handle edge cases
                     storage_portion = min(host_total, req.storage_hit_length)
                     host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
+                    device_portion = getattr(
+                        req,
+                        "cache_hit_hbm_tokens",
+                        max(0, len(req.prefix_indices) - host_total),
+                    )
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion

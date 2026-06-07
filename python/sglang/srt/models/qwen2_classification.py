@@ -18,6 +18,7 @@ import torch
 from torch import nn
 from transformers import Qwen2Config
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -33,6 +34,8 @@ class Qwen2ForSequenceClassification(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # Qwen2ForCausalLM.load_weights(), reused below, expects this field.
+        self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen2Model(
