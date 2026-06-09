@@ -1754,6 +1754,8 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if self.enable_ref_aware_kv_buffer and hasattr(self.tree_cache, "mark_rid_generating"):
+            self.tree_cache.mark_rid_generating(req.rid)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return

@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import logging
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
 class RefInfo:
     is_high: bool
     nodes: Set[TreeNode] = field(default_factory=set)
+    cached_tokens: int = 0
+    is_generating: bool = False
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +68,8 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.high_ref_evictable_size_: int = 0
         self.rid_to_ref_info: Dict[str, RefInfo] = {}
         self._evict_scope_stack: list[tuple[bool, bool]] = []
+        self._adaptively_demoted_rids: OrderedDict[str, int] = OrderedDict()
+        self._idle_hp_heap: list[tuple[int, str]] = []
         super().__init__(params=params, server_args=server_args)
 
     def reset(self):
@@ -76,6 +81,8 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.high_ref_evictable_size_ = 0
         self.rid_to_ref_info.clear()
         self._evict_scope_stack.clear()
+        self._adaptively_demoted_rids.clear()
+        self._idle_hp_heap.clear()
         super().reset()
 
     def is_high_priority(self, priority: int) -> bool:
@@ -411,6 +418,72 @@ class RefAwareHiRadixCache(HiRadixCache):
 
         return num_evicted
 
+    # --- Adaptive HP demotion on host pressure ---
+
+    def _select_shortest_hp_rid(self) -> Optional[str]:
+        """O(1) amortized: pop from min-heap, skip stale entries."""
+        while self._idle_hp_heap:
+            _tokens, rid = self._idle_hp_heap[0]
+            ref_info = self.rid_to_ref_info.get(rid)
+            if (
+                ref_info is None
+                or not ref_info.is_high
+                or ref_info.is_generating
+                or rid in self._adaptively_demoted_rids
+            ):
+                heapq.heappop(self._idle_hp_heap)
+                continue
+            return rid
+        return None
+
+    def _adaptive_demote(self, rid: str) -> int:
+        """Demote rid from HP to LP at cache tier level only. Returns tokens moved."""
+        ref_info = self.rid_to_ref_info.get(rid)
+        if ref_info is None or not ref_info.is_high:
+            return 0
+
+        tokens_moved = 0
+        for node in ref_info.nodes:
+            self._dec_priority_ref_single(node, True)
+            self._inc_priority_ref_single(node, False)
+            tokens_moved += len(node.key)
+
+        ref_info.is_high = False
+        self._adaptively_demoted_rids[rid] = self.high_priority_threshold
+        logger.info(
+            "[adaptive-demote] rid=%s tokens=%d demoted_count=%d",
+            rid,
+            tokens_moved,
+            len(self._adaptively_demoted_rids),
+        )
+        return tokens_moved
+
+    def _adaptive_restore(self, rid: str) -> bool:
+        """Restore a previously demoted rid back to HP. Returns True if restored."""
+        original_priority = self._adaptively_demoted_rids.pop(rid, None)
+        if original_priority is None:
+            return False
+
+        ref_info = self.rid_to_ref_info.get(rid)
+        if ref_info is None:
+            return False
+
+        tokens_restored = 0
+        for node in ref_info.nodes:
+            self._dec_priority_ref_single(node, False)
+            self._inc_priority_ref_single(node, True)
+            tokens_restored += len(node.key)
+        ref_info.is_high = True
+        if not ref_info.is_generating:
+            heapq.heappush(self._idle_hp_heap, (ref_info.cached_tokens, rid))
+        logger.info(
+            "[adaptive-restore] rid=%s tokens=%d demoted_remaining=%d",
+            rid,
+            tokens_restored,
+            len(self._adaptively_demoted_rids),
+        )
+        return True
+
     # --- Tiered host eviction ---
 
     def evict_host(self, num_tokens: int, allow_high: bool = False):
@@ -420,10 +493,25 @@ class RefAwareHiRadixCache(HiRadixCache):
             num_evicted += self._evict_host_from_tier(
                 num_tokens - num_evicted, TIER_LOW_REF
             )
+
         if allow_high and num_evicted < num_tokens:
-            num_evicted += self._evict_host_from_tier(
-                num_tokens - num_evicted, TIER_HIGH_REF
-            )
+            # Adaptive demotion: demote shortest HP request(s) to LP so their
+            # host nodes become LOW_REF-evictable, avoiding permanent loss of
+            # TIER_HIGH_REF entries which would require full recomputation.
+            while num_evicted < num_tokens:
+                victim_rid = self._select_shortest_hp_rid()
+                if victim_rid is None:
+                    break
+                self._adaptive_demote(victim_rid)
+                num_evicted += self._evict_host_from_tier(
+                    num_tokens - num_evicted, TIER_LOW_REF
+                )
+
+            if num_evicted < num_tokens:
+                num_evicted += self._evict_host_from_tier(
+                    num_tokens - num_evicted, TIER_HIGH_REF
+                )
+
         return num_evicted
 
     def _evict_host_from_tier(self, num_tokens: int, target_tier: int) -> int:
@@ -506,6 +594,13 @@ class RefAwareHiRadixCache(HiRadixCache):
 
     # --- Explicit ref management for RL multi-turn ---
 
+    def mark_rid_generating(self, rid: str):
+        """Called by scheduler when a request with this rid enters the batch.
+        O(1) flag flip — prevents this rid from being selected for demotion."""
+        ref_info = self.rid_to_ref_info.get(rid)
+        if ref_info is not None:
+            ref_info.is_generating = True
+
     def register_ref(self, req: Req):
         rid = req.rid
         is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
@@ -514,6 +609,12 @@ class RefAwareHiRadixCache(HiRadixCache):
             self.rid_to_ref_info[rid] = RefInfo(is_high=is_high)
 
         ref_info = self.rid_to_ref_info[rid]
+
+        # If this rid was adaptively demoted and now re-enters as HP, restore it
+        # to prevent ref-count inconsistency (register adds high_ref but release
+        # would decrement low_ref if ref_info.is_high stayed False).
+        if rid in self._adaptively_demoted_rids and is_high:
+            self._adaptive_restore(rid)
 
         last_node = getattr(req, "last_node", None)
         if last_node not in (None, self.root_node):
@@ -538,6 +639,12 @@ class RefAwareHiRadixCache(HiRadixCache):
             self._inc_priority_ref_single(node, is_high)
             ref_info.nodes.add(node)
             node.tracked_rids.add(rid)
+
+        # Update cached_tokens and mark idle; push to heap for O(1) selection
+        ref_info.cached_tokens = sum(len(n.key) for n in ref_info.nodes)
+        ref_info.is_generating = False
+        if ref_info.is_high and rid not in self._adaptively_demoted_rids:
+            heapq.heappush(self._idle_hp_heap, (ref_info.cached_tokens, rid))
 
     def _collect_nodes_on_path(self, key: RadixKey):
         node = self.root_node
@@ -596,13 +703,22 @@ class RefAwareHiRadixCache(HiRadixCache):
         return super()._evict_backuped(node)
 
     def release_ref(self, rid: str) -> Tuple[bool, str]:
+        self._adaptively_demoted_rids.pop(rid, None)
+
         ref_info = self.rid_to_ref_info.pop(rid, None)
         if ref_info is None:
             return True, f"rid {rid} not tracked"
 
+        was_high = ref_info.is_high
+
         for node in ref_info.nodes:
             self._dec_priority_ref_single(node, ref_info.is_high)
             node.tracked_rids.discard(rid)
+
+        if was_high and self._adaptively_demoted_rids:
+            oldest_demoted = next(iter(self._adaptively_demoted_rids))
+            self._adaptive_restore(oldest_demoted)
+
         return True, f"released {len(ref_info.nodes)} nodes for rid {rid}"
 
     def update_ref(self, rid: str, new_priority: int) -> Tuple[bool, str]:
@@ -611,6 +727,15 @@ class RefAwareHiRadixCache(HiRadixCache):
             return False, f"rid {rid} not found in ref tracking"
 
         new_is_high = self.is_high_priority(new_priority)
+
+        if rid in self._adaptively_demoted_rids:
+            if new_is_high:
+                self._adaptive_restore(rid)
+                return True, f"restored adaptively-demoted rid {rid} via external update_ref"
+            else:
+                self._adaptively_demoted_rids.pop(rid, None)
+                return True, "priority class unchanged (already demoted)"
+
         if new_is_high == ref_info.is_high:
             return True, "priority class unchanged"
 
