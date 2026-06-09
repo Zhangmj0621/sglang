@@ -80,22 +80,14 @@ class SchedulerOutputProcessorMixin:
         if not getattr(self, "enable_hierarchical_cache", False):
             return None
 
-        # Only show if there are any cached tokens
-        if (
-            req.cached_tokens_device > 0
-            or req.cached_tokens_host > 0
-            or req.cached_tokens_storage > 0
-        ):
-            details = {
-                "device": req.cached_tokens_device,
-                "host": req.cached_tokens_host,
-            }
-            # Only include storage fields if L3 storage is enabled
-            if getattr(self, "enable_hicache_storage", False):
-                details["storage"] = req.cached_tokens_storage
-                details["storage_backend"] = self._get_storage_backend_type()
-            return details
-        return None
+        details = {
+            "device": req.cached_tokens_device,
+            "host": req.cached_tokens_host,
+        }
+        if getattr(self, "enable_hicache_storage", False):
+            details["storage"] = req.cached_tokens_storage
+            details["storage_backend"] = self._get_storage_backend_type()
+        return details
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE

@@ -1530,15 +1530,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
-                # Add detailed cache breakdown if available
-                if (
-                    getattr(state.obj, "return_cache_hit_metrics", False)
-                    and hasattr(recv_obj, "cached_tokens_details")
-                    and recv_obj.cached_tokens_details
-                ):
-                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
-                        i
-                    ]
+                if getattr(state.obj, "return_cache_hit_metrics", False):
+                    details = (
+                        recv_obj.cached_tokens_details[i]
+                        if (
+                            hasattr(recv_obj, "cached_tokens_details")
+                            and recv_obj.cached_tokens_details
+                            and i < len(recv_obj.cached_tokens_details)
+                        )
+                        else None
+                    )
+                    if not isinstance(details, dict):
+                        raise RuntimeError(
+                            "Cache hit metrics were requested, but the scheduler "
+                            "did not return cached_tokens_details."
+                        )
+                    meta_info["cached_tokens_details"] = details
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
