@@ -636,6 +636,11 @@ class PrefillAdder:
             req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
             budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
             _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
+            if _rem_tokens <= 0 and req_is_high:
+                # HP chunks can evict all tiers (scoped_evict allow_high=True),
+                # same as the non-ref-aware path. Fall back to rem_chunk_tokens
+                # and let eviction handle it, matching the original behavior.
+                _rem_tokens = self.rem_chunk_tokens
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.

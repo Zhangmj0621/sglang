@@ -2142,29 +2142,12 @@ class Scheduler(
         deferred_chunked_req = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-
-            if self.enable_ref_aware_kv_buffer:
-                chunk_is_high = self.tree_cache.is_high_priority(
-                    self.chunked_req.priority or 0
-                )
-                if chunk_is_high:
-                    # HP chunks are added immediately — check budget now.
-                    own_budget = (
-                        int(adder._rem_total_tokens_ref_aware(chunk_is_high))
-                        - adder.page_size
-                    )
-                    if own_budget <= 0:
-                        deferred_chunked_req = self.chunked_req
-                        self.chunked_req = None
-                        release_kv_cache(
-                            deferred_chunked_req,
-                            self.tree_cache,
-                            is_insert=False,
-                        )
-                        deferred_chunked_req.reset_for_retract()
-                # LP chunks: budget checked at deferred insertion point
-                # (after HP add_one_req).  Condition 2 (HP starvation) is
-                # structurally eliminated by the reordering.
+            # LP chunks: budget checked at the deferred insertion point
+            # (after HP add_one_req) — see the chunk_deferred logic below.
+            # HP chunks: no yield check needed — they can evict all tiers
+            # (scoped_evict allow_high=True), same as non-ref-aware.
+            # add_chunked_req falls back to rem_chunk_tokens for HP if
+            # budget is 0, matching the original behavior.
 
         chunk_deferred = self._maybe_add_chunked_req_before_loop(adder) if self.enable_ref_aware_kv_buffer else False
 
