@@ -2121,13 +2121,6 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
-        has_waiting_high_priority = False
-        if self.enable_priority_scheduling and self.enable_ref_aware_kv_buffer:
-            has_waiting_high_priority = any(
-                (req.priority or 0) >= self.high_priority_threshold
-                for req in self.waiting_queue
-            )
-
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2146,57 +2139,32 @@ class Scheduler(
             high_priority_threshold=self.high_priority_threshold,
         )
 
-        # Yield the in-flight low-priority chunked prefill to waiting high-priority
-        # work ONLY under KV-cache pressure, i.e. when continuing its next chunk
-        # would leave no budget to admit a high-priority request. When memory
-        # suffices we keep running it alongside the high-priority requests. On
-        # yield we drop (not cache) its partial KV since we are reclaiming memory,
-        # and release its req slot so it re-enters the queue as a clean prefill.
         deferred_chunked_req = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
 
             if self.enable_ref_aware_kv_buffer:
-                chunk_is_high = (
+                chunk_is_high = self.tree_cache.is_high_priority(
                     self.chunked_req.priority or 0
-                ) >= self.high_priority_threshold
-                # Memory the chunk's own priority tier can reclaim. A low-priority
-                # chunk cannot evict high-ref KV, so high-ref is excluded here.
-                # Must use the SAME integer formula as add_chunked_req
-                # (int(rem) - page_size); _rem_total_tokens_ref_aware is a float
-                # (rem_total_token_offset scales by new_token_ratio). A float
-                # compare here would let a budget in (page_size, page_size+1)
-                # skip the yield, yet add_chunked_req would then truncate the
-                # chunk to 0 tokens and emit a 0-token extend batch -> crash.
-                own_budget = (
-                    int(adder._rem_total_tokens_ref_aware(chunk_is_high))
-                    - adder.page_size
                 )
-                # If even one page beyond the allocator's per-request overhead is
-                # not reclaimable in this tier, the chunk cannot make progress.
-                # Retract it (drop partial KV, re-queue) instead of forcing it
-                # through against memory it cannot evict -> would OOM at alloc.
-                must_yield = own_budget <= 0
-                # A low-priority chunk also yields to a waiting high-priority
-                # request when continuing it would starve that request.
-                if (
-                    not must_yield
-                    and has_waiting_high_priority
-                    and not chunk_is_high
-                ):
-                    chunk_cost = adder.ceil_paged_tokens(
-                        min(self.chunked_req.extend_input_len, chunked_prefill_size)
+                if chunk_is_high:
+                    # HP chunks are added immediately — check budget now.
+                    own_budget = (
+                        int(adder._rem_total_tokens_ref_aware(chunk_is_high))
+                        - adder.page_size
                     )
-                    high_budget = adder._rem_total_tokens_ref_aware(is_high=True)
-                    must_yield = high_budget - chunk_cost <= 0
-
-                if must_yield:
-                    deferred_chunked_req = self.chunked_req
-                    self.chunked_req = None
-                    release_kv_cache(
-                        deferred_chunked_req, self.tree_cache, is_insert=False
-                    )
-                    deferred_chunked_req.reset_for_retract()
+                    if own_budget <= 0:
+                        deferred_chunked_req = self.chunked_req
+                        self.chunked_req = None
+                        release_kv_cache(
+                            deferred_chunked_req,
+                            self.tree_cache,
+                            is_insert=False,
+                        )
+                        deferred_chunked_req.reset_for_retract()
+                # LP chunks: budget checked at deferred insertion point
+                # (after HP add_one_req).  Condition 2 (HP starvation) is
+                # structurally eliminated by the reordering.
 
         chunk_deferred = self._maybe_add_chunked_req_before_loop(adder) if self.enable_ref_aware_kv_buffer else False
 
@@ -2211,7 +2179,25 @@ class Scheduler(
             # new LP requests.
             if chunk_deferred and not chunk_added:
                 if not self.tree_cache.is_high_priority(req.priority or 0):
-                    self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                    # Condition 1: check LP chunk budget after HP locks
+                    chunk_is_high = self.tree_cache.is_high_priority(
+                        self.chunked_req.priority or 0
+                    )
+                    own_budget = (
+                        int(adder._rem_total_tokens_ref_aware(chunk_is_high))
+                        - adder.page_size
+                    )
+                    if own_budget <= 0:
+                        deferred_chunked_req = self.chunked_req
+                        self.chunked_req = None
+                        release_kv_cache(
+                            deferred_chunked_req,
+                            self.tree_cache,
+                            is_insert=False,
+                        )
+                        deferred_chunked_req.reset_for_retract()
+                    else:
+                        self.chunked_req = adder.add_chunked_req(self.chunked_req)
                     chunk_added = True
 
             if self.enable_lora and req.lora_id not in running_loras:
@@ -2288,7 +2274,22 @@ class Scheduler(
 
         # LP chunk deferred but queue was all HP or empty — add now.
         if chunk_deferred and not chunk_added:
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            chunk_is_high = self.tree_cache.is_high_priority(
+                self.chunked_req.priority or 0
+            )
+            own_budget = (
+                int(adder._rem_total_tokens_ref_aware(chunk_is_high))
+                - adder.page_size
+            )
+            if own_budget <= 0:
+                deferred_chunked_req = self.chunked_req
+                self.chunked_req = None
+                release_kv_cache(
+                    deferred_chunked_req, self.tree_cache, is_insert=False
+                )
+                deferred_chunked_req.reset_for_retract()
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
