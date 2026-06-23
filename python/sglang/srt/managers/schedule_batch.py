@@ -1883,8 +1883,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Phase 1: reclaim only idle non-high tiers (unused + low_ref). These
         # are safe to drop on behalf of any request, high or low priority.
+        # Evict num_tokens (total, not deficit) to maintain free-pool headroom
+        # and avoid re-evicting every decode step — consistent with
+        # evict_from_tree_cache's normal path.
         self.tree_cache._evict_tiered(
-            num_tokens - allocator.available_size(),
+            num_tokens,
             allow_low=True,
             allow_high=False,
         )
