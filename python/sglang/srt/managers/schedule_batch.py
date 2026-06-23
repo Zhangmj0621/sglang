@@ -2093,7 +2093,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+
+        if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            allow_high = any(
+                self.tree_cache.is_high_priority(req.priority or 0)
+                for req in self.reqs
+            )
+            with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
+                self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        else:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
         for req in self.reqs:
