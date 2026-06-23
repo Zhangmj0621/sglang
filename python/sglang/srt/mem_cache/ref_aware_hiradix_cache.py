@@ -103,7 +103,11 @@ class RefAwareHiRadixCache(HiRadixCache):
         new_set = self._tier_leaf_set(new_tier)
         if node in old_set:
             old_set.discard(node)
-            new_set.add(node)
+            # Only re-add if node is still a valid evictable leaf
+            # (all children evicted or no children).
+            is_leaf = all(c.evicted for c in node.children.values())
+            if is_leaf:
+                new_set.add(node)
         self._add_tier_size(old_tier, -node_size)
         self._add_tier_size(new_tier, node_size)
 
