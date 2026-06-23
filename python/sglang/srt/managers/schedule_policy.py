@@ -633,7 +633,7 @@ class PrefillAdder:
             # over-estimate. We must NOT fall back to rem_chunk_tokens here: the
             # scheduler retracts the chunk before calling this whenever the tier
             # budget cannot cover any progress, so a positive budget is implied.
-            req_is_high = (req.priority or 0) >= self.high_priority_threshold
+            req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
             budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
             _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
         else:
@@ -787,7 +787,7 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if self.enable_ref_aware_kv_buffer:
-            req_is_high = (req.priority or 0) >= self.high_priority_threshold
+            req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
             if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
                 return AddReqResult.NO_TOKEN
 

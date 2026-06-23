@@ -60,6 +60,7 @@ class RefAwareHiRadixCache(HiRadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self.high_priority_threshold = server_args.high_priority_threshold
+        self._enable_priority_scheduling = server_args.enable_priority_scheduling
         self.unused_evictable_leaves: set = set()
         self.low_ref_evictable_leaves: set = set()
         self.high_ref_evictable_leaves: set = set()
@@ -86,6 +87,8 @@ class RefAwareHiRadixCache(HiRadixCache):
         super().reset()
 
     def is_high_priority(self, priority: int) -> bool:
+        if not self._enable_priority_scheduling:
+            return True
         return priority >= self.high_priority_threshold
 
     def _move_node_tier(self, node: TreeNode, old_tier: int, new_tier: int):

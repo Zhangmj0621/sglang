@@ -2701,19 +2701,15 @@ class ServerArgs:
                 "--enable-ref-aware-kv-buffer requires --enable-hierarchical-cache"
             )
 
-        if self.enable_ref_aware_kv_buffer and not self.enable_priority_scheduling:
-            # Ref-aware KV buffer relies on priority-ordered scheduling so that
-            # high-priority requests form batches ahead of low-priority ones.
-            self.enable_priority_scheduling = True
-            logger.info(
-                "--enable-ref-aware-kv-buffer implies priority scheduling; "
-                "enabling --enable-priority-scheduling automatically."
-            )
-
-        if self.enable_ref_aware_kv_buffer and self.schedule_low_priority_values_first:
+        if (
+            self.enable_ref_aware_kv_buffer
+            and self.enable_priority_scheduling
+            and self.schedule_low_priority_values_first
+        ):
             raise ValueError(
-                "--enable-ref-aware-kv-buffer assumes larger priority value == higher "
-                "priority (high tier is `priority >= high_priority_threshold`), so it is "
+                "--enable-ref-aware-kv-buffer with --enable-priority-scheduling assumes "
+                "larger priority value == higher priority "
+                "(high tier is `priority >= high_priority_threshold`), so it is "
                 "incompatible with --schedule-low-priority-values-first. Please disable "
                 "--schedule-low-priority-values-first."
             )

@@ -2062,8 +2062,8 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
             return False
 
-        chunk_is_high = (
-            (self.chunked_req.priority or 0) >= self.high_priority_threshold
+        chunk_is_high = self.tree_cache.is_high_priority(
+            self.chunked_req.priority or 0
         )
         if chunk_is_high:
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -2212,7 +2212,7 @@ class Scheduler(
             # tier sizes after HP inc_lock_ref but keeps priority over
             # new LP requests.
             if chunk_deferred and not chunk_added:
-                if (req.priority or 0) < self.high_priority_threshold:
+                if not self.tree_cache.is_high_priority(req.priority or 0):
                     self.chunked_req = adder.add_chunked_req(self.chunked_req)
                     chunk_added = True
 

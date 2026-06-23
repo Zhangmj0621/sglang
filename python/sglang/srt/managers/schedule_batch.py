@@ -1510,7 +1510,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if isinstance(self.tree_cache, RefAwareHiRadixCache):
             allow_high = any(
-                (req.priority or 0) >= self.tree_cache.high_priority_threshold
+                self.tree_cache.is_high_priority(req.priority or 0)
                 for req in reqs
             )
             with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
@@ -1900,11 +1900,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # shortfall must NOT sacrifice an idle HP prefix. Freed slots are
         # fungible, so we cap high_ref eviction at the HP requests' own decode
         # demand; any demand beyond that is left for retract to resolve.
-        threshold = self.tree_cache.high_priority_threshold
         scope = (
             range(len(self.reqs)) if selected_indices is None else selected_indices
         )
-        hp_indices = [i for i in scope if (self.reqs[i].priority or 0) >= threshold]
+        hp_indices = [
+            i for i in scope
+            if self.tree_cache.is_high_priority(self.reqs[i].priority or 0)
+        ]
         if not hp_indices:
             return
 
@@ -1944,10 +1946,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # before any HP req. Within a priority class the original heuristic
             # stands: keep the most-decoded / shortest-input reqs and retract
             # the least-progressed ones first (cheapest work to redo).
-            threshold = getattr(server_args, "high_priority_threshold", 1)
             sorted_indices.sort(
                 key=lambda i: (
-                    (self.reqs[i].priority or 0) >= threshold,
+                    self.tree_cache.is_high_priority(self.reqs[i].priority or 0),
                     len(self.reqs[i].output_ids),
                     -len(self.reqs[i].origin_input_ids),
                 ),
