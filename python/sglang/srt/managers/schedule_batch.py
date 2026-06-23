@@ -1946,14 +1946,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # before any HP req. Within a priority class the original heuristic
             # stands: keep the most-decoded / shortest-input reqs and retract
             # the least-progressed ones first (cheapest work to redo).
-            sorted_indices.sort(
-                key=lambda i: (
-                    self.tree_cache.is_high_priority(self.reqs[i].priority or 0),
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+                sorted_indices.sort(
+                    key=lambda i: (
+                        self.tree_cache.is_high_priority(self.reqs[i].priority or 0),
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
+            else:
+                threshold = getattr(server_args, "high_priority_threshold", 1)
+                sorted_indices.sort(
+                    key=lambda i: (
+                        (self.reqs[i].priority or 0) >= threshold,
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
 
         retracted_reqs = []
         first_iter = True
