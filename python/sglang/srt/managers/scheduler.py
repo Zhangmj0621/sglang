@@ -860,9 +860,7 @@ class Scheduler(
         # churn -- a likely cause of the GPU-utilization drop. batch_is_full is
         # still cleared naturally when a running req finishes (see the filter
         # step in get_next_batch_to_run), so prefill resumes without it.
-        self.try_preemption = self.enable_priority_scheduling and (
-            not self.enable_ref_aware_kv_buffer
-        )
+        self.try_preemption = self.enable_priority_scheduling
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
