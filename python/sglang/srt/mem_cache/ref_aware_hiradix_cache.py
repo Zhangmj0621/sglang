@@ -299,7 +299,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         self, num_tokens: int, allow_low: bool = True, allow_high: bool = False
     ) -> EvictResult:
         start_time = time.perf_counter()
-        avail_before = self.token_to_kv_pool_allocator.available_size()
         num_evicted = 0
 
         num_evicted += self._evict_from_tier(
@@ -314,49 +313,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         if allow_high and num_evicted < num_tokens:
             num_evicted += self._evict_from_tier(
                 num_tokens - num_evicted, self.high_ref_evictable_leaves, TIER_HIGH_REF
-            )
-
-        # Shortfall diagnostic: only fires when eviction could not free what was
-        # asked (the pre-OOM condition). Distinguishes the failure modes of the
-        # admission-vs-allocation mismatch:
-        #   - allow_high=False here while high tier is the only sizeable pool ->
-        #     the alloc scope cannot touch high-ref that admission counted on.
-        #   - leaf-set token sum << tier size counter -> the size counter is
-        #     inflated relative to the actually-evictable leaf frontier
-        #     (counter bookkeeping drift or eviction unreachability).
-        # Compare with `available_and_evictable_str` printed at the OOM site.
-        if num_evicted < num_tokens:
-
-            def _leaf_sum(leaves):
-                return sum(len(n.key) for n in leaves), len(leaves)
-
-            unused_leaf_sum, unused_leaf_n = _leaf_sum(self.unused_evictable_leaves)
-            low_leaf_sum, low_leaf_n = _leaf_sum(self.low_ref_evictable_leaves)
-            high_leaf_sum, high_leaf_n = _leaf_sum(self.high_ref_evictable_leaves)
-            logger.warning(
-                "[ref-aware evict shortfall] requested=%d evicted=%d "
-                "allow_low=%s allow_high=%s | available before=%d after=%d | "
-                "size_counter[unused=%d low=%d high=%d] | "
-                "leaf_token_sum[unused=%d low=%d high=%d] | "
-                "leaf_count[unused=%d low=%d high=%d] | "
-                "evictable_size_=%d protected_size_=%d",
-                num_tokens,
-                num_evicted,
-                allow_low,
-                allow_high,
-                avail_before,
-                self.token_to_kv_pool_allocator.available_size(),
-                self.unused_evictable_size_,
-                self.low_ref_evictable_size_,
-                self.high_ref_evictable_size_,
-                unused_leaf_sum,
-                low_leaf_sum,
-                high_leaf_sum,
-                unused_leaf_n,
-                low_leaf_n,
-                high_leaf_n,
-                self.evictable_size_,
-                self.protected_size_,
             )
 
         self.update_eviction_metrics(num_evicted, start_time)
@@ -579,12 +535,6 @@ class RefAwareHiRadixCache(HiRadixCache):
             node_id=node.id,
         )
         if host_indices is None:
-            # Make room on host by evicting the most-recently-idle host entries,
-            # high_ref included (MRU via _get_tier_priority): the earliest-idle
-            # high_ref prefixes are the likeliest to be reused next, so keep
-            # them. This keeps the async write-through flowing so device high_ref
-            # stays backuped (device eviction then takes the host-safe
-            # `_evict_backuped` path instead of dropping).
             self.evict_host(len(node.value), allow_high=True)
             host_indices = self.cache_controller.write(
                 device_indices=node.value,

@@ -2142,13 +2142,8 @@ class Scheduler(
         deferred_chunked_req = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            # LP chunks: budget checked at the deferred insertion point
-            # (after HP add_one_req) — see the chunk_deferred logic below.
-            # HP chunks: no yield check needed — they can evict all tiers
-            # (scoped_evict allow_high=True), same as non-ref-aware.
-            # add_chunked_req falls back to rem_chunk_tokens for HP if
-            # budget is 0, matching the original behavior.
 
+        # If enable ref_aware_kv_buffer and enable_priority_scheduling, the LP chunk request may be deferred after HP requests.
         chunk_deferred = self._maybe_add_chunked_req_before_loop(adder) if self.enable_ref_aware_kv_buffer else False
 
         if self.enable_lora:
@@ -2157,12 +2152,11 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         chunk_added = False
         for req in self.waiting_queue:
-            # Insert deferred LP chunk at the HP→LP boundary so it sees
-            # tier sizes after HP inc_lock_ref but keeps priority over
-            # new LP requests.
+            # Insert deferred LP chunk at the HP→LP boundary.
             if chunk_deferred and not chunk_added:
                 if not self.tree_cache.is_high_priority(req.priority or 0):
-                    # Condition 1: check LP chunk budget after HP locks
+                    # Release the LP chunk req if token budget is insufficient. 
+                    # Release KV Cache and retract it to avoid memory leak.
                     chunk_is_high = self.tree_cache.is_high_priority(
                         self.chunked_req.priority or 0
                     )

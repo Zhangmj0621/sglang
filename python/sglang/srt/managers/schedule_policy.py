@@ -624,15 +624,6 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         elif self.enable_ref_aware_kv_buffer:
-            # A chunked prefill can only reclaim memory within its own priority
-            # tier at allocation time: scoped_evict uses allow_high = any(req is
-            # high), and a low-priority chunk never makes a batch high. Sizing it
-            # against the full rem_total_tokens (which counts high-ref KV) would
-            # over-admit memory the chunk can never evict -> prefill OOM. Budget
-            # by tier, reserving one page for the allocator's per-request
-            # over-estimate. We must NOT fall back to rem_chunk_tokens here: the
-            # scheduler retracts the chunk before calling this whenever the tier
-            # budget cannot cover any progress, so a positive budget is implied.
             req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
             budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
             _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))

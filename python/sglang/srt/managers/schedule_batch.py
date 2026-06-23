@@ -1881,11 +1881,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if allocator.available_size() >= num_tokens:
             return
 
-        # Phase 1: reclaim only idle non-high tiers (unused + low_ref). These
-        # are safe to drop on behalf of any request, high or low priority.
-        # Evict num_tokens (total, not deficit) to maintain free-pool headroom
-        # and avoid re-evicting every decode step — consistent with
-        # evict_from_tree_cache's normal path.
+        # Evict from low-reference tokens first, num_tokens align with evict_from_tree_cache().
         self.tree_cache._evict_tiered(
             num_tokens,
             allow_low=True,
@@ -1896,13 +1892,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if shortfall <= 0:
             return
 
-        # Phase 2: a remaining shortfall may dip into idle (lock_ref == 0)
-        # high_ref prefixes -- evicting one only forces a later recompute/reload,
-        # it never drops in-use state. But the eviction must be bounded to what
-        # the HIGH-priority requests in this batch actually need: a low-priority
-        # shortfall must NOT sacrifice an idle HP prefix. Freed slots are
-        # fungible, so we cap high_ref eviction at the HP requests' own decode
-        # demand; any demand beyond that is left for retract to resolve.
+        # Only evict high-reference tokens for high-priority requests.
         scope = (
             range(len(self.reqs)) if selected_indices is None else selected_indices
         )
