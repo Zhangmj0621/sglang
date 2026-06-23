@@ -2054,6 +2054,36 @@ class Scheduler(
 
         return ret
 
+    def _maybe_add_chunked_req_before_loop(self, adder) -> bool:
+        """Add the chunked request now, or defer it for ref-aware LP ordering.
+
+        When ref-aware KV buffering is enabled a low-priority chunk must not
+        be budgeted before high-priority ``add_one_req`` calls, because those
+        calls lock prefixes via ``inc_lock_ref`` and drain the UNUSED/LOW_REF
+        tiers that the LP chunk's budget depends on.  Deferring the LP chunk
+        until after the HP requests are processed lets it see accurate tier
+        sizes.
+
+        Returns True if a LP chunk was deferred (the caller must add it at the
+        HP-to-LP boundary in the main loop).  Returns False otherwise (the
+        chunk was already added, or there is no chunk to process).
+        """
+        if self.chunked_req is None:
+            return False
+
+        if not self.enable_ref_aware_kv_buffer:
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            return False
+
+        chunk_is_high = (
+            (self.chunked_req.priority or 0) >= self.high_priority_threshold
+        )
+        if chunk_is_high:
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            return False
+
+        return True
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2183,14 +2213,22 @@ class Scheduler(
                     )
                     deferred_chunked_req.reset_for_retract()
 
-        if self.chunked_req is not None:
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        lp_chunk_deferred = self._maybe_add_chunked_req_before_loop(adder)
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
+        lp_chunk_added = False
         for req in self.waiting_queue:
+            # Insert deferred LP chunk at the HP→LP boundary so it sees
+            # tier sizes after HP inc_lock_ref but keeps priority over
+            # new LP requests.
+            if lp_chunk_deferred and not lp_chunk_added:
+                if (req.priority or 0) < self.high_priority_threshold:
+                    self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                    lp_chunk_added = True
+
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2262,6 +2300,10 @@ class Scheduler(
                     else:
                         self.running_batch.batch_is_full = True
                 break
+
+        # LP chunk deferred but queue was all HP or empty — add now.
+        if lp_chunk_deferred and not lp_chunk_added:
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
