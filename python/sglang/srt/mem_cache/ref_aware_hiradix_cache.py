@@ -359,12 +359,14 @@ class RefAwareHiRadixCache(HiRadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _get_tier_priority(self, node: TreeNode, target_tier: int):
-        # For multi-turn interactive workloads, a high_ref node that became idle
-        # earlier is often more likely to be reused sooner. Evict the most recently
-        # idle high_ref nodes first instead of applying the global LRU policy there.
+        # Evict nodes with fewer references first — more refs means more
+        # requests share this prefix, so evicting it is more expensive.
+        # Primary key: high_ref count (more → evict later).
+        # Secondary key: low_ref count (more → evict later).
+        # Tertiary key: time-based tiebreaker matching the tier's semantics.
         if target_tier == TIER_HIGH_REF:
-            return -node.last_access_time
-        return self.eviction_strategy.get_priority(node)
+            return (node.high_ref, node.low_ref, -node.last_access_time)
+        return (node.high_ref, node.low_ref, self.eviction_strategy.get_priority(node))
 
     def _evict_from_tier(self, num_tokens: int, leaf_set: set, target_tier: int) -> int:
         leaves = list(leaf_set)
