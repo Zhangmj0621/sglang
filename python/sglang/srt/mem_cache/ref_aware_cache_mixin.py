@@ -27,11 +27,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Data types
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RefInfo:
     is_high: bool
@@ -39,10 +34,6 @@ class RefInfo:
     nodes: Set[TreeNode] = field(default_factory=set)
     cached_tokens: int = 0
 
-
-# ---------------------------------------------------------------------------
-# Eviction tier constants
-# ---------------------------------------------------------------------------
 
 TIER_UNUSED = 0  # high_ref == 0, low_ref == 0
 TIER_LOW_REF = 1  # high_ref == 0, low_ref > 0
@@ -57,23 +48,14 @@ def _classify_node_tier(node: TreeNode) -> int:
     return TIER_UNUSED
 
 
-# ---------------------------------------------------------------------------
-# Mixin class
-# ---------------------------------------------------------------------------
-
-
 class RefAwareCacheMixin:
-    """Mixin that adds ref-aware tiered eviction to any radix-style cache.
-
-    Concrete subclasses must call ``_init_ref_aware_state(server_args)`` from
-    their own ``__init__`` and ``_reset_ref_aware_state()`` from ``reset()``.
+    """
+    Mixin that adds ref-aware tiered eviction to any radix-style cache.
     """
 
     def _init_ref_aware_state(self, server_args: ServerArgs):
-        """Initialize all ref-aware tier tracking state.
-
-        Must be called from the concrete class's ``__init__`` after
-        ``super().__init__(...)`` has been invoked.
+        """
+        Initialize all ref-aware tier tracking state.
         """
         self.high_priority_threshold = getattr(
             server_args, "high_priority_threshold", 1
@@ -91,9 +73,8 @@ class RefAwareCacheMixin:
         self._evict_scope_stack: list[tuple[bool, bool]] = []
 
     def _reset_ref_aware_state(self):
-        """Clear all ref-aware tier tracking state.
-
-        Must be called from the concrete class's ``reset()`` method.
+        """
+        Clear all ref-aware tier tracking state.
         """
         self.unused_evictable_leaves.clear()
         self.low_ref_evictable_leaves.clear()
