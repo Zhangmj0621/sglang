@@ -1,14 +1,5 @@
-"""Mixin providing ref-aware tiered eviction logic.
-
-This mixin extracts the reusable tier-tracking and ref-management logic from
-RefAwareHiRadixCache so it can be shared between different cache backends
-(HiRadixCache, plain RadixCache, etc.) without duplicating code.
-
-Usage:
-    class MyConcretCache(RefAwareCacheMixin, SomeBaseCache):
-        def __init__(self, params, server_args):
-            super().__init__(params=params, server_args=server_args)
-            self._init_ref_aware_state(server_args)
+"""
+Mixin providing ref-aware tiered eviction logic.
 """
 
 from __future__ import annotations
@@ -78,10 +69,6 @@ class RefAwareCacheMixin:
     their own ``__init__`` and ``_reset_ref_aware_state()`` from ``reset()``.
     """
 
-    # ------------------------------------------------------------------
-    # Initialization helpers (NOT __init__)
-    # ------------------------------------------------------------------
-
     def _init_ref_aware_state(self, server_args: ServerArgs):
         """Initialize all ref-aware tier tracking state.
 
@@ -117,18 +104,10 @@ class RefAwareCacheMixin:
         self.session_id_to_ref_info.clear()
         self._evict_scope_stack.clear()
 
-    # ------------------------------------------------------------------
-    # Priority classification
-    # ------------------------------------------------------------------
-
     def is_high_priority(self, priority: int) -> bool:
         if not self._enable_priority_scheduling:
             return True
         return priority >= self.high_priority_threshold
-
-    # ------------------------------------------------------------------
-    # Tier bookkeeping
-    # ------------------------------------------------------------------
 
     def _move_node_tier(self, node: TreeNode, old_tier: int, new_tier: int):
         assert (
@@ -167,10 +146,6 @@ class RefAwareCacheMixin:
             return
         self._add_tier_size(_classify_node_tier(node), len(node.key))
 
-    # ------------------------------------------------------------------
-    # Leaf status tracking
-    # ------------------------------------------------------------------
-
     def _update_leaf_status(self, node: TreeNode):
         super()._update_leaf_status(node)
         self._update_ref_aware_leaf_status(node)
@@ -190,16 +165,8 @@ class RefAwareCacheMixin:
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).add(node)
 
-    # ------------------------------------------------------------------
-    # Lock ref hooks
-    # ------------------------------------------------------------------
-
     def _on_lock_ref_node(self, node: TreeNode):
         pass
-
-    # ------------------------------------------------------------------
-    # inc_lock_ref / dec_lock_ref — full reimplementation with tier accounting
-    # ------------------------------------------------------------------
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
@@ -244,10 +211,6 @@ class RefAwareCacheMixin:
             node = node.parent
         return DecLockRefResult(delta=delta)
 
-    # ------------------------------------------------------------------
-    # _delete_leaf — tier cleanup + tracked_session_ids cleanup
-    # ------------------------------------------------------------------
-
     def _delete_leaf(self, node):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
@@ -258,10 +221,6 @@ class RefAwareCacheMixin:
                 ref_info.nodes.discard(node)
         node.tracked_session_ids.clear()
         super()._delete_leaf(node)
-
-    # ------------------------------------------------------------------
-    # Tiered eviction size queries
-    # ------------------------------------------------------------------
 
     def evictable_size_by_tier(
         self, allow_low: bool = True, allow_high: bool = False
@@ -316,10 +275,6 @@ class RefAwareCacheMixin:
             f"{protected_size=}, {pool_size=}, {tier_sum=}, {leaked=})\n"
         )
 
-    # ------------------------------------------------------------------
-    # Tier priority & shared eviction heap
-    # ------------------------------------------------------------------
-
     def _get_tier_priority(self, node: TreeNode, target_tier: int):
         """Compute eviction priority for a node within its tier.
 
@@ -367,10 +322,6 @@ class RefAwareCacheMixin:
                         heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         return num_evicted
-
-    # ------------------------------------------------------------------
-    # Explicit ref management for multi-turn requests
-    # ------------------------------------------------------------------
 
     def session_id_for_req(self, req: Req) -> Optional[str]:
         session_id = getattr(req, "session_id", None)
@@ -504,10 +455,6 @@ class RefAwareCacheMixin:
             self._inc_priority_ref_single(node, new_is_high)
         ref_info.is_high = new_is_high
         return True, f"updated {len(ref_info.nodes)} nodes for session_id {session_id}"
-
-    # ------------------------------------------------------------------
-    # Split node override to propagate high_ref / low_ref
-    # ------------------------------------------------------------------
 
     def _split_node(self, key, child, split_len):
         new_node = super()._split_node(key, child, split_len)

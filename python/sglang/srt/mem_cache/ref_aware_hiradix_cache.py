@@ -3,7 +3,7 @@ from __future__ import annotations
 import heapq
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -47,16 +47,8 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
         self._reset_ref_aware_state()
         super().reset()
 
-    # ------------------------------------------------------------------
-    # Hook: additional per-node work during inc_lock_ref / dec_lock_ref
-    # ------------------------------------------------------------------
-
     def _on_lock_ref_node(self, node: TreeNode):
         self._update_host_leaf_status(node)
-
-    # ------------------------------------------------------------------
-    # HiCache-specific: safe evictable size accounting for host capacity
-    # ------------------------------------------------------------------
 
     def safe_evictable_size_by_tier(
         self, allow_low: bool = True, allow_high: bool = False
@@ -67,10 +59,6 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
         if allow_high:
             total += self.high_ref_evictable_size_
         return total
-
-    # ------------------------------------------------------------------
-    # Tiered eviction (HiCache-specific: write_back / backuped logic)
-    # ------------------------------------------------------------------
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self._evict_scope_stack:
@@ -131,7 +119,7 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
         heap = self._make_tier_eviction_heap(leaf_set, target_tier)
         num_evicted = 0
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if _classify_node_tier(x) != target_tier:
@@ -146,11 +134,25 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
     def _evict_from_tier_write_back(
         self, num_tokens: int, leaf_set: set, target_tier: int
     ) -> int:
+        """eviction for write_back mode: demote already-backuped leaves, stage non-backuped ones to host if possible, otherwise drop them.
+        note this path will be deprecated in the future.
+        """
         allow_high_host = target_tier == TIER_HIGH_REF
         heap = self._make_tier_eviction_heap(leaf_set, target_tier)
         num_evicted = 0
+        staged: List[Tuple[TreeNode, torch.Tensor]] = []
+
+        def flush_staged() -> None:
+            if not staged:
+                return
+            self.writing_check(write_back=True)
+            for node, device_indices in staged:
+                self.cache_controller.evict_device(device_indices)
+                node.release_host()
+            staged.clear()
+
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if _classify_node_tier(x) != target_tier:
@@ -158,16 +160,15 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True, allow_high=allow_high_host) > 0:
-                self.writing_check(write_back=True)
-                num_evicted += self._evict_backuped(x)
+                x.protect_host()
+                staged.append((x, x.value))
+                num_evicted += self._detach_backuped(x)
             else:
+                flush_staged()
                 num_evicted += self._drop_subtree_no_host(x)
             self._promote_tier_parent(x, heap, target_tier)
+        flush_staged()
         return num_evicted
-
-    # ------------------------------------------------------------------
-    # Tiered host eviction
-    # ------------------------------------------------------------------
 
     def evict_host(self, num_tokens: int, allow_high: bool = False):
         num_evicted = 0
@@ -199,7 +200,7 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
             if not x.evicted or x.host_ref_counter > 0:
@@ -231,13 +232,12 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
 
         return num_evicted
 
-    # ------------------------------------------------------------------
-    # Write backup and evict backuped (HiCache-specific tier accounting)
-    # ------------------------------------------------------------------
-
     def write_backup(
         self, node: TreeNode, write_back=False, allow_high: bool = False
     ) -> int:
+        # Backup invariant (for write-through mode): backed-up nodes must form a
+        # contiguous prefix from root — no gaps.  Skip if parent isn't backed
+        # up yet;
         if not write_back and (
             node.parent != self.root_node and not node.parent.backuped
         ):
@@ -266,11 +266,11 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
 
         return len(host_indices)
 
-    def _evict_backuped(self, node: TreeNode):
+    def _detach_backuped(self, node: TreeNode) -> int:
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
-        return super()._evict_backuped(node)
+        return super()._detach_backuped(node)
 
     def _drop_subtree_no_host(self, root: TreeNode) -> int:
         nodes = []
@@ -319,10 +319,6 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
         self._update_leaf_status(root.parent)
         self._update_host_leaf_status(root.parent)
         return freed_device
-
-    # ------------------------------------------------------------------
-    # Load back
-    # ------------------------------------------------------------------
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None, req: Optional[Req] = None
@@ -431,10 +427,6 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
             last_node,
         )
 
-    # ------------------------------------------------------------------
-    # Insert (HiCache-specific: host leaf status, write_back policy)
-    # ------------------------------------------------------------------
-
     def insert(self, params: InsertParams) -> InsertResult:
         key = params.key
         value = params.value
@@ -465,6 +457,7 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
             if prefix_len == len(node.key):
                 if node.evicted:
                     # change the reference if the node is evicted
+                    # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
                     self._account_new_evictable_node(node)
