@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RefInfo:
     is_high: bool
+    priority: int = 0
     nodes: Set[TreeNode] = field(default_factory=set)
     cached_tokens: int = 0
 
@@ -381,12 +382,20 @@ class RefAwareCacheMixin:
         session_id = self.session_id_for_req(req)
         if session_id is None:
             return
-        is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
+        priority = getattr(req, "priority", 0)
+        is_high = self.is_high_priority(priority)
 
         if session_id not in self.session_id_to_ref_info:
-            self.session_id_to_ref_info[session_id] = RefInfo(is_high=is_high)
+            self.session_id_to_ref_info[session_id] = RefInfo(
+                is_high=is_high, priority=priority
+            )
 
         ref_info = self.session_id_to_ref_info[session_id]
+        if is_high != ref_info.is_high:
+            msg = "Priority class mismatch for ref-aware KV buffer."
+            logger.error(msg)
+            raise ValueError(msg)
+        ref_info.priority = priority
 
         last_node = getattr(req, "last_node", None)
         if last_node not in (None, self.root_node):
@@ -485,6 +494,7 @@ class RefAwareCacheMixin:
             return False, f"session_id {session_id} not found in ref tracking"
 
         new_is_high = self.is_high_priority(new_priority)
+        ref_info.priority = new_priority
 
         if new_is_high == ref_info.is_high:
             return True, "priority class unchanged"

@@ -309,6 +309,43 @@ class TestRefAwareRegisterRef(unittest.TestCase):
         self.assertEqual(a.low_ref, 1)
         self.assertEqual(a.high_ref, 0)
 
+    def test_register_ref_priority_class_mismatch_raises(self):
+        """A follow-up request that changes priority class without /update_ref
+        must fail fast instead of corrupting high_ref/low_ref accounting."""
+        cache = self._make_cache()
+        a = self._append_node(cache.root_node, [1, 2, 3, 4])
+
+        req = SimpleNamespace(session_id="s1", priority=0, last_node=a)
+        cache.register_ref(req)
+
+        b = self._append_node(a, [5, 6, 7, 8])
+        req2 = SimpleNamespace(session_id="s1", priority=1, last_node=b)
+        with self.assertRaisesRegex(ValueError, "Priority class mismatch"):
+            cache.register_ref(req2)
+
+        # Accounting must be untouched by the rejected request
+        self.assertEqual(a.low_ref, 1)
+        self.assertEqual(a.high_ref, 0)
+        self.assertEqual(b.low_ref, 0)
+        self.assertEqual(b.high_ref, 0)
+
+    def test_register_ref_same_class_different_priority_ok(self):
+        """Priority changes within the same class (e.g. 1 -> 2, both high)
+        are harmless and must not raise."""
+        cache = self._make_cache()
+        a = self._append_node(cache.root_node, [1, 2, 3, 4])
+
+        req = SimpleNamespace(session_id="s1", priority=1, last_node=a)
+        cache.register_ref(req)
+
+        b = self._append_node(a, [5, 6, 7, 8])
+        req2 = SimpleNamespace(session_id="s1", priority=2, last_node=b)
+        cache.register_ref(req2)
+
+        self.assertEqual(a.high_ref, 1)
+        self.assertEqual(b.high_ref, 1)
+        self.assertEqual(cache.session_id_to_ref_info["s1"].priority, 2)
+
     def test_register_ref_only_adds_new_suffix_from_last_node(self):
         """Second register_ref only adds nodes not previously tracked."""
         cache = self._make_cache()
