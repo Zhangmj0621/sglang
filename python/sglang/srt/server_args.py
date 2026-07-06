@@ -2032,11 +2032,11 @@ class ServerArgs:
     # Ref-aware KV cache eviction (requires hierarchical cache)
     enable_ref_aware_kv_buffer: A[
         bool,
-        "Enable ref-aware KV cache eviction with two-tier priority. Requires --enable-hierarchical-cache.",
+        "Enable ref-aware KV cache eviction with two-tier priority.",
     ] = False
     high_priority_threshold: A[
         int,
-        "Requests with priority >= this threshold are high-priority for ref-aware eviction.",
+        "Requests with priority >= this threshold are high-priority for ref-aware eviction. Need if --enable-priority-scheduling",
     ] = 1
 
     # -------------------------------------------------------------------------
@@ -5739,17 +5739,6 @@ class ServerArgs:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
-            )
-
-        if (
-            self.enable_ref_aware_kv_buffer
-            and self.enable_priority_scheduling
-            and self.schedule_low_priority_values_first
-        ):
-            raise ValueError(
-                "--enable-ref-aware-kv-buffer with --enable-priority-scheduling assumes "
-                "larger priority value == higher priority, so it is incompatible with "
-                "--schedule-low-priority-values-first."
             )
 
         if self.disaggregation_decode_enable_offload_kvcache:
