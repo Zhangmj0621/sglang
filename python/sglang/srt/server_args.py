@@ -2658,23 +2658,6 @@ class ServerArgs:
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
 
-        # Validate PD disaggregation flags early (before dummy-model short-circuit).
-        from sglang.srt.arg_groups.pd_disaggregation_hook import (
-            handle_pd_disaggregation,
-        )
-
-        handle_pd_disaggregation(self)
-
-        # Normalize deprecated CP aliases before validations or model-specific
-        # defaults inspect enable_prefill_cp/cp_strategy.
-        self._handle_legacy_cp_arguments()
-        self._validate_prefill_only_disable_kv_cache_args()
-        self._handle_dcp_validation()
-
-        if self.model_path.lower() in ["none", "dummy"]:
-            # Skip for dummy models
-            return
-
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
