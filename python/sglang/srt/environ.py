@@ -208,6 +208,9 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
+    # megaAttention (Hopper SM90 fused causal-varlen-FA + O_proj + NVLS AllReduce; prefill EXTEND only)
+    SGLANG_USE_MEGA_ATTENTION = EnvBool(False)
+
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)

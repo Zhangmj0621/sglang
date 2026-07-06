@@ -1088,6 +1088,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
+            if getattr(forward_batch, "mega_attn_reduced", False):
+                # megaAttention already produced the all-reduced attention output (fused
+                # FA + O_proj + NVLS AllReduce). Skip the deferred attention AllReduce —
+                # this single guard covers the fused / quant / plain paths below — and keep
+                # the post-attention layernorm (+ residual) intact.
+                hidden_states, residual = layernorm(hidden_states, residual)
+                return hidden_states, residual
             handled = False
             if (
                 apply_aiter_all_reduce_fusion(hidden_states)

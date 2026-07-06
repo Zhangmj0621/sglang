@@ -391,6 +391,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
+    # megaAttention: set per layer in Qwen3MoeAttention.forward_core — True when the mega
+    # fused kernel already produced the all-reduced attention output, so LayerCommunicator
+    # must skip its deferred attention AllReduce (see layers/communicator.py).
+    mega_attn_reduced: bool = False
+
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 

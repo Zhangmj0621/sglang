@@ -490,7 +490,12 @@ target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+# FlashMLA is DeepSeek-MLA-only and bundles an older cutlass; gate it so non-MLA builds
+# (e.g. Qwen3 MoE / megaAttention integration on CUDA 13.x) can skip it.
+option(SGL_KERNEL_ENABLE_FLASHMLA "Enable FlashMLA (DeepSeek MLA only)" ON)
+if (SGL_KERNEL_ENABLE_FLASHMLA)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+endif()
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"

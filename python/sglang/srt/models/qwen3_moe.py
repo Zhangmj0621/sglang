@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.attention.mega_attention_runtime import get_mega_runtime
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
@@ -546,6 +547,16 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
+        # megaAttention fused prefill runtime (None when SGLANG_USE_MEGA_ATTENTION off).
+        self.mega_runtime = get_mega_runtime()
+
+    def _use_mega(self, forward_batch) -> bool:
+        """mega fast-path gate. Evaluated in BOTH apply_qk_norm_rope (phase 1) and
+        forward_core (phase 2); deterministic per forward, so both phases agree."""
+        return self.mega_runtime is not None and self.mega_runtime.should_use_mega(
+            forward_batch, self
+        )
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -599,6 +610,11 @@ class Qwen3MoeAttention(nn.Module):
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        if use_fused and self._use_mega(forward_batch):
+            # mega 路径跳过 self.attn,不能靠 save_kv_cache 写 KV;而 fused qk-norm-rope 分支不写
+            # KV。故强制走下面的非 fused 分支,经 fused_set_kv_buffer_arg 在 RoPE 阶段写好本层新
+            # token KV(mega launch 前 KV 必须已在 pool)。
+            use_fused = False
         if use_fused:
             theta = self.rope_theta
             positions = (
@@ -684,6 +700,17 @@ class Qwen3MoeAttention(nn.Module):
 
         q, k, v, fb = inner_state
 
+        if self._use_mega(fb):
+            # mega fused prefill: 本层新 token KV 已在 apply_qk_norm_rope 经 fused-set-kv-buffer
+            # 写入。跳过 self.attn + self.o_proj;输出已是 post-o_proj、跨 rank all-reduced 的
+            # [tot_q, hidden](C_sym 零拷贝 view)。打 flag 通知 communicator 跳过延迟 AllReduce。
+            out = self.mega_runtime.run_layer(
+                fb, q, self.o_proj.weight, self.attn.layer_id
+            )
+            fb.mega_attn_reduced = True
+            return out
+
+        fb.mega_attn_reduced = False
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
             enable_fused_set_kv_buffer(forward_batch)
