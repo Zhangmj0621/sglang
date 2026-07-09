@@ -471,10 +471,10 @@ class PrefillAdder:
         return available_and_evictable - self.rem_total_token_offset
 
     def _rem_total_tokens_ref_aware(self, is_high: bool):
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
         cache = self.tree_cache
-        assert isinstance(cache, RefAwareHiRadixCache)
+        assert isinstance(cache, RefAwareCacheMixin)
         available = self.token_to_kv_pool_allocator.available_size()
         evictable = cache.safe_evictable_size_by_tier(
             allow_low=True,
@@ -624,6 +624,7 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         elif self.enable_ref_aware_kv_buffer:
+            # TODO (zhangmj): need to support is_hybrid_swa.
             req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
             budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
             _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
@@ -632,6 +633,8 @@ class PrefillAdder:
                 # same as the non-ref-aware path. Fall back to rem_chunk_tokens
                 # and let eviction handle it, matching the original behavior.
                 _rem_tokens = self.rem_chunk_tokens
+            elif _rem_tokens <= 0 and not req_is_high:
+                return req
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
@@ -950,10 +953,10 @@ class PrefillAdder:
     def _kick_low_priority_for_high(
         self, req: Req, total_tokens_needed: int, server_args: ServerArgs
     ) -> bool:
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
         cache = self.tree_cache
-        if not isinstance(cache, RefAwareHiRadixCache):
+        if not isinstance(cache, RefAwareCacheMixin):
             return False
 
         threshold = self.high_priority_threshold

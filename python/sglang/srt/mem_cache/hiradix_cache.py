@@ -823,9 +823,10 @@ class HiRadixCache(RadixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def _evict_backuped(self, node: TreeNode):
-        # evict a node already written to host
-        num_evicted = self.cache_controller.evict_device(node.value)
+    def _detach_backuped(self, node: TreeNode) -> int:
+        # detach the device copy from the tree while keeping the host backup;
+        # the caller is responsible for freeing the device indices
+        num_evicted = len(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
@@ -833,6 +834,13 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        return num_evicted
+
+    def _evict_backuped(self, node: TreeNode):
+        # evict a node already written to host
+        device_indices = node.value
+        num_evicted = self._detach_backuped(node)
+        self.cache_controller.evict_device(device_indices)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):

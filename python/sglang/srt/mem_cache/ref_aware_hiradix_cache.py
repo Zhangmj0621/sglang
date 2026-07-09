@@ -4,26 +4,28 @@ import heapq
 import logging
 import time
 from collections import OrderedDict
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefResult,
     EvictParams,
     EvictResult,
-    IncLockRefResult,
     InsertParams,
     InsertResult,
-    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
     compute_node_hash_values,
+)
+from sglang.srt.mem_cache.ref_aware_cache_mixin import (
+    TIER_HIGH_REF,
+    TIER_LOW_REF,
+    TIER_UNUSED,
+    RefAwareCacheMixin,
+    _classify_node_tier,
 )
 
 if TYPE_CHECKING:
@@ -32,126 +34,40 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
-@dataclass
-class RefInfo:
-    is_high: bool
-    nodes: Set[TreeNode] = field(default_factory=set)
-    cached_tokens: int = 0
-    is_generating: bool = False
-
-
 logger = logging.getLogger(__name__)
 
-# Eviction tier constants
-TIER_UNUSED = 0  # high_ref == 0, low_ref == 0
-TIER_LOW_REF = 1  # high_ref == 0, low_ref > 0
-TIER_HIGH_REF = 2  # high_ref > 0
 
-
-def _classify_node_tier(node: TreeNode) -> int:
-    if node.high_ref > 0:
-        return TIER_HIGH_REF
-    if node.low_ref > 0:
-        return TIER_LOW_REF
-    return TIER_UNUSED
-
-
-class RefAwareHiRadixCache(HiRadixCache):
+class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
-        self.high_priority_threshold = server_args.high_priority_threshold
-        self._enable_priority_scheduling = server_args.enable_priority_scheduling
-        self.unused_evictable_leaves: set = set()
-        self.low_ref_evictable_leaves: set = set()
-        self.high_ref_evictable_leaves: set = set()
-        self.unused_evictable_size_: int = 0
-        self.low_ref_evictable_size_: int = 0
-        self.high_ref_evictable_size_: int = 0
-        self.rid_to_ref_info: Dict[str, RefInfo] = {}
-        self._evict_scope_stack: list[tuple[bool, bool]] = []
+        self._init_ref_aware_state(server_args)
         self._adaptively_demoted_rids: OrderedDict[str, int] = OrderedDict()
         self._idle_hp_heap: list[tuple[int, str]] = []
         super().__init__(params=params, server_args=server_args)
 
     def reset(self):
-        self.unused_evictable_leaves.clear()
-        self.low_ref_evictable_leaves.clear()
-        self.high_ref_evictable_leaves.clear()
-        self.unused_evictable_size_ = 0
-        self.low_ref_evictable_size_ = 0
-        self.high_ref_evictable_size_ = 0
-        self.rid_to_ref_info.clear()
-        self._evict_scope_stack.clear()
+        self._reset_ref_aware_state()
         self._adaptively_demoted_rids.clear()
         self._idle_hp_heap.clear()
         super().reset()
 
-    def is_high_priority(self, priority: int) -> bool:
-        if not self._enable_priority_scheduling:
-            return True
-        return priority >= self.high_priority_threshold
+    def _on_lock_ref_node(self, node: TreeNode):
+        self._update_host_leaf_status(node)
 
-    def _move_node_tier(self, node: TreeNode, old_tier: int, new_tier: int):
-        # Caller (inc/dec_priority_ref / update_ref) has already gated on
-        # `not node.evicted and node.lock_ref == 0`. Assert it instead of
-        # re-checking.
-        assert (
-            not node.evicted and node.lock_ref == 0
-        ), "_move_node_tier called for evicted or lock-held node"
-        node_size = len(node.key)
-        old_set = self._tier_leaf_set(old_tier)
-        new_set = self._tier_leaf_set(new_tier)
-        if node in old_set:
-            old_set.discard(node)
-            # Only re-add if node is still a valid evictable leaf
-            # (all children evicted or no children).
-            is_leaf = all(c.evicted for c in node.children.values())
-            if is_leaf:
-                new_set.add(node)
-        self._add_tier_size(old_tier, -node_size)
-        self._add_tier_size(new_tier, node_size)
-
-    def _tier_leaf_set(self, tier: int) -> set:
-        if tier == TIER_UNUSED:
-            return self.unused_evictable_leaves
-        elif tier == TIER_LOW_REF:
-            return self.low_ref_evictable_leaves
-        else:
-            return self.high_ref_evictable_leaves
-
-    def _add_tier_size(self, tier: int, delta: int):
-        if tier == TIER_UNUSED:
-            self.unused_evictable_size_ += delta
-        elif tier == TIER_LOW_REF:
-            self.low_ref_evictable_size_ += delta
-        else:
-            self.high_ref_evictable_size_ += delta
-
-    def _account_new_evictable_node(self, node: TreeNode):
-        if node in (None, self.root_node) or node.evicted or node.lock_ref > 0:
-            return
-        self._add_tier_size(_classify_node_tier(node), len(node.key))
-
-    # --- Override leaf status tracking ---
-
-    def _update_leaf_status(self, node: TreeNode):
-        super()._update_leaf_status(node)
-        self._update_ref_aware_leaf_status(node)
-
-    def _update_ref_aware_leaf_status(self, node: TreeNode):
-        self.unused_evictable_leaves.discard(node)
-        self.low_ref_evictable_leaves.discard(node)
-        self.high_ref_evictable_leaves.discard(node)
-
-        if node.evicted or node.lock_ref > 0:
-            return
-
-        for child in node.children.values():
-            if not child.evicted:
-                return
-
-        tier = _classify_node_tier(node)
-        self._tier_leaf_set(tier).add(node)
+    def safe_evictable_size_by_tier(
+        self, allow_low: bool = True, allow_high: bool = False
+    ) -> int:
+        # A high-priority eviction scope (allow_high) can free every high-ref
+        # device node -- backuped ones via `_evict_backuped` (host copy kept),
+        # the rest via `_evict_regular`. So the admission budget equals the full
+        # high-ref evictable size, keeping admission consistent with what
+        # eviction can actually reclaim. O(1) counter read.
+        total = self.unused_evictable_size_
+        if allow_low:
+            total += self.low_ref_evictable_size_
+        if allow_high:
+            total += self.high_ref_evictable_size_
+        return total
 
     def _insert_host_only(self, parent_node, suffix_key, host_value):
         """Override that keeps RefAware tier sets consistent for the new
@@ -162,130 +78,6 @@ class RefAwareHiRadixCache(HiRadixCache):
         new_last_node = super()._insert_host_only(parent_node, suffix_key, host_value)
         self._update_ref_aware_leaf_status(new_last_node)
         return new_last_node
-
-    # --- Override inc_lock_ref / dec_lock_ref ---
-
-    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
-        if self.disable:
-            return IncLockRefResult(delta=0)
-
-        delta = 0
-        while node != self.root_node:
-            if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.key)
-                self.protected_size_ += len(node.key)
-                delta -= len(node.key)
-                if not node.evicted:
-                    tier = _classify_node_tier(node)
-                    tier_set = self._tier_leaf_set(tier)
-                    if node in tier_set:
-                        tier_set.discard(node)
-                    self._add_tier_size(tier, -len(node.key))
-            node.lock_ref += 1
-            self._update_leaf_status(node)
-            self._update_host_leaf_status(node)
-            node = node.parent
-        return IncLockRefResult(delta=delta)
-
-    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: Optional[str] = None):
-        if self.disable:
-            return DecLockRefResult(delta=0)
-
-        delta = 0
-        while node != self.root_node:
-            if node.lock_ref == 1:
-                self.evictable_size_ += len(node.key)
-                self.protected_size_ -= len(node.key)
-                delta += len(node.key)
-                if not node.evicted:
-                    tier = _classify_node_tier(node)
-                    self._add_tier_size(tier, len(node.key))
-            node.lock_ref -= 1
-            self._update_leaf_status(node)
-            self._update_host_leaf_status(node)
-            if node.parent is None:
-                assert node is self.root_node
-            node = node.parent
-        return DecLockRefResult(delta=delta)
-
-    # --- Override _delete_leaf ---
-
-    def _delete_leaf(self, node):
-        tier = _classify_node_tier(node)
-        self._tier_leaf_set(tier).discard(node)
-        self._add_tier_size(tier, -len(node.key))
-        for rid in node.tracked_rids:
-            ref_info = self.rid_to_ref_info.get(rid)
-            if ref_info is not None:
-                ref_info.nodes.discard(node)
-        node.tracked_rids.clear()
-        super()._delete_leaf(node)
-
-    # --- Tiered eviction ---
-
-    def evictable_size_by_tier(
-        self, allow_low: bool = True, allow_high: bool = False
-    ) -> int:
-        total = self.unused_evictable_size_
-        if allow_low:
-            total += self.low_ref_evictable_size_
-        if allow_high:
-            total += self.high_ref_evictable_size_
-        return total
-
-    def high_ref_host_safe_evictable_size(self) -> int:
-        # A high-priority eviction scope (allow_high) can free every high-ref
-        # device node -- backuped ones via `_evict_backuped` (host copy kept),
-        # the rest via `_evict_regular`. So the admission budget equals the full
-        # high-ref evictable size, keeping admission consistent with what
-        # eviction can actually reclaim. O(1) counter read.
-        return self.high_ref_evictable_size_
-
-    def safe_evictable_size_by_tier(
-        self, allow_low: bool = True, allow_high: bool = False
-    ) -> int:
-        total = self.unused_evictable_size_
-        if allow_low:
-            total += self.low_ref_evictable_size_
-        if allow_high:
-            total += self.high_ref_host_safe_evictable_size()
-        return total
-
-    @contextmanager
-    def scoped_evict(self, allow_low: bool = True, allow_high: bool = False):
-        self._evict_scope_stack.append((allow_low, allow_high))
-        try:
-            yield
-        finally:
-            self._evict_scope_stack.pop()
-
-    def available_and_evictable_str(self) -> str:
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.evictable_size()
-        protected_size = self.protected_size()
-        pool_size = getattr(self.token_to_kv_pool_allocator, "size", None)
-        # Conservation: every device token is free, evictable (unlocked) or
-        # protected (locked). A positive `leaked` means tokens went missing
-        # (true leak); if `protected` accounts for the gap it is just heavy
-        # concurrent locking, not a leak. `tier_sum` should equal evictable.
-        tier_sum = (
-            self.unused_evictable_size_
-            + self.low_ref_evictable_size_
-            + self.high_ref_evictable_size_
-        )
-        leaked = (
-            pool_size - (available_size + evictable_size + protected_size)
-            if pool_size is not None
-            else None
-        )
-        return (
-            f"Available tokens: {available_size + evictable_size} "
-            f"({available_size=} + {evictable_size=}, "
-            f"unused_evictable_size={self.unused_evictable_size_}, "
-            f"low_ref_evictable_size={self.low_ref_evictable_size_}, "
-            f"high_ref_evictable_size={self.high_ref_evictable_size_}, "
-            f"{protected_size=}, {pool_size=}, {tier_sum=}, {leaked=})\n"
-        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self._evict_scope_stack:
@@ -318,70 +110,138 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def _get_tier_priority(self, node: TreeNode, target_tier: int):
-        # Evict nodes with fewer references first — more refs means more
-        # requests share this prefix, so evicting it is more expensive.
-        # Primary key: high_ref count (more → evict later).
-        # Secondary key: low_ref count (more → evict later).
-        # Tertiary key: time-based tiebreaker matching the tier's semantics.
-        if target_tier == TIER_HIGH_REF:
-            return (node.high_ref, node.low_ref, -node.last_access_time)
-        return (node.high_ref, node.low_ref, self.eviction_strategy.get_priority(node))
-
     def _evict_from_tier(self, num_tokens: int, leaf_set: set, target_tier: int) -> int:
-        leaves = list(leaf_set)
-        eviction_heap = [
-            (self._get_tier_priority(node, target_tier), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
+        if self.cache_controller.write_policy == "write_back":
+            return self._evict_from_tier_write_back(num_tokens, leaf_set, target_tier)
+        else:
+            return self._evict_from_tier_write_through(
+                num_tokens, leaf_set, target_tier
+            )
 
+    def _make_tier_eviction_heap(self, leaf_set: set, target_tier: int):
+        heap = [(self._get_tier_priority(node, target_tier), node) for node in leaf_set]
+        heapq.heapify(heap)
+        return heap
+
+    def _promote_tier_parent(self, node: TreeNode, heap, target_tier: int):
+        p = node.parent
+        if (
+            p is not self.root_node
+            and _classify_node_tier(p) == target_tier
+            and all(c.evicted for c in p.children.values())
+        ):
+            heapq.heappush(heap, (self._get_tier_priority(p, target_tier), p))
+
+    def _evict_from_tier_write_through(
+        self, num_tokens: int, leaf_set: set, target_tier: int
+    ) -> int:
+        heap = self._make_tier_eviction_heap(leaf_set, target_tier)
         num_evicted = 0
-        write_back_nodes = []
-
-        while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
-
+        while num_evicted < num_tokens and heap:
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
-
             if _classify_node_tier(x) != target_tier:
                 continue
-
-            if not x.backuped:
-                if self.cache_controller.write_policy == "write_back":
-                    written = self.write_backup(x, write_back=True)
-                    num_evicted += written
-                    if written > 0:
-                        write_back_nodes.append(x)
-                else:
-                    # write_through: free the device copy directly. For a high
-                    # tier this only runs in a high-priority eviction scope
-                    # (allow_high; a low-priority batch never enters this tier),
-                    # so admission (which budgets all high-ref as reclaimable)
-                    # stays consistent with what eviction can actually free.
-                    # No host DMA / sync on this path.
-                    num_evicted += self._evict_regular(x)
-            else:
+            if x.backuped:
                 num_evicted += self._evict_backuped(x)
-
-            for child in x.parent.children.values():
-                if child in write_back_nodes:
-                    continue
-                if not child.evicted:
-                    break
             else:
-                if x.parent.lock_ref == 0 and x.parent != self.root_node:
-                    if _classify_node_tier(x.parent) == target_tier:
-                        new_priority = self._get_tier_priority(x.parent, target_tier)
-                        heapq.heappush(eviction_heap, (new_priority, x.parent))
-
-        if self.cache_controller.write_policy == "write_back":
-            self.writing_check(write_back=True)
-            for node in write_back_nodes:
-                assert node.backuped
-                self._evict_backuped(node)
-
+                num_evicted += self._evict_regular(x)
+            self._promote_tier_parent(x, heap, target_tier)
         return num_evicted
+
+    def _evict_from_tier_write_back(
+        self, num_tokens: int, leaf_set: set, target_tier: int
+    ) -> int:
+        """eviction for write_back mode: demote already-backuped leaves, stage
+        non-backuped ones to host if possible, otherwise drop them.
+        note this path will be deprecated in the future.
+        """
+        heap = self._make_tier_eviction_heap(leaf_set, target_tier)
+        num_evicted = 0
+        staged: List[Tuple[TreeNode, torch.Tensor]] = []
+
+        def flush_staged() -> None:
+            if not staged:
+                return
+            self.writing_check(write_back=True)
+            for node, device_indices in staged:
+                self.cache_controller.evict_device(device_indices)
+                node.release_host()
+            staged.clear()
+
+        while num_evicted < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            if x.lock_ref > 0:
+                continue
+            if _classify_node_tier(x) != target_tier:
+                continue
+            if x.backuped:
+                num_evicted += self._evict_backuped(x)
+            elif self.write_backup(x, write_back=True) > 0:
+                x.protect_host()
+                staged.append((x, x.value))
+                num_evicted += self._detach_backuped(x)
+            else:
+                flush_staged()
+                num_evicted += self._drop_subtree_no_host(x)
+            self._promote_tier_parent(x, heap, target_tier)
+        flush_staged()
+        return num_evicted
+
+    def _detach_backuped(self, node: TreeNode) -> int:
+        tier = _classify_node_tier(node)
+        self._tier_leaf_set(tier).discard(node)
+        self._add_tier_size(tier, -len(node.key))
+        return super()._detach_backuped(node)
+
+    def _drop_subtree_no_host(self, root: TreeNode) -> int:
+        nodes = []
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            nodes.append(n)
+            stack.extend(n.children.values())
+
+        if any(n.host_ref_counter > 0 for n in nodes):
+            return 0
+
+        logger.warning(
+            "write_back: KV cache on device are dropped without backup "
+            "due to host memory pressure, subtree root %d, num_nodes %d",
+            root.id,
+            len(nodes),
+        )
+
+        freed_device = 0
+        for n in nodes:
+            tier = _classify_node_tier(n)
+            self._tier_leaf_set(tier).discard(n)
+            if n.host_value is not None:
+                self.cache_controller.evict_host(n.host_value)
+                n.host_value = None
+            if n.value is not None:
+                self.cache_controller.mem_pool_device_allocator.free(n.value)
+                freed_device += len(n.value)
+                self.evictable_size_ -= len(n.value)
+                self._add_tier_size(tier, -len(n.key))
+                n.value = None
+            self.ongoing_write_through.pop(n.id, None)
+            self.evictable_leaves.discard(n)
+            self.evictable_host_leaves.discard(n)
+            for rid in n.tracked_rids:
+                ref_info = self.rid_to_ref_info.get(rid)
+                if ref_info is not None:
+                    ref_info.nodes.discard(n)
+            n.tracked_rids.clear()
+            # node removed from the tree entirely
+            self._record_remove_event(n)
+
+        key = self.get_child_key_fn(root.key)
+        root.parent.children.pop(key, None)
+        self._update_leaf_status(root.parent)
+        self._update_host_leaf_status(root.parent)
+        return freed_device
 
     # --- Adaptive HP demotion on host pressure ---
 
@@ -448,8 +308,6 @@ class RefAwareHiRadixCache(HiRadixCache):
             len(self._adaptively_demoted_rids),
         )
         return True
-
-    # --- Tiered host eviction ---
 
     def evict_host(self, num_tokens: int, allow_high: bool = False):
         num_evicted = 0
@@ -551,8 +409,6 @@ class RefAwareHiRadixCache(HiRadixCache):
 
         return len(host_indices)
 
-    # --- Explicit ref management for RL multi-turn ---
-
     def mark_rid_generating(self, rid: str):
         """Called by scheduler when a request with this rid enters the batch.
         O(1) flag flip — prevents this rid from being selected for demotion."""
@@ -560,165 +416,56 @@ class RefAwareHiRadixCache(HiRadixCache):
         if ref_info is not None:
             ref_info.is_generating = True
 
+    # --- Explicit ref management for RL multi-turn (adaptive-demotion aware) ---
+
     def register_ref(self, req: Req):
         rid = req.rid
         is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
 
-        if rid not in self.rid_to_ref_info:
-            self.rid_to_ref_info[rid] = RefInfo(is_high=is_high)
-
-        ref_info = self.rid_to_ref_info[rid]
-
         # If this rid was adaptively demoted and now re-enters as HP, restore it
-        # to prevent ref-count inconsistency (register adds high_ref but release
-        # would decrement low_ref if ref_info.is_high stayed False).
+        # first so the mixin's priority-class check sees consistent state.
         if rid in self._adaptively_demoted_rids and is_high:
             self._adaptive_restore(rid)
 
-        last_node = getattr(req, "last_node", None)
-        if last_node not in (None, self.root_node):
-            new_nodes = self._collect_untracked_nodes_from_last_node(
-                last_node, ref_info.nodes
-            )
-        else:
-            token_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
-            if not token_ids:
-                return
+        super().register_ref(req)
 
-            radix_key = RadixKey(
-                list(token_ids), getattr(req, "extra_key", None)
-            ).page_aligned(self.page_size)
-            if len(radix_key) == 0:
-                return
-
-            nodes_on_path = self._collect_nodes_on_path(radix_key)
-            new_nodes = [node for node in nodes_on_path if node not in ref_info.nodes]
-
-        for node in new_nodes:
-            self._inc_priority_ref_single(node, is_high)
-            ref_info.nodes.add(node)
-            node.tracked_rids.add(rid)
-
-        # Update cached_tokens and mark idle; push to heap for O(1) selection
-        ref_info.cached_tokens = sum(len(n.key) for n in ref_info.nodes)
+        ref_info = self.rid_to_ref_info.get(rid)
+        if ref_info is None:
+            return
         ref_info.is_generating = False
         if ref_info.is_high and rid not in self._adaptively_demoted_rids:
             heapq.heappush(self._idle_hp_heap, (ref_info.cached_tokens, rid))
 
-    def _collect_nodes_on_path(self, key: RadixKey):
-        node = self.root_node
-        nodes = []
-        child_key_fn = self.get_child_key_fn
-
-        while len(key) > 0:
-            ck = child_key_fn(key)
-            if ck not in node.children:
-                break
-            child = node.children[ck]
-            prefix_len = self.key_match_fn(child.key, key)
-            if prefix_len <= 0:
-                break
-            nodes.append(child)
-            if prefix_len < len(child.key):
-                break
-            key = key[prefix_len:]
-        return nodes
-
-    def _collect_untracked_nodes_from_last_node(
-        self, node: Optional[TreeNode], tracked_nodes: Set[TreeNode]
-    ) -> list[TreeNode]:
-        nodes = []
-        while node not in (None, self.root_node):
-            if node in tracked_nodes:
-                break
-            nodes.append(node)
-            node = node.parent
-        return nodes
-
-    def _inc_priority_ref_single(self, node: TreeNode, is_high: bool):
-        old_tier = _classify_node_tier(node)
-        if is_high:
-            node.high_ref += 1
-        else:
-            node.low_ref += 1
-        new_tier = _classify_node_tier(node)
-        if not node.evicted and node.lock_ref == 0 and old_tier != new_tier:
-            self._move_node_tier(node, old_tier, new_tier)
-
-    def _dec_priority_ref_single(self, node: TreeNode, is_high: bool):
-        old_tier = _classify_node_tier(node)
-        if is_high:
-            node.high_ref = max(0, node.high_ref - 1)
-        else:
-            node.low_ref = max(0, node.low_ref - 1)
-        new_tier = _classify_node_tier(node)
-        if not node.evicted and node.lock_ref == 0 and old_tier != new_tier:
-            self._move_node_tier(node, old_tier, new_tier)
-
-    def _evict_backuped(self, node: TreeNode):
-        tier = _classify_node_tier(node)
-        self._tier_leaf_set(tier).discard(node)
-        self._add_tier_size(tier, -len(node.key))
-        return super()._evict_backuped(node)
-
     def release_ref(self, rid: str) -> Tuple[bool, str]:
         self._adaptively_demoted_rids.pop(rid, None)
+        ref_info = self.rid_to_ref_info.get(rid)
+        was_high = ref_info.is_high if ref_info is not None else False
 
-        ref_info = self.rid_to_ref_info.pop(rid, None)
-        if ref_info is None:
-            return True, f"rid {rid} not tracked"
+        ok, msg = super().release_ref(rid)
 
-        was_high = ref_info.is_high
-
-        for node in ref_info.nodes:
-            self._dec_priority_ref_single(node, ref_info.is_high)
-            node.tracked_rids.discard(rid)
-
+        # A released HP rollout frees host budget: restore the earliest
+        # adaptively-demoted rid back to HP.
         if was_high and self._adaptively_demoted_rids:
-            oldest_demoted = next(iter(self._adaptively_demoted_rids))
-            self._adaptive_restore(oldest_demoted)
-
-        return True, f"released {len(ref_info.nodes)} nodes for rid {rid}"
+            self._adaptive_restore(next(iter(self._adaptively_demoted_rids)))
+        return ok, msg
 
     def update_ref(self, rid: str, new_priority: int) -> Tuple[bool, str]:
         ref_info = self.rid_to_ref_info.get(rid)
         if ref_info is None:
             return False, f"rid {rid} not found in ref tracking"
 
-        new_is_high = self.is_high_priority(new_priority)
-
         if rid in self._adaptively_demoted_rids:
-            if new_is_high:
+            ref_info.priority = new_priority
+            if self.is_high_priority(new_priority):
                 self._adaptive_restore(rid)
-                return True, f"restored adaptively-demoted rid {rid} via external update_ref"
-            else:
-                self._adaptively_demoted_rids.pop(rid, None)
-                return True, "priority class unchanged (already demoted)"
+                return (
+                    True,
+                    f"restored adaptively-demoted rid {rid} via external update_ref",
+                )
+            self._adaptively_demoted_rids.pop(rid, None)
+            return True, "priority class unchanged (already demoted)"
 
-        if new_is_high == ref_info.is_high:
-            return True, "priority class unchanged"
-
-        for node in ref_info.nodes:
-            self._dec_priority_ref_single(node, ref_info.is_high)
-            self._inc_priority_ref_single(node, new_is_high)
-        ref_info.is_high = new_is_high
-        return True, f"updated {len(ref_info.nodes)} nodes for rid {rid}"
-
-    # --- Split node override to propagate high_ref/low_ref ---
-
-    def _split_node(self, key, child, split_len):
-        new_node = super()._split_node(key, child, split_len)
-        new_node.high_ref = child.high_ref
-        new_node.low_ref = child.low_ref
-        new_node.tracked_rids = set(child.tracked_rids)
-        # Update rid_to_ref_info: add new_node to each tracking rid's node set
-        for rid in new_node.tracked_rids:
-            ref_info = self.rid_to_ref_info.get(rid)
-            if ref_info is not None:
-                ref_info.nodes.add(new_node)
-        self._update_ref_aware_leaf_status(new_node)
-        self._update_ref_aware_leaf_status(child)
-        return new_node
+        return super().update_ref(rid, new_priority)
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None, req: Optional[Req] = None
@@ -748,6 +495,10 @@ class RefAwareHiRadixCache(HiRadixCache):
             self.dec_lock_ref(ancester_node)
             return None
 
+        # Protect the nodes being loaded from host eviction.
+        for n in nodes_to_load:
+            n.protect_host()
+
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
@@ -768,6 +519,8 @@ class RefAwareHiRadixCache(HiRadixCache):
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
+            for n in nodes_to_load:
+                n.release_host()
             logger.warning(
                 "load_back: FAILED to load %d tokens for node %d "
                 "even after eviction (evictable_size=%d)",
@@ -776,6 +529,9 @@ class RefAwareHiRadixCache(HiRadixCache):
                 self.evictable_size_,
             )
             return None
+
+        for n in nodes_to_load:
+            n.release_host()
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0

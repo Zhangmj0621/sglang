@@ -87,9 +87,9 @@ from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    CloseSessionReqInput,
     CommitTransferRequestKVCacheReqInput,
     CommitTransferRequestKVCacheReqOutput,
-    CloseSessionReqInput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
@@ -751,8 +751,29 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                 )
+            elif server_args.enable_ref_aware_kv_buffer:
+                from sglang.srt.mem_cache.ref_aware_radix_cache import (
+                    RefAwareRadixCache,
+                )
+
+                self.tree_cache = RefAwareRadixCache(
+                    params=params, server_args=server_args
+                )
             else:
                 self.tree_cache = RadixCache(params)
+
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import (
+                RefAwareCacheMixin,
+            )
+
+            if not isinstance(self.tree_cache, RefAwareCacheMixin):
+                logger.warning(
+                    "enable_ref_aware_kv_buffer is set but tree_cache is %s, "
+                    "disabling ref-aware KV buffer.",
+                    type(self.tree_cache).__name__,
+                )
+                self.enable_ref_aware_kv_buffer = False
 
         # KV migration manager (per-rank). Gated by --enable-kv-migration; only
         # supported when a HiRadixCache-with-host-pool is in use (RefAware or plain).
@@ -1752,7 +1773,9 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
-        if self.enable_ref_aware_kv_buffer and hasattr(self.tree_cache, "mark_rid_generating"):
+        if self.enable_ref_aware_kv_buffer and hasattr(
+            self.tree_cache, "mark_rid_generating"
+        ):
             self.tree_cache.mark_rid_generating(req.rid)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
@@ -2052,22 +2075,21 @@ class Scheduler(
 
         return ret
 
-    def _maybe_add_chunked_req_before_loop(self, adder) -> bool:
-        if self.chunked_req is None:
-            return False
-
-        if not self.enable_ref_aware_kv_buffer:
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            return False
-
-        chunk_is_high = self.tree_cache.is_high_priority(
-            self.chunked_req.priority or 0
-        )
-        if chunk_is_high:
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            return False
-
-        return True
+    def _try_add_deferred_chunk(self, adder: PrefillAdder, req: Req):
+        self.chunked_req = adder.add_chunked_req(req)
+        if self.chunked_req is not None and (
+            not adder.can_run_list or adder.can_run_list[-1] is not req
+        ):
+            # LP chunk was not admitted due to insufficient token budget.
+            # Retract it so the slot is free for high-priority requests.
+            # Unlike the community version, retract even when can_run_list is
+            # empty: batch formation increments is_chunked on self.chunked_req
+            # unconditionally, so parking an unadmitted chunk outside the batch
+            # would leave unmatched increments (request hang + locked KV).
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.reset_for_retract()
+            self._add_request_to_queue(req)
+            self.chunked_req = None
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
@@ -2143,40 +2165,24 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
 
-        # If enable ref_aware_kv_buffer and enable_priority_scheduling, the LP chunk request may be deferred after HP requests.
-        chunk_deferred = self._maybe_add_chunked_req_before_loop(adder) if self.enable_ref_aware_kv_buffer else False
+        chunk_deferred = False
+        if self.enable_ref_aware_kv_buffer and self.chunked_req is not None:
+            chunk_is_high = self.tree_cache.is_high_priority(
+                self.chunked_req.priority or 0
+            )
+            if not chunk_is_high:
+                chunk_deferred = True
+                deferred_chunked_req = self.chunked_req
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        elif self.chunked_req is not None:
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
-        chunk_added = False
         for req in self.waiting_queue:
-            # Insert deferred LP chunk at the HP→LP boundary.
-            if chunk_deferred and not chunk_added:
-                if not self.tree_cache.is_high_priority(req.priority or 0):
-                    # Release the LP chunk req if token budget is insufficient. 
-                    # Release KV Cache and retract it to avoid memory leak.
-                    chunk_is_high = self.tree_cache.is_high_priority(
-                        self.chunked_req.priority or 0
-                    )
-                    own_budget = (
-                        int(adder._rem_total_tokens_ref_aware(chunk_is_high))
-                        - adder.page_size
-                    )
-                    if own_budget <= 0:
-                        deferred_chunked_req = self.chunked_req
-                        self.chunked_req = None
-                        release_kv_cache(
-                            deferred_chunked_req,
-                            self.tree_cache,
-                            is_insert=False,
-                        )
-                        deferred_chunked_req.reset_for_retract()
-                    else:
-                        self.chunked_req = adder.add_chunked_req(self.chunked_req)
-                    chunk_added = True
-
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2228,6 +2234,14 @@ class Scheduler(
                     req.rid
                 )
 
+            # At the HP->LP boundary, try to insert the deferred LP chunk
+            if chunk_deferred and deferred_chunked_req is not None:
+                req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+                if not req_is_high:
+                    self._try_add_deferred_chunk(adder, deferred_chunked_req)
+                    deferred_chunked_req = None
+                    chunk_deferred = False
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -2249,29 +2263,13 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
-        # LP chunk deferred but queue was all HP or empty — add now.
-        if chunk_deferred and not chunk_added:
-            chunk_is_high = self.tree_cache.is_high_priority(
-                self.chunked_req.priority or 0
-            )
-            own_budget = (
-                int(adder._rem_total_tokens_ref_aware(chunk_is_high))
-                - adder.page_size
-            )
-            if own_budget <= 0:
-                deferred_chunked_req = self.chunked_req
-                self.chunked_req = None
-                release_kv_cache(
-                    deferred_chunked_req, self.tree_cache, is_insert=False
-                )
-                deferred_chunked_req.reset_for_retract()
-            else:
-                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # If the queue was exhausted without inserting the deferred chunk, handle it
+        if chunk_deferred and deferred_chunked_req is not None:
+            self._try_add_deferred_chunk(adder, deferred_chunked_req)
+            deferred_chunked_req = None
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
-        if deferred_chunked_req is not None:
-            self._add_request_to_queue(deferred_chunked_req)
         if len(can_run_list) == 0:
             return None
 
@@ -2649,11 +2647,11 @@ class Scheduler(
 
     def handle_release_ref(self, recv_req: ReleaseRefReqInput):
         if self.enable_ref_aware_kv_buffer:
-            from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
-                RefAwareHiRadixCache,
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import (
+                RefAwareCacheMixin,
             )
 
-            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
                 success, msg = self.tree_cache.release_ref(recv_req.rid)
                 return ReleaseRefReqOutput(success=success, message=msg)
         return ReleaseRefReqOutput(
@@ -2665,9 +2663,9 @@ class Scheduler(
             return UpdateRefReqOutput(
                 success=False, message="ref-aware KV buffer not enabled"
             )
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
-        if not isinstance(self.tree_cache, RefAwareHiRadixCache):
+        if not isinstance(self.tree_cache, RefAwareCacheMixin):
             return UpdateRefReqOutput(
                 success=False, message="ref-aware KV buffer not enabled"
             )
@@ -2697,11 +2695,7 @@ class Scheduler(
         rank's send_output is a no-op (see SenderWrapper(None) in init). So
         per-rank migration outputs must be gathered to this rank before they can
         reach the tokenizer."""
-        return (
-            self.pp_rank == 0
-            and self.attn_tp_rank == 0
-            and self.attn_cp_rank == 0
-        )
+        return self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0
 
     def _kv_migration_reply(self, local_output, recv_req):
         """Collective: gather this rank's migration output with every other
@@ -2715,9 +2709,7 @@ class Scheduler(
                 self.send_to_tokenizer.send_output(out, recv_req)
         return None
 
-    def _kv_migration_get_session_info(
-        self, recv_req: GetTransferSessionInfoReqInput
-    ):
+    def _kv_migration_get_session_info(self, recv_req: GetTransferSessionInfoReqInput):
         if self.kv_migration_manager is None:
             local = GetTransferSessionInfoReqOutput(
                 success=False, message="kv migration not enabled"
@@ -2737,9 +2729,7 @@ class Scheduler(
             local = self.kv_migration_manager.get_extra_token_size_wrapped(recv_req)
         return self._kv_migration_reply(local, recv_req)
 
-    def _kv_migration_allocate(
-        self, recv_req: AllocateTokenForTransferReqInput
-    ):
+    def _kv_migration_allocate(self, recv_req: AllocateTokenForTransferReqInput):
         if self.kv_migration_manager is None:
             local = AllocateTokenForTransferReqOutput(
                 success=False, message="kv migration not enabled"
@@ -2757,9 +2747,7 @@ class Scheduler(
             local = self.kv_migration_manager.transfer(recv_req)
         return self._kv_migration_reply(local, recv_req)
 
-    def _kv_migration_commit(
-        self, recv_req: CommitTransferRequestKVCacheReqInput
-    ):
+    def _kv_migration_commit(self, recv_req: CommitTransferRequestKVCacheReqInput):
         if self.kv_migration_manager is None:
             local = CommitTransferRequestKVCacheReqOutput(
                 success=False, message="kv migration not enabled"

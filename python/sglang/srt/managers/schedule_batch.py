@@ -1506,12 +1506,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
-        if isinstance(self.tree_cache, RefAwareHiRadixCache):
+        if isinstance(self.tree_cache, RefAwareCacheMixin):
             allow_high = any(
-                self.tree_cache.is_high_priority(req.priority or 0)
-                for req in reqs
+                self.tree_cache.is_high_priority(req.priority or 0) for req in reqs
             )
             with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
                 out_cache_loc, req_pool_indices_tensor, req_pool_indices = (
@@ -1863,13 +1862,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _evict_for_decode(
         self, num_tokens: int, selected_indices: Optional[List[int]] = None
     ):
-        from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
         from sglang.srt.server_args import get_global_server_args
 
         server_args = get_global_server_args()
         if not (
             server_args.enable_ref_aware_kv_buffer
-            and isinstance(self.tree_cache, RefAwareHiRadixCache)
+            and isinstance(self.tree_cache, RefAwareCacheMixin)
         ):
             evict_from_tree_cache(self.tree_cache, num_tokens)
             return
@@ -1893,11 +1892,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         # Only evict high-reference tokens for high-priority requests.
-        scope = (
-            range(len(self.reqs)) if selected_indices is None else selected_indices
-        )
+        scope = range(len(self.reqs)) if selected_indices is None else selected_indices
         hp_indices = [
-            i for i in scope
+            i
+            for i in scope
             if self.tree_cache.is_high_priority(self.reqs[i].priority or 0)
         ]
         if not hp_indices:
@@ -1939,8 +1937,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # before any HP req. Within a priority class the original heuristic
             # stands: keep the most-decoded / shortest-input reqs and retract
             # the least-progressed ones first (cheapest work to redo).
-            from sglang.srt.mem_cache.ref_aware_hiradix_cache import RefAwareHiRadixCache
-            if isinstance(self.tree_cache, RefAwareHiRadixCache):
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
                 sorted_indices.sort(
                     key=lambda i: (
                         self.tree_cache.is_high_priority(self.reqs[i].priority or 0),
