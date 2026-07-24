@@ -150,6 +150,8 @@ def match_len(cache, token_ids) -> int:
 
 
 def register(cache, token_ids, session_id, generation=None):
+    if generation is None:
+        generation = cache.ensure_session_generation(session_id)
     cache.register_session_ref(
         SimpleNamespace(
             session_id=session_id,

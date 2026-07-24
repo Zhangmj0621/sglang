@@ -8,7 +8,7 @@ from array import array
 from collections import defaultdict
 from functools import partial
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Iterator, NamedTuple, Optional, TypeVar
 
 import torch
 
@@ -39,6 +39,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.session_unified_radix_cache import (
+    SessionUnifiedRadixCacheMixin,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -50,7 +53,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     LRURefreshPhase,
     MambaComponent,
     PrepareLoadBackResult,
-    SessionUnifiedRadixCacheMixin,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
@@ -143,6 +145,7 @@ class UnifiedLRUList:
         component_type: ComponentType,
         tree_components: tuple[ComponentType, ...],
         use_host_ptr: bool = False,
+        is_referenced: Optional[Callable[[UnifiedTreeNode], bool]] = None,
     ):
         self.component_type = component_type
         # Pointer slot: host LRU uses offset slots so device/host pointers
@@ -153,6 +156,19 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
+        # Session partition: [head .. mid) holds session-referenced nodes and
+        # (mid .. tail] unreferenced ones, so evictions directly walks (tail -> head).
+        self._is_referenced = is_referenced
+        self.mid: Optional[UnifiedTreeNode] = None
+        self.cursor: Optional[UnifiedTreeNode] = None
+        if is_referenced is not None:
+            self.mid = UnifiedTreeNode(tree_components)
+            self.cursor = UnifiedTreeNode(tree_components)
+            for ct in tree_components:
+                for node in (self.mid, self.cursor):
+                    node.component_data[ct].lock_ref = 1
+                    node.component_data[ct].host_lock_ref = 1
+            self._add_node_after(self.head, self.mid)
 
     def _add_node_after(self, prev_node: UnifiedTreeNode, new_node: UnifiedTreeNode):
         pt = self._pt
@@ -162,7 +178,10 @@ class UnifiedLRUList:
         prev_node.lru_next[pt] = new_node
 
     def _add_node(self, node: UnifiedTreeNode):
-        self._add_node_after(self.head, node)
+        if self._is_referenced is None or self._is_referenced(node):
+            self._add_node_after(self.head, node)
+        else:
+            self._add_node_after(self.mid, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
         pt = self._pt
@@ -187,19 +206,49 @@ class UnifiedLRUList:
         self._remove_node(node)
         self._add_node(node)
 
+    def cursor_begin(self):
+        assert self.cursor.lru_prev[self._pt] is None
+        self._add_node_after(self.tail.lru_prev[self._pt], self.cursor)
+
+    def cursor_next(self, *, host_lock: bool = False):
+        pt = self._pt
+        ct = self.component_type
+        x = self.cursor.lru_prev[pt]
+        while x is not self.head:
+            cd = x.component_data[ct]
+            if (cd.host_lock_ref if host_lock else cd.lock_ref) == 0:
+                break
+            x = x.lru_prev[pt]
+        if x is self.head:
+            return None
+        self._remove_node(self.cursor)
+        self._add_node_after(x.lru_prev[pt], self.cursor)
+        return x
+
+    def cursor_end(self):
+        """Unlink the walk-cursor sentinel after a walk."""
+        self._remove_node(self.cursor)
+
     def reset_node_and_parents_mru(
         self,
         node: UnifiedTreeNode,
         root_node: UnifiedTreeNode,
         should_include,
     ):
-        prev_node = self.head
+        is_referenced = self._is_referenced
+        prev_ref = self.head
+        prev_unref = self.head if self.mid is None else self.mid
         while node != root_node:
             if should_include(node):
                 assert node.id in self.cache
+                part = is_referenced is None or is_referenced(node)
                 self._remove_node(node)
-                self._add_node_after(prev_node, node)
-                prev_node = node
+                if part:
+                    self._add_node_after(prev_ref, node)
+                    prev_ref = node
+                else:
+                    self._add_node_after(prev_unref, node)
+                    prev_unref = node
             node = node.parent
 
     def reset_node_and_window_ancestors_mru(
@@ -209,14 +258,21 @@ class UnifiedLRUList:
         window_size: int,
         should_include,
     ):
-        prev_node = self.head
+        is_referenced = self._is_referenced
+        prev_ref = self.head
+        prev_unref = self.head if self.mid is None else self.mid
         accumulated = 0
         while node != root_node and accumulated < window_size:
             if should_include(node):
                 assert node.id in self.cache
+                part = is_referenced is None or is_referenced(node)
                 self._remove_node(node)
-                self._add_node_after(prev_node, node)
-                prev_node = node
+                if part:
+                    self._add_node_after(prev_ref, node)
+                    prev_ref = node
+                else:
+                    self._add_node_after(prev_unref, node)
+                    prev_unref = node
             accumulated += len(node.key)
             node = node.parent
 
@@ -456,6 +512,11 @@ class UnifiedRadixCache(
     def reset(self) -> None:
         self._reset_full()
 
+    def _session_lru_predicate(self, ct: ComponentType):
+        if not self.enable_session_radix_cache or ct is ComponentType.FULL:
+            return None
+        return lambda node: node.component_data[ct].session_ref > 0
+
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.root_node = UnifiedTreeNode(self.tree_components)
@@ -469,14 +530,22 @@ class UnifiedRadixCache(
         self.component_protected_size_ = {ct: 0 for ct in self.tree_components}
 
         self.lru_lists = {
-            ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
+            ct: UnifiedLRUList(
+                ct, self.tree_components, is_referenced=self._session_lru_predicate(ct)
+            )
+            for ct in self.tree_components
         }
         self.session.slots.clear()
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
         self.host_lru_lists = {
-            ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
+            ct: UnifiedLRUList(
+                ct,
+                self.tree_components,
+                use_host_ptr=True,
+                is_referenced=self._session_lru_predicate(ct),
+            )
             for ct in self.tree_components
         }
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
@@ -799,6 +868,14 @@ class UnifiedRadixCache(
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+
+        if self.enable_session_radix_cache and result is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if req.finished_reason is not None and not isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                self.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -3070,6 +3147,10 @@ class UnifiedRadixCache(
         while x is not None and x != lru.tail:
             if x.lru_prev[pt] != prev:
                 errors.append(f"[{label}][{ct}] broken prev at node {x.id}")
+            if lru.mid is not None and x is lru.mid:
+                prev = x
+                x = x.lru_next[pt]
+                continue
             if x.id not in lru.cache:
                 errors.append(f"[{label}][{ct}] node {x.id} in list not cache")
             if x.id in visited:
