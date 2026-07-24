@@ -8,8 +8,6 @@ import logging
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -33,14 +31,10 @@ class SessionUnifiedRadixCacheMixin:
         for component in self._components_tuple:
             component.reset_session_state()
 
-    def _ensure_session_radix_state(self) -> None:
-        if not hasattr(self, "_closed_session_ids"):
-            self._reset_session_radix_state()
-
     def session_id_for_req(self, req: Req) -> Optional[str]:
-        session_id = getattr(req, "session_id", None)
-        if session_id is None:
-            session_id = getattr(getattr(req, "session", None), "session_id", None)
+        session_id = req.session_id
+        if session_id is None and req.session is not None:
+            session_id = req.session.session_id
         return session_id
 
     def register_session_ref(self, req: Req) -> None:
@@ -48,43 +42,22 @@ class SessionUnifiedRadixCacheMixin:
         if not self.enable_session_radix_cache:
             return
 
-        session = getattr(req, "session", None)
-        if session is not None and getattr(session, "streaming", False):
+        session = req.session
+        if session is not None and session.streaming:
             return
 
-        self._ensure_session_radix_state()
         session_id = self.session_id_for_req(req)
         if session_id is None or session_id in self._closed_session_ids:
             return
 
-        if getattr(
-            req, "session_generation", None
-        ) is not None and req.session_generation != self._session_generations.get(
-            session_id
-        ):
+        current_generation = self._session_generations.get(session_id)
+        if current_generation is None or req.session_generation != current_generation:
             logger.warning("register_session_ref called for stale request; Skip it.")
             return
 
-        last_node = getattr(req, "last_node", None)
-        if last_node is None:
-            logger.warning(
-                "register_session_ref called for request without last_node; falling back to match_prefix."
-            )
-            from sglang.srt.mem_cache.radix_cache import RadixKey
-
-            token_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
-            if not token_ids:
-                return
-            radix_key = RadixKey(
-                token_ids, getattr(req, "extra_key", None)
-            ).page_aligned(self.page_size)
-            if len(radix_key) == 0:
-                return
-            last_node = self.match_prefix(
-                MatchPrefixParams(key=radix_key)
-            ).last_device_node
-
-        if last_node in (None, self.root_node):
+        last_node = req.last_node
+        assert last_node is not None
+        if last_node is self.root_node:
             return
 
         for component in self._components_tuple:
@@ -98,21 +71,24 @@ class SessionUnifiedRadixCacheMixin:
             self._closed_session_ids.popitem(last=False)
 
     def open_radix_session(self, session_id: str) -> Optional[int]:
-        self._ensure_session_radix_state()
         self._closed_session_ids.pop(session_id, None)
         self._session_incarnation_counter += 1
         self._session_generations[session_id] = self._session_incarnation_counter
         return self._session_incarnation_counter
 
+    def ensure_session_generation(self, session_id: str) -> int:
+        generation = self._session_generations.get(session_id)
+        if generation is None:
+            generation = self.open_radix_session(session_id)
+        return generation
+
     def current_session_generation(self, session_id: str) -> Optional[int]:
-        self._ensure_session_radix_state()
         return self._session_generations.get(session_id)
 
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:
             return 0
 
-        self._ensure_session_radix_state()
         if session_id in self._closed_session_ids:
             return 0
 

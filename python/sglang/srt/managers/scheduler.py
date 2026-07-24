@@ -957,14 +957,16 @@ class Scheduler(
             )
 
     def init_session_radix_cache_guard(self) -> None:
-        if not self.server_args.enable_session_radix_cache:
+        self.enable_session_radix_cache = self.server_args.enable_session_radix_cache
+        if not self.enable_session_radix_cache:
             return
 
         if not getattr(self.tree_cache, "enable_session_radix_cache", False):
-            logger.warning(
-                "enable_session_radix_cache requires UnifiedRadixCache, but "
-                "tree_cache is %s; session radix cache remains disabled.",
-                type(self.tree_cache).__name__,
+            raise ValueError(
+                "--enable-session-radix-cache requires UnifiedRadixCache, but "
+                f"tree_cache is {type(self.tree_cache).__name__}. Set "
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (or remove "
+                "--enable-session-radix-cache)."
             )
 
     def init_hisparse_coordinator(self) -> None:
@@ -2108,8 +2110,8 @@ class Scheduler(
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
         # Radix-native sessions use only the top-level session_id.
-        radix_native_session = recv_req.session_id is not None and getattr(
-            self.tree_cache, "enable_session_radix_cache", False
+        radix_native_session = (
+            recv_req.session_id is not None and self.enable_session_radix_cache
         )
 
         if session_id is None or radix_native_session:
@@ -2168,7 +2170,7 @@ class Scheduler(
             req.tokenizer = self.tokenizer
 
             if radix_native_session:
-                req.session_generation = self.tree_cache.current_session_generation(
+                req.session_generation = self.tree_cache.ensure_session_generation(
                     recv_req.session_id
                 )
 
@@ -2202,7 +2204,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
-            if getattr(self.tree_cache, "enable_session_radix_cache", False):
+            if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.current_session_generation(
                     session_id
                 )
@@ -4458,19 +4460,18 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)
-        if output.success and getattr(
-            self.tree_cache, "enable_session_radix_cache", False
-        ):
+        if output.success and self.enable_session_radix_cache:
             self.tree_cache.open_radix_session(recv_req.session_id)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if getattr(self.tree_cache, "enable_session_radix_cache", False):
+        if self.enable_session_radix_cache:
             self.tree_cache.release_radix_session(recv_req.session_id)
-        if recv_req.session_id in self.session_controller or not (
-            getattr(self.tree_cache, "enable_session_radix_cache", False)
+        if (
+            recv_req.session_id in self.session_controller
+            or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
 

@@ -128,8 +128,14 @@ class TreeComponent(ABC):
     def session_ref(self, node: UnifiedTreeNode) -> int:
         return node.component_data[self.component_type].session_ref
 
-    def is_session_referenced(self, node: UnifiedTreeNode) -> bool:
-        return self.session_ref(node) > 0
+    def _refresh_session_partition(self, node: UnifiedTreeNode) -> None:
+        ct = self.component_type
+        lru = self.cache.lru_lists[ct]
+        if lru.in_list(node):
+            lru.reset_node_mru(node)
+        host_lru = self.cache.host_lru_lists[ct]
+        if host_lru.in_list(node):
+            host_lru.reset_node_mru(node)
 
     def _find_reusable_session_leaf(
         self, node: Optional[UnifiedTreeNode]
@@ -186,6 +192,14 @@ class TreeComponent(ABC):
     def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         raise NotImplementedError
 
+    def _advance_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        old_ancestor: Optional[UnifiedTreeNode],
+    ) -> None:
+        raise NotImplementedError
+
     def register_session_leaf(
         self, session_id: str, leaf: Optional[UnifiedTreeNode]
     ) -> None:
@@ -201,10 +215,9 @@ class TreeComponent(ABC):
             return
 
         old_ancestor = self._nearest_session_ancestor(leaf, current_leaves)
-        self._inc_session_coverage(session_id, leaf)
+        self._advance_session_coverage(session_id, leaf, old_ancestor)
         self._mark_session_leaf(session_id, leaf)
         if old_ancestor is not None:
-            self._dec_session_coverage(session_id, old_ancestor)
             self._unmark_session_leaf(session_id, old_ancestor)
 
     def release_session(self, session_id: str) -> int:

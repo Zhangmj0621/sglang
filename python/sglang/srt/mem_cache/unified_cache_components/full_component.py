@@ -46,6 +46,10 @@ class FullComponent(TreeComponent):
             self._free_full = allocator.free
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
+        if cache.enable_session_radix_cache:
+            self.session_ref_eviction_strategy = self._session_ref_eviction_strategy
+        else:
+            self.session_ref_eviction_strategy = cache.eviction_strategy.get_priority
 
     def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         node = leaf
@@ -59,6 +63,20 @@ class FullComponent(TreeComponent):
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
             cd.session_ref -= 1
+            node = node.parent
+
+    def _advance_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        old_ancestor: Optional[UnifiedTreeNode],
+    ) -> None:
+        stop = old_ancestor if old_ancestor is not None else self.cache.root_node
+        node = leaf
+        while (
+            node is not None and node is not stop and node is not self.cache.root_node
+        ):
+            node.component_data[self.component_type].session_ref += 1
             node = node.parent
 
     def create_match_validator(
@@ -145,12 +163,9 @@ class FullComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
 
-    def session_ref_eviction_strategy(self, node: UnifiedTreeNode):
-        base_priority = self.cache.eviction_strategy.get_priority(node)
-        if not self.cache.enable_session_radix_cache:
-            return base_priority
+    def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
         ref = self.session_ref(node)
-        return ref > 0, ref, base_priority
+        return ref > 0, ref, self.cache.eviction_strategy.get_priority(node)
 
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
