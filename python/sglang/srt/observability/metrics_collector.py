@@ -1435,12 +1435,15 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+        self._cache_token_totals: Dict[tuple, Dict[str, int]] = {}
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -1526,6 +1529,20 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of cached prompt tokens by source (device/host/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
         )
+        self.cache_device_hit_ratio = Gauge(
+            name="sglang:cache_device_hit_ratio",
+            documentation="Cumulative device cache hit tokens divided by prompt tokens.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.cache_host_hit_ratio = Gauge(
+            name="sglang:cache_host_hit_ratio",
+            documentation="Cumulative host cache hit tokens divided by prompt tokens.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.cache_device_hit_ratio.labels(**self.labels).set(0)
+        self.cache_host_hit_ratio.labels(**self.labels).set(0)
 
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
@@ -1688,6 +1705,21 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 # Fallback for backward compatibility
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+
+        label_key = tuple(sorted(labels.items()))
+        cache_totals = self._cache_token_totals.setdefault(label_key, Counter())
+        cache_totals["prompt"] += prompt_tokens
+        if cached_tokens_details:
+            cache_totals["device"] += cached_tokens_details.get("device", 0)
+            cache_totals["host"] += cached_tokens_details.get("host", 0)
+        else:
+            cache_totals["device"] += cached_tokens
+
+        prompt_total = cache_totals["prompt"]
+        device_hit_ratio = cache_totals["device"] / prompt_total if prompt_total else 0
+        host_hit_ratio = cache_totals["host"] / prompt_total if prompt_total else 0
+        self.cache_device_hit_ratio.labels(**labels).set(device_hit_ratio)
+        self.cache_host_hit_ratio.labels(**labels).set(host_hit_ratio)
 
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
