@@ -1365,6 +1365,7 @@ class UnifiedRadixCache(
             is_leaf = node in self.evictable_host_leaves
 
         trigger_priority = trigger.eviction_priority(is_leaf)
+        base_evicted = False
 
         for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
@@ -1382,6 +1383,8 @@ class UnifiedRadixCache(
                             continue
                         if EvictLayer.HOST in target and cd.host_lock_ref != 0:
                             continue
+                        if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+                            continue
                     if EvictLayer.DEVICE in target:
                         assert cd.lock_ref == 0
                     if EvictLayer.HOST in target:
@@ -1389,6 +1392,8 @@ class UnifiedRadixCache(
                     self._evict_component_and_detach_lru(
                         node, comp, target=target, tracker=tracker
                     )
+                    if comp.component_type == BASE_COMPONENT_TYPE:
+                        base_evicted = True
 
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
@@ -1398,6 +1403,9 @@ class UnifiedRadixCache(
             and trigger.component_type == BASE_COMPONENT_TYPE
         ):
             node.component_data[trigger.component_type].value = None
+
+        if target is EvictLayer.DEVICE and base_evicted:
+            node.component_data[BASE_COMPONENT_TYPE].value = None
 
         self._update_evictable_leaf_sets(node)
 

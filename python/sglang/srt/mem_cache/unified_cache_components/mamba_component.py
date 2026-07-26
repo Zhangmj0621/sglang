@@ -307,13 +307,15 @@ class MambaComponent(TreeComponent):
             assert x.component_data[ct].value is not None
             if not enabled:
                 x_next = lru.get_prev_no_lock(x)
-            if x in self.cache.evictable_device_leaves:
+            if x in self.cache.evictable_device_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
                 # D-leaf: atomic eviction of all components
                 self.cache._evict_device_leaf(x, tracker)
                 if not enabled and not lru.in_list(x_next):
                     x_next = lru.get_lru_no_lock()
             else:
-                # Internal: tombstone Mamba + cascade
+                # Internal (or a leaf a session still pins): tombstone Mamba + cascade
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
@@ -745,11 +747,13 @@ class MambaComponent(TreeComponent):
             if not enabled:
                 x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
-            if x in self.cache.evictable_host_leaves:
+            if x in self.cache.evictable_host_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
                 # Host leaf: atomic eviction (all components host + delete)
                 self.cache._evict_host_leaf(x, tracker)
             else:
-                # Internal: tombstone Mamba + cascade
+                # Internal (or a leaf a session still pins): tombstone Mamba + cascade
                 assert cd.host_value is not None
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.HOST, tracker=tracker
