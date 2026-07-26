@@ -46,6 +46,29 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
+def _count_high_low_priority_reqs(
+    reqs: List["Req"],
+    enable_priority_scheduling: bool,
+    high_priority_threshold: int,
+) -> Tuple[int, int, int]:
+    if not enable_priority_scheduling:
+        return 0, 0, 0
+
+    high_priority_count = 0
+    low_priority_count = 0
+    unknown_priority_count = 0
+
+    for req in reqs:
+        if req.priority is None:
+            unknown_priority_count += 1
+        elif req.priority >= high_priority_threshold:
+            high_priority_count += 1
+        else:
+            low_priority_count += 1
+
+    return high_priority_count, low_priority_count, unknown_priority_count
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -55,6 +78,9 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    num_new_high_priority_reqs: int = 0
+    num_new_low_priority_reqs: int = 0
+    num_new_unknown_priority_reqs: int = 0
 
     @classmethod
     def from_adder(
@@ -62,7 +88,13 @@ class PrefillStats:
         adder: PrefillAdder,
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
+        high_priority_threshold: int = 1,
     ):
+        num_high, num_low, num_unknown = _count_high_low_priority_reqs(
+            adder.can_run_list,
+            enable_priority_scheduling,
+            high_priority_threshold,
+        )
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
@@ -71,6 +103,9 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
+            num_new_high_priority_reqs=num_high,
+            num_new_low_priority_reqs=num_low,
+            num_new_unknown_priority_reqs=num_unknown,
         )
 
 
@@ -395,6 +430,17 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
+        if self.enable_priority_scheduling:
+            msg += (
+                f"#prefill-high-req: {prefill_stats.num_new_high_priority_reqs}, "
+                f"#prefill-low-req: {prefill_stats.num_new_low_priority_reqs}, "
+            )
+            if prefill_stats.num_new_unknown_priority_reqs > 0:
+                msg += (
+                    f"#prefill-unknown-priority-req: "
+                    f"{prefill_stats.num_new_unknown_priority_reqs}, "
+                )
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
@@ -656,6 +702,26 @@ class SchedulerMetricsMixin:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+
+        if self.enable_priority_scheduling:
+            (
+                num_decode_high_priority_reqs,
+                num_decode_low_priority_reqs,
+                num_decode_unknown_priority_reqs,
+            ) = _count_high_low_priority_reqs(
+                batch.reqs,
+                self.enable_priority_scheduling,
+                self.high_priority_threshold,
+            )
+            msg += (
+                f", #decode-high-req: {num_decode_high_priority_reqs}, "
+                f"#decode-low-req: {num_decode_low_priority_reqs}"
+            )
+            if num_decode_unknown_priority_reqs > 0:
+                msg += (
+                    f", #decode-unknown-priority-req: "
+                    f"{num_decode_unknown_priority_reqs}"
+                )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency

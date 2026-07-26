@@ -64,6 +64,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -74,6 +76,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -205,6 +209,12 @@ class TokenizerCommunicatorMixin:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.release_ref_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_ref_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -309,6 +319,14 @@ class TokenizerCommunicatorMixin:
                     self.flush_cache_communicator.handle_recv,
                 ),
                 (
+                    ReleaseRefReqOutput,
+                    self.release_ref_communicator.handle_recv,
+                ),
+                (
+                    UpdateRefReqOutput,
+                    self.update_ref_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -350,6 +368,16 @@ class TokenizerCommunicatorMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def release_ref(self: TokenizerManager, obj: ReleaseRefReqInput):
+        self.auto_create_handle_loop()
+        results = await self.release_ref_communicator(obj)
+        return _Communicator.merge_results(results)
+
+    async def update_ref(self: TokenizerManager, obj: UpdateRefReqInput):
+        self.auto_create_handle_loop()
+        results = await self.update_ref_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

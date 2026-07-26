@@ -715,6 +715,8 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        self.cache_hit_hbm_tokens = 0
+        self.cache_hit_host_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -972,6 +974,8 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
+        self.cache_hit_hbm_tokens = 0
+        self.cache_hit_host_tokens = 0
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -996,6 +1000,8 @@ class Req(ReqDllmMixin):
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.cache_hit_hbm_tokens = len(match_result.device_indices)
+            self.cache_hit_host_tokens = match_result.host_hit_length
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1612,9 +1618,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
-        )
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        if isinstance(self.tree_cache, RefAwareCacheMixin):
+            allow_high = any(
+                self.tree_cache.is_high_priority(req.priority or 0) for req in reqs
+            )
+            with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
+                out_cache_loc, req_pool_indices_tensor, req_pool_indices = (
+                    alloc_for_extend(self)
+                )
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+                self
+            )
 
         # Set fields
         input_embeds = []
@@ -1663,11 +1680,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     #
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
+                    # Both counters are set by init_next_round_input() from the
+                    # match result, and reset to 0 there on every round.
+                    host_total = req.cache_hit_host_tokens
                     # Clamp storage to host_total to handle edge cases
                     storage_portion = min(host_total, req.storage_hit_length)
                     host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
+                    device_portion = req.cache_hit_hbm_tokens
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
@@ -1936,8 +1955,59 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        self._evict_for_decode(num_tokens, selected_indices)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _evict_for_decode(
+        self, num_tokens: int, selected_indices: Optional[List[int]] = None
+    ):
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if not (
+            server_args.enable_ref_aware_kv_buffer
+            and isinstance(self.tree_cache, RefAwareCacheMixin)
+        ):
+            evict_from_tree_cache(self.tree_cache, num_tokens)
+            return
+
+        if self.tree_cache.is_chunk_cache():
+            return
+
+        allocator = self.tree_cache.token_to_kv_pool_allocator
+        if allocator.available_size() >= num_tokens:
+            return
+
+        # Evict from low-reference tokens first, num_tokens align with evict_from_tree_cache().
+        self.tree_cache._evict_tiered(
+            num_tokens,
+            allow_low=True,
+            allow_high=False,
+        )
+
+        shortfall = num_tokens - allocator.available_size()
+        if shortfall <= 0:
+            return
+
+        # Only evict high-reference tokens for high-priority requests.
+        scope = range(len(self.reqs)) if selected_indices is None else selected_indices
+        hp_indices = [
+            i
+            for i in scope
+            if self.tree_cache.is_high_priority(self.reqs[i].priority or 0)
+        ]
+        if not hp_indices:
+            return
+
+        hp_tokens = self.new_tokens_required_next_decode(hp_indices)
+        high_target = min(shortfall, hp_tokens)
+        if high_target > 0:
+            self.tree_cache._evict_tiered(
+                high_target,
+                allow_low=False,
+                allow_high=True,
+            )
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -1959,13 +2029,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
-            sorted_indices.sort(
-                key=lambda i: (
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+            # Retract low-priority requests first. The loop pops victims from
+            # the tail of sorted_indices, and reverse=True keeps the highest
+            # key at the front, so ranking high-priority (is_high=True) above
+            # low-priority (False) makes every LP req a retract candidate
+            # before any HP req. Within a priority class the original heuristic
+            # stands: keep the most-decoded / shortest-input reqs and retract
+            # the least-progressed ones first (cheapest work to redo).
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
+                sorted_indices.sort(
+                    key=lambda i: (
+                        self.tree_cache.is_high_priority(self.reqs[i].priority or 0),
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
+            else:
+                threshold = getattr(server_args, "high_priority_threshold", 1)
+                sorted_indices.sort(
+                    key=lambda i: (
+                        (self.reqs[i].priority or 0) >= threshold,
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
 
         retracted_reqs = []
         first_iter = True

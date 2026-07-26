@@ -68,6 +68,10 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
+    # Deepest node on the inserted path. Only populated by HiRadixCache;
+    # RefAwareCacheMixin uses it to keep `req.last_node` current for ref
+    # registration. None means "not reported by this cache".
+    last_node: Optional[Any] = None
 
 
 @dataclasses.dataclass

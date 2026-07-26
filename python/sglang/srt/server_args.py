@@ -565,6 +565,10 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # Ref-aware KV cache eviction (requires hierarchical cache)
+    enable_ref_aware_kv_buffer: bool = False
+    high_priority_threshold: int = 1
+
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
@@ -5182,6 +5186,18 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
+        parser.add_argument(
+            "--enable-ref-aware-kv-buffer",
+            action="store_true",
+            default=ServerArgs.enable_ref_aware_kv_buffer,
+            help="Enable ref-aware KV cache eviction with two-tier priority (high_ref/low_ref).",
+        )
+        parser.add_argument(
+            "--high-priority-threshold",
+            type=int,
+            default=ServerArgs.high_priority_threshold,
+            help="Requests with priority >= this threshold are classified as high-priority for ref-aware eviction. Default: 1.",
+        )
 
         # Hierarchical sparse attention
         parser.add_argument(
@@ -6142,6 +6158,27 @@ class ServerArgs:
         self.validate_buckets_rule(
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
+
+        if (
+            self.enable_ref_aware_kv_buffer
+            and self.enable_priority_scheduling
+            and self.schedule_low_priority_values_first
+        ):
+            raise ValueError(
+                "--enable-ref-aware-kv-buffer with --enable-priority-scheduling assumes "
+                "larger priority value == higher priority "
+                "(high tier is `priority >= high_priority_threshold`), so it is "
+                "incompatible with --schedule-low-priority-values-first. Please disable "
+                "--schedule-low-priority-values-first."
+            )
+
+        if self.enable_ref_aware_kv_buffer and not self.enable_priority_scheduling:
+            logger.warning(
+                "--enable-ref-aware-kv-buffer is set without --enable-priority-scheduling. "
+                "Request priorities are not populated in that mode, so every request is "
+                "treated as high-priority and the high_ref/low_ref tiering is a no-op. "
+                "Enable --enable-priority-scheduling to make the tiering effective."
+            )
 
         # Check scheduling policy
         if self.enable_priority_scheduling:

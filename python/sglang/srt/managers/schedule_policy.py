@@ -389,6 +389,8 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        enable_ref_aware_kv_buffer: bool = False,
+        high_priority_threshold: int = 1,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -437,6 +439,8 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.enable_ref_aware_kv_buffer = enable_ref_aware_kv_buffer
+        self.high_priority_threshold = high_priority_threshold
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -473,6 +477,18 @@ class PrefillAdder:
                 + self.tree_cache.evictable_size()
             )
         return available_and_evictable - self.rem_total_token_offset
+
+    def _rem_total_tokens_ref_aware(self, is_high: bool):
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        cache = self.tree_cache
+        assert isinstance(cache, RefAwareCacheMixin)
+        available = self.token_to_kv_pool_allocator.available_size()
+        evictable = cache.safe_evictable_size_by_tier(
+            allow_low=True,
+            allow_high=is_high,
+        )
+        return available + evictable - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
@@ -514,6 +530,22 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
+
+    def _can_admit_ref_aware_req(
+        self, req: Req, req_is_high: bool, total_tokens: int
+    ) -> bool:
+        ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
+        if total_tokens < ref_aware_budget:
+            return True
+
+        if not req_is_high:
+            return False
+
+        from sglang.srt.server_args import get_global_server_args
+
+        return self._kick_low_priority_for_high(
+            req, total_tokens, get_global_server_args()
+        )
 
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
@@ -599,6 +631,18 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
+        elif self.enable_ref_aware_kv_buffer:
+            # TODO (zhangmj): need to support is_hybrid_swa.
+            req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+            budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
+            _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
+            if _rem_tokens <= 0 and req_is_high:
+                # HP chunks can evict all tiers (scoped_evict allow_high=True),
+                # same as the non-ref-aware path. Fall back to rem_chunk_tokens
+                # and let eviction handle it, matching the original behavior.
+                _rem_tokens = self.rem_chunk_tokens
+            elif _rem_tokens <= 0 and not req_is_high:
+                return req
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
@@ -761,6 +805,11 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        if self.enable_ref_aware_kv_buffer:
+            req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+            if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
+                return AddReqResult.NO_TOKEN
+
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
@@ -769,6 +818,10 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
+            if self.enable_ref_aware_kv_buffer:
+                if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
+                    return AddReqResult.NO_TOKEN
+
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
@@ -912,4 +965,59 @@ class PrefillAdder:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
+        return True
+
+    def _kick_low_priority_for_high(
+        self, req: Req, total_tokens_needed: int, server_args: ServerArgs
+    ) -> bool:
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        cache = self.tree_cache
+        if not isinstance(cache, RefAwareCacheMixin):
+            return False
+
+        low_priority_reqs = []
+        for r in self.running_batch.reqs:
+            if r in self.preempt_list or r.finished():
+                continue
+            # Classify through the cache, like every other ref-aware site: with
+            # priority scheduling disabled, is_high_priority() is unconditionally
+            # True and req.priority stays None, so a raw `(priority or 0) <
+            # threshold` test would mark the entire running batch preemptible.
+            if not cache.is_high_priority(r.priority or 0):
+                total_tokens = len(r.origin_input_ids) + len(r.output_ids)
+                low_priority_reqs.append((total_tokens, r))
+
+        low_priority_reqs.sort(key=lambda x: x[0], reverse=True)
+
+        kicked_reqs = []
+        for _total_tokens, running_req in low_priority_reqs:
+            kicked_reqs.append(running_req)
+            self.rem_total_token_offset -= self._get_running_request_total_token_offset(
+                running_req
+            )
+            ref_aware_budget = self._rem_total_tokens_ref_aware(is_high=True)
+            if total_tokens_needed < ref_aware_budget:
+                break
+
+        if total_tokens_needed >= self._rem_total_tokens_ref_aware(is_high=True):
+            for running_req in kicked_reqs:
+                self.rem_total_token_offset += (
+                    self._get_running_request_total_token_offset(running_req)
+                )
+            return False
+
+        kicked_set = set(kicked_reqs)
+        keep_indices = []
+        release_counter = 0
+        for i, running_req in enumerate(self.running_batch.reqs):
+            if running_req in kicked_set:
+                release_counter += 1
+                self.running_batch.release_req(
+                    i, len(self.running_batch.reqs) - release_counter, server_args
+                )
+            else:
+                keep_indices.append(i)
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.preempt_list.extend(kicked_reqs)
         return True

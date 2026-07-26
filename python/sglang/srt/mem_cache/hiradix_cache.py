@@ -772,7 +772,9 @@ class HiRadixCache(RadixCache):
             return
 
         for child in node.children.values():
-            if child.evicted:
+            # A node can only release its host copy when no descendant still
+            # holds one -- otherwise the host prefix chain breaks.
+            if child.backuped:
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                 return
@@ -826,9 +828,10 @@ class HiRadixCache(RadixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
-        num_evicted = self.cache_controller.evict_device(node.value)
+    def _detach_backuped(self, node: TreeNode) -> int:
+        # detach the device copy from the tree while keeping the host backup;
+        # the caller is responsible for freeing the device indices
+        num_evicted = len(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
@@ -836,6 +839,13 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        return num_evicted
+
+    def _evict_backuped(self, node: TreeNode):
+        # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
+        device_indices = node.value
+        num_evicted = self._detach_backuped(node)
+        self.cache_controller.evict_device(device_indices)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1334,7 +1344,7 @@ class HiRadixCache(RadixCache):
         key, value = self.maybe_bigram_convert(key, value)
 
         if len(key) == 0:
-            return InsertResult(prefix_len=0)
+            return InsertResult(prefix_len=0, last_node=self.root_node)
 
         if self.is_eagle and value is not None:
             # Make sure the value len equal to the EAGLE bigram key len
@@ -1356,6 +1366,7 @@ class HiRadixCache(RadixCache):
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
+                    self._account_new_evictable_node(node)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
@@ -1371,6 +1382,7 @@ class HiRadixCache(RadixCache):
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
+                    self._account_new_evictable_node(new_node)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
@@ -1386,6 +1398,7 @@ class HiRadixCache(RadixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
+        last_node = node
         if len(key):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
@@ -1393,6 +1406,7 @@ class HiRadixCache(RadixCache):
             new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
+            self._account_new_evictable_node(new_node)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
 
@@ -1405,7 +1419,8 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
-        return InsertResult(prefix_len=total_prefix_length)
+            last_node = new_node
+        return InsertResult(prefix_len=total_prefix_length, last_node=last_node)
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request

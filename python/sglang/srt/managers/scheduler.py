@@ -122,6 +122,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseRefReqInput,
+    ReleaseRefReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -135,6 +137,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRefReqInput,
+    UpdateRefReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -339,6 +343,8 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_ref_aware_kv_buffer = server_args.enable_ref_aware_kv_buffer
+        self.high_priority_threshold = server_args.high_priority_threshold
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
@@ -782,6 +788,14 @@ class Scheduler(
                     self.tree_cache = HiMambaRadixCache(
                         params=params, server_args=server_args
                     )
+                elif server_args.enable_ref_aware_kv_buffer:
+                    from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
+                        RefAwareHiRadixCache,
+                    )
+
+                    self.tree_cache = RefAwareHiRadixCache(
+                        params=params, server_args=server_args
+                    )
                 else:
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
@@ -811,11 +825,32 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                 )
+            elif server_args.enable_ref_aware_kv_buffer:
+                from sglang.srt.mem_cache.ref_aware_radix_cache import (
+                    RefAwareRadixCache,
+                )
+
+                self.tree_cache = RefAwareRadixCache(
+                    params=params, server_args=server_args
+                )
             else:
                 self.tree_cache = RadixCache(params)
 
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
+
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+            # Must run after any decorator-style wrapping (e.g. SessionAwareCache),
+            # which hides the mixin from isinstance checks.
+            if not isinstance(self.tree_cache, RefAwareCacheMixin):
+                logger.warning(
+                    "enable_ref_aware_kv_buffer is set but tree_cache is %s, "
+                    "disabling ref-aware KV buffer.",
+                    type(self.tree_cache).__name__,
+                )
+                self.enable_ref_aware_kv_buffer = False
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
@@ -1251,6 +1286,8 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (ReleaseRefReqInput, self.handle_release_ref),
+                (UpdateRefReqInput, self.handle_update_ref),
             ]
         )
 
@@ -1931,6 +1968,10 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if self.enable_ref_aware_kv_buffer and hasattr(
+            self.tree_cache, "mark_rid_generating"
+        ):
+            self.tree_cache.mark_rid_generating(req.rid)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -2284,6 +2325,44 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _try_add_deferred_chunk(self, adder: PrefillAdder, req: Req):
+        # A batch can carry at most one chunked request. Deferring the LP chunk
+        # leaves adder.rem_chunk_tokens intact, so a waiting request may already
+        # have opened a chunk of its own by the time we get here. In that case the
+        # deferred chunk must not be admitted as a second one -- that would trip
+        # `assert self.chunked_req is None` below. Skip the admission attempt and
+        # fall through to the retract path.
+        if adder.new_chunked_req is None:
+            self.chunked_req = adder.add_chunked_req(req)
+        else:
+            self.chunked_req = req
+
+        if self.chunked_req is not None and (
+            not adder.can_run_list or adder.can_run_list[-1] is not req
+        ):
+            # LP chunk was not admitted due to insufficient token budget.
+            # Retract it so the slot is free for high-priority requests.
+            # Unlike the community version, retract even when can_run_list is
+            # empty: batch formation increments is_chunked on self.chunked_req
+            # unconditionally, so parking an unadmitted chunk outside the batch
+            # would leave unmatched increments (request hang + locked KV).
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.reset_for_retract()
+            # NOTE: this appends onto self.waiting_queue, which the caller may
+            # still be iterating. Benign: reset_for_retract() has cleared the
+            # per-round state and init_next_round_input() runs again before the
+            # request can be reconsidered in this same pass.
+            self._add_request_to_queue(req)
+            self.chunked_req = None
+        elif self.chunked_req is not None:
+            # The deferred chunk was admitted and is still unfinished, so it now
+            # owns this batch's single chunk slot. Drain the chunk budget so no
+            # later add_one_req can open a second chunk (which would trip the
+            # same assert). This cannot stall the LP chunk: it already advanced
+            # by extend_input_len this round and is re-offered at the top of the
+            # next round.
+            adder.rem_chunk_tokens = 0
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2387,10 +2466,25 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            enable_ref_aware_kv_buffer=self.enable_ref_aware_kv_buffer,
+            high_priority_threshold=self.high_priority_threshold,
         )
 
+        deferred_chunked_req = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+
+        chunk_deferred = False
+        if self.enable_ref_aware_kv_buffer and self.chunked_req is not None:
+            chunk_is_high = self.tree_cache.is_high_priority(
+                self.chunked_req.priority or 0
+            )
+            if not chunk_is_high:
+                chunk_deferred = True
+                deferred_chunked_req = self.chunked_req
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        elif self.chunked_req is not None:
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2415,7 +2509,17 @@ class Scheduler(
                         continue
 
             running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_allocatable = self.get_num_allocatable_reqs(running_bs)
+            if self.enable_ref_aware_kv_buffer:
+                req_slot_capacity = self.req_to_token_pool.available_size()
+                if (
+                    self.chunked_req is not None
+                    and self.chunked_req.req_pool_idx is not None
+                ):
+                    # A chunked request already owns a req slot and can reuse it in this batch.
+                    req_slot_capacity += 1
+                num_allocatable = min(num_allocatable, req_slot_capacity)
+            if len(adder.can_run_list) >= num_allocatable:
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -2439,6 +2543,14 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
+
+            # At the HP->LP boundary, try to insert the deferred LP chunk
+            if chunk_deferred and deferred_chunked_req is not None:
+                req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+                if not req_is_high:
+                    self._try_add_deferred_chunk(adder, deferred_chunked_req)
+                    deferred_chunked_req = None
+                    chunk_deferred = False
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -2468,16 +2580,26 @@ class Scheduler(
                     req.mamba_pool_idx = None
                 break
 
+        # If the queue was exhausted without inserting the deferred chunk, handle it
+        if chunk_deferred and deferred_chunked_req is not None:
+            self._try_add_deferred_chunk(adder, deferred_chunked_req)
+            deferred_chunked_req = None
+            chunk_deferred = False
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
-        if len(can_run_list) == 0:
-            return None
-
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        # Re-queue preempted requests before the `can_run_list` early return
+        # below. Their KV cache is already released and they were removed from
+        # running_batch, so returning without re-queueing them loses the
+        # requests entirely (client hangs until timeout).
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+
+        if len(can_run_list) == 0:
+            return None
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
@@ -2516,7 +2638,10 @@ class Scheduler(
 
         # Record prefill stats for logging after forward
         new_batch.prefill_stats = PrefillStats.from_adder(
-            adder, self.running_batch.reqs, self.enable_priority_scheduling
+            adder,
+            self.running_batch.reqs,
+            self.enable_priority_scheduling,
+            self.high_priority_threshold,
         )
 
         # Mixed-style chunked prefill
@@ -2883,6 +3008,47 @@ class Scheduler(
 
         self._pending_flush = (recv_req, time.monotonic() + timeout_s)
         return None
+
+    def handle_release_ref(self, recv_req: ReleaseRefReqInput):
+        if self.enable_ref_aware_kv_buffer:
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
+                success, msg = self.tree_cache.release_ref(recv_req.rid)
+                return ReleaseRefReqOutput(success=success, message=msg)
+        return ReleaseRefReqOutput(
+            success=False, message="ref-aware KV buffer not enabled"
+        )
+
+    def handle_update_ref(self, recv_req: UpdateRefReqInput):
+        if not self.enable_ref_aware_kv_buffer:
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
+        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+
+        if not isinstance(self.tree_cache, RefAwareCacheMixin):
+            return UpdateRefReqOutput(
+                success=False, message="ref-aware KV buffer not enabled"
+            )
+
+        # Propagate priority into every in-flight Req with this rid BEFORE
+        # touching tier accounting, so concurrent prefill iterations always
+        # see a (req.priority, tier) pair that is internally consistent.
+        rid = recv_req.rid
+        new_priority = recv_req.new_priority
+        for req in getattr(self.running_batch, "reqs", []) or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        for req in self.waiting_queue or []:
+            if getattr(req, "rid", None) == rid:
+                req.priority = new_priority
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None and getattr(chunked, "rid", None) == rid:
+            chunked.priority = new_priority
+
+        success, msg = self.tree_cache.update_ref(rid, new_priority)
+        return UpdateRefReqOutput(success=success, message=msg)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

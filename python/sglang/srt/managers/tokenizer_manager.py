@@ -1579,14 +1579,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
-                # Add detailed cache breakdown if available
-                if (
-                    hasattr(recv_obj, "cached_tokens_details")
-                    and recv_obj.cached_tokens_details
+                # Add detailed cache breakdown if available. Forward it
+                # unconditionally: the OpenAI endpoints gate on their own
+                # `return_cached_tokens_details` flag and read this meta_info key.
+                details = (
+                    recv_obj.cached_tokens_details[i]
+                    if (
+                        hasattr(recv_obj, "cached_tokens_details")
+                        and recv_obj.cached_tokens_details
+                        and i < len(recv_obj.cached_tokens_details)
+                    )
+                    else None
+                )
+                if details is not None:
+                    meta_info["cached_tokens_details"] = details
+                if not isinstance(details, dict) and getattr(
+                    state.obj, "return_cache_hit_metrics", False
                 ):
-                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
-                        i
-                    ]
+                    raise RuntimeError(
+                        "Cache hit metrics were requested, but the scheduler "
+                        "did not return cached_tokens_details."
+                    )
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]

@@ -227,7 +227,10 @@ class SchedulerDllmMixin:
         from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
 
         new_batch.prefill_stats = PrefillStats.from_adder(
-            self.adder, self.running_batch.reqs, self.enable_priority_scheduling
+            self.adder,
+            self.running_batch.reqs,
+            self.enable_priority_scheduling,
+            self.high_priority_threshold,
         )
 
         return new_batch

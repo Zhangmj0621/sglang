@@ -142,6 +142,11 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # ref-aware tiered eviction counters (see RefAwareCacheMixin)
+        self.high_ref = 0
+        self.low_ref = 0
+        self.tracked_rids: set = set()
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -816,6 +821,14 @@ class RadixCache(BasePrefixCache):
 
         if node not in self.evictable_leaves:
             self.evictable_leaves.add(node)
+
+    def _account_new_evictable_node(self, node: TreeNode):
+        """Hook: a node just gained a device value and became evictable.
+
+        No-op here; RefAwareCacheMixin overrides it to keep its per-tier
+        size counters in sync.
+        """
+        pass
 
     def _total_size_helper(self):
         total_size = 0

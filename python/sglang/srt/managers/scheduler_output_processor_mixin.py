@@ -41,6 +41,20 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _maybe_register_ref(self, req):
+        """Track a finished request's cached prefix for ref-aware eviction.
+
+        Called only after `release_kv_cache` has inserted the request's prefix
+        into the tree (so `req.last_node` / the tree path are up to date).
+        """
+        if getattr(self, "enable_ref_aware_kv_buffer", False):
+            from sglang.srt.mem_cache.ref_aware_cache_mixin import (
+                RefAwareCacheMixin,
+            )
+
+            if isinstance(self.tree_cache, RefAwareCacheMixin):
+                self.tree_cache.register_ref(req)
+
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
@@ -51,36 +65,28 @@ class SchedulerOutputProcessorMixin:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def _get_cached_tokens_details(self: Scheduler, req: Req) -> Optional[dict]:
-        """Get detailed cache breakdown for a request, if available.
+    def _get_cached_tokens_details(self: Scheduler, req: Req) -> dict:
+        """Get detailed cache breakdown for a request.
 
-        Returns:
-            - None if no cached tokens at all
-            - {"device": X, "host": Y} without storage breakdown
-            - {"device": X, "host": Y, "storage": Z} with storage breakdown
+        Always returns a dict so `return_cache_hit_metrics=True` never yields
+        a missing breakdown. Falls back to attributing everything to the
+        device tier when the per-tier counters were never populated.
         """
-        if (
-            req.cached_tokens_device > 0
-            or req.cached_tokens_host > 0
-            or req.cached_tokens_storage > 0
-        ):
-            details = {
-                "device": req.cached_tokens_device,
-                "host": req.cached_tokens_host,
-            }
-            # Only include storage fields if L3 storage is enabled
-            if getattr(self, "enable_hicache_storage", False):
-                details["storage"] = req.cached_tokens_storage
-                details["storage_backend"] = self._get_storage_backend_type()
-            return details
+        device = req.cached_tokens_device
+        host = req.cached_tokens_host
+        storage = req.cached_tokens_storage
+        if device == 0 and host == 0 and storage == 0 and req.cached_tokens > 0:
+            device = req.cached_tokens
 
-        if req.cached_tokens > 0:
-            return {
-                "device": req.cached_tokens,
-                "host": 0,
-            }
-
-        return None
+        details = {
+            "device": device,
+            "host": host,
+        }
+        # Only include storage fields if L3 storage is enabled
+        if getattr(self, "enable_hicache_storage", False):
+            details["storage"] = storage
+            details["storage_backend"] = self._get_storage_backend_type()
+        return details
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -90,6 +96,7 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 release_kv_cache(req, self.tree_cache)
+                self._maybe_register_ref(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -189,6 +196,7 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
+                        self._maybe_register_ref(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
@@ -314,6 +322,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self._maybe_register_ref(req)
                         req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -543,6 +552,9 @@ class SchedulerOutputProcessorMixin:
             self.maybe_collect_routed_experts(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                # NOTE: ref-aware registration is intentionally skipped here --
+                # the KV release happens inside the offload manager, and
+                # decode-offload is not a supported ref-aware configuration.
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
@@ -550,6 +562,7 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                self._maybe_register_ref(req)
 
             req.time_stats.set_completion_time()
 

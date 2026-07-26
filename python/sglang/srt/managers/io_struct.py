@@ -165,6 +165,8 @@ class GenerateReqInput(BaseReq):
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Whether to return per-request cache hit metrics in meta_info.
+    return_cache_hit_metrics: bool = False
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
@@ -619,6 +621,7 @@ class GenerateReqInput(BaseReq):
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            return_cache_hit_metrics=self.return_cache_hit_metrics,
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)
@@ -1128,6 +1131,29 @@ class FlushCacheReqInput(BaseReq):
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+    message: str = ""
+
+
+@dataclass
+class ReleaseRefReqInput(BaseReq):
+    rid: str = ""
+
+
+@dataclass
+class ReleaseRefReqOutput(BaseReq):
+    success: bool = True
+    message: str = ""
+
+
+@dataclass
+class UpdateRefReqInput(BaseReq):
+    rid: str = ""
+    new_priority: int = 0
+
+
+@dataclass
+class UpdateRefReqOutput(BaseReq):
+    success: bool = True
     message: str = ""
 
 
