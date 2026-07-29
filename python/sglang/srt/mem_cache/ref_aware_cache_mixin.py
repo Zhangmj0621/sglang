@@ -6,55 +6,31 @@ from __future__ import annotations
 
 import heapq
 import logging
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
     IncLockRefResult,
-    InsertParams,
-    InsertResult,
 )
-from sglang.srt.mem_cache.radix_cache import (
-    RadixKey,
-    TreeNode,
-    convert_to_bigram_key,
-    page_align_keys,
+from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.mem_cache.ref_aware_cache_core import (  # noqa: F401  (re-export)
+    TIER_HIGH_REF,
+    TIER_LOW_REF,
+    TIER_UNUSED,
+    RefAwareCacheCore,
+    RefInfo,
+    _classify_node_tier,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
 
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class RefInfo:
-    is_high: bool
-    priority: int = 0
-    nodes: Set[TreeNode] = field(default_factory=set)
-    cached_tokens: int = 0
-    is_generating: bool = False
-
-
-TIER_UNUSED = 0  # high_ref == 0, low_ref == 0
-TIER_LOW_REF = 1  # high_ref == 0, low_ref > 0
-TIER_HIGH_REF = 2  # high_ref > 0
-
-
-def _classify_node_tier(node: TreeNode) -> int:
-    if node.high_ref > 0:
-        return TIER_HIGH_REF
-    if node.low_ref > 0:
-        return TIER_LOW_REF
-    return TIER_UNUSED
-
-
-class RefAwareCacheMixin:
+class RefAwareCacheMixin(RefAwareCacheCore):
     """
     Mixin that adds ref-aware tiered eviction to any radix-style cache.
     """
@@ -63,39 +39,31 @@ class RefAwareCacheMixin:
         """
         Initialize all ref-aware tier tracking state.
         """
-        self.high_priority_threshold = getattr(
-            server_args, "high_priority_threshold", 1
-        )
-        self._enable_priority_scheduling = getattr(
-            server_args, "enable_priority_scheduling", False
-        )
+        self._init_ref_aware_core_state(server_args)
         self.unused_evictable_leaves: set = set()
         self.low_ref_evictable_leaves: set = set()
         self.high_ref_evictable_leaves: set = set()
         self.unused_evictable_size_: int = 0
         self.low_ref_evictable_size_: int = 0
         self.high_ref_evictable_size_: int = 0
-        self.rid_to_ref_info: Dict[str, RefInfo] = {}
-        self._evict_scope_stack: list[tuple[bool, bool]] = []
-        self._last_inserted_node = None
 
     def _reset_ref_aware_state(self):
         """
         Clear all ref-aware tier tracking state.
         """
+        self._reset_ref_aware_core_state()
         self.unused_evictable_leaves.clear()
         self.low_ref_evictable_leaves.clear()
         self.high_ref_evictable_leaves.clear()
         self.unused_evictable_size_ = 0
         self.low_ref_evictable_size_ = 0
         self.high_ref_evictable_size_ = 0
-        self.rid_to_ref_info.clear()
-        self._evict_scope_stack.clear()
 
-    def is_high_priority(self, priority: int) -> bool:
-        if not self._enable_priority_scheduling:
-            return True
-        return priority >= self.high_priority_threshold
+    def _on_node_tier_changed(self, node, old_tier: int, new_tier: int):
+        # Guard mirrors the pre-refactor condition inside
+        # _inc/_dec_priority_ref_single.
+        if not node.evicted and node.lock_ref == 0:
+            self._move_node_tier(node, old_tier, new_tier)
 
     def _move_node_tier(self, node: TreeNode, old_tier: int, new_tier: int):
         assert (
@@ -206,11 +174,7 @@ class RefAwareCacheMixin:
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
-        for rid in node.tracked_rids:
-            ref_info = self.rid_to_ref_info.get(rid)
-            if ref_info is not None:
-                ref_info.nodes.discard(node)
-        node.tracked_rids.clear()
+        self._untrack_node_rids(node)
         super()._delete_leaf(node)
 
     def evictable_size_by_tier(
@@ -233,14 +197,6 @@ class RefAwareCacheMixin:
         calculation.
         """
         return self.evictable_size_by_tier(allow_low=allow_low, allow_high=allow_high)
-
-    @contextmanager
-    def scoped_evict(self, allow_low: bool = True, allow_high: bool = False):
-        self._evict_scope_stack.append((allow_low, allow_high))
-        try:
-            yield
-        finally:
-            self._evict_scope_stack.pop()
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
@@ -319,148 +275,6 @@ class RefAwareCacheMixin:
                         heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         return num_evicted
-
-    def register_ref(self, req: Req):
-        rid = req.rid
-        priority = getattr(req, "priority", 0) or 0
-        is_high = self.is_high_priority(priority)
-
-        if rid not in self.rid_to_ref_info:
-            self.rid_to_ref_info[rid] = RefInfo(is_high=is_high, priority=priority)
-
-        ref_info = self.rid_to_ref_info[rid]
-        if is_high != ref_info.is_high:
-            msg = "Priority class mismatch for ref-aware KV buffer."
-            logger.error(msg)
-            raise ValueError(msg)
-        ref_info.priority = priority
-
-        last_node = getattr(req, "last_node", None)
-        if last_node not in (None, self.root_node):
-            new_nodes = self._collect_untracked_nodes_from_last_node(
-                last_node, ref_info.nodes
-            )
-        else:
-            token_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
-            if not token_ids:
-                return
-
-            # Mirror cache_finished_req's key construction: EAGLE stores bigram
-            # keys in the tree, so a raw-token key would never match.
-            keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-            keys = page_align_keys(keys, self.page_size)
-            if not keys:
-                return
-            radix_key = RadixKey(
-                keys, getattr(req, "extra_key", None), is_bigram=self.is_eagle
-            )
-
-            nodes_on_path = self._collect_nodes_on_path(radix_key)
-            new_nodes = [node for node in nodes_on_path if node not in ref_info.nodes]
-
-        for node in new_nodes:
-            self._inc_priority_ref_single(node, is_high)
-            ref_info.nodes.add(node)
-            node.tracked_rids.add(rid)
-
-        ref_info.cached_tokens = sum(len(n.key) for n in ref_info.nodes)
-
-    def _collect_nodes_on_path(self, key: RadixKey):
-        node = self.root_node
-        nodes = []
-        child_key_fn = self.get_child_key_fn
-
-        while len(key) > 0:
-            ck = child_key_fn(key)
-            if ck not in node.children:
-                break
-            child = node.children[ck]
-            prefix_len = self.key_match_fn(child.key, key)
-            if prefix_len <= 0:
-                break
-            nodes.append(child)
-            if prefix_len < len(child.key):
-                break
-            node = child
-            key = key[prefix_len:]
-        return nodes
-
-    def _collect_untracked_nodes_from_last_node(
-        self, node: Optional[TreeNode], tracked_nodes: Set[TreeNode]
-    ) -> list[TreeNode]:
-        nodes = []
-        while node not in (None, self.root_node):
-            if node in tracked_nodes:
-                break
-            nodes.append(node)
-            node = node.parent
-        return nodes
-
-    def _inc_priority_ref_single(self, node: TreeNode, is_high: bool):
-        old_tier = _classify_node_tier(node)
-        if is_high:
-            node.high_ref += 1
-        else:
-            node.low_ref += 1
-        new_tier = _classify_node_tier(node)
-        if not node.evicted and node.lock_ref == 0 and old_tier != new_tier:
-            self._move_node_tier(node, old_tier, new_tier)
-
-    def _dec_priority_ref_single(self, node: TreeNode, is_high: bool):
-        old_tier = _classify_node_tier(node)
-        if is_high:
-            node.high_ref = max(0, node.high_ref - 1)
-        else:
-            node.low_ref = max(0, node.low_ref - 1)
-        new_tier = _classify_node_tier(node)
-        if not node.evicted and node.lock_ref == 0 and old_tier != new_tier:
-            self._move_node_tier(node, old_tier, new_tier)
-
-    def release_ref(self, rid: str) -> Tuple[bool, str]:
-        if rid is None:
-            return False, "rid is None"
-        ref_info = self.rid_to_ref_info.pop(rid, None)
-        if ref_info is None:
-            return True, f"rid {rid} not tracked"
-
-        for node in ref_info.nodes:
-            self._dec_priority_ref_single(node, ref_info.is_high)
-            node.tracked_rids.discard(rid)
-
-        return True, f"released {len(ref_info.nodes)} nodes for rid {rid}"
-
-    def update_ref(self, rid: str, new_priority: int) -> Tuple[bool, str]:
-        if rid is None:
-            return False, "rid is None"
-        ref_info = self.rid_to_ref_info.get(rid)
-        if ref_info is None:
-            return False, f"rid {rid} not found in ref tracking"
-
-        new_is_high = self.is_high_priority(new_priority)
-        ref_info.priority = new_priority
-
-        if new_is_high == ref_info.is_high:
-            return True, "priority class unchanged"
-
-        for node in ref_info.nodes:
-            self._dec_priority_ref_single(node, ref_info.is_high)
-            self._inc_priority_ref_single(node, new_is_high)
-        ref_info.is_high = new_is_high
-        return True, f"updated {len(ref_info.nodes)} nodes for rid {rid}"
-
-    def insert(self, params: InsertParams) -> InsertResult:
-        result = super().insert(params)
-        self._last_inserted_node = result.last_node
-        return result
-
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        self._last_inserted_node = None
-        super().cache_finished_req(req, is_insert=is_insert)
-        # Refresh req.last_node to the freshly inserted deepest node so the
-        # following register_ref picks up this turn's new suffix. Done after
-        # super(), which still needs the pre-insert node for dec_lock_ref.
-        if self._last_inserted_node is not None:
-            req.last_node = self._last_inserted_node
 
     def _split_node(self, key, child, split_len):
         new_node = super()._split_node(key, child, split_len)

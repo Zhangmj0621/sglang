@@ -48,11 +48,11 @@ class SchedulerOutputProcessorMixin:
         into the tree (so `req.last_node` / the tree path are up to date).
         """
         if getattr(self, "enable_ref_aware_kv_buffer", False):
-            from sglang.srt.mem_cache.ref_aware_cache_mixin import (
-                RefAwareCacheMixin,
+            from sglang.srt.mem_cache.ref_aware_cache_core import (
+                RefAwareCacheCore,
             )
 
-            if isinstance(self.tree_cache, RefAwareCacheMixin):
+            if isinstance(self.tree_cache, RefAwareCacheCore):
                 self.tree_cache.register_ref(req)
 
     def _get_storage_backend_type(self) -> str:

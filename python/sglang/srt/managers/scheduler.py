@@ -810,9 +810,18 @@ class Scheduler(
 
                 self.tree_cache = SWARadixCache(params=params)
             elif self.is_hybrid_ssm:
-                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+                if server_args.enable_ref_aware_kv_buffer:
+                    from sglang.srt.mem_cache.ref_aware_mamba_radix_cache import (
+                        RefAwareMambaRadixCache,
+                    )
 
-                self.tree_cache = MambaRadixCache(params)
+                    self.tree_cache = RefAwareMambaRadixCache(
+                        params=params, server_args=server_args
+                    )
+                else:
+                    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+                    self.tree_cache = MambaRadixCache(params)
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,
@@ -840,11 +849,11 @@ class Scheduler(
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
         if self.enable_ref_aware_kv_buffer:
-            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+            from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
             # Must run after any decorator-style wrapping (e.g. SessionAwareCache),
             # which hides the mixin from isinstance checks.
-            if not isinstance(self.tree_cache, RefAwareCacheMixin):
+            if not isinstance(self.tree_cache, RefAwareCacheCore):
                 logger.warning(
                     "enable_ref_aware_kv_buffer is set but tree_cache is %s, "
                     "disabling ref-aware KV buffer.",
@@ -3011,9 +3020,9 @@ class Scheduler(
 
     def handle_release_ref(self, recv_req: ReleaseRefReqInput):
         if self.enable_ref_aware_kv_buffer:
-            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+            from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
-            if isinstance(self.tree_cache, RefAwareCacheMixin):
+            if isinstance(self.tree_cache, RefAwareCacheCore):
                 success, msg = self.tree_cache.release_ref(recv_req.rid)
                 return ReleaseRefReqOutput(success=success, message=msg)
         return ReleaseRefReqOutput(
@@ -3025,9 +3034,9 @@ class Scheduler(
             return UpdateRefReqOutput(
                 success=False, message="ref-aware KV buffer not enabled"
             )
-        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
-        if not isinstance(self.tree_cache, RefAwareCacheMixin):
+        if not isinstance(self.tree_cache, RefAwareCacheCore):
             return UpdateRefReqOutput(
                 success=False, message="ref-aware KV buffer not enabled"
             )

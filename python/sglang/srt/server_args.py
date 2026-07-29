@@ -5190,7 +5190,7 @@ class ServerArgs:
             "--enable-ref-aware-kv-buffer",
             action="store_true",
             default=ServerArgs.enable_ref_aware_kv_buffer,
-            help="Enable ref-aware KV cache eviction with two-tier priority (high_ref/low_ref).",
+            help="Enable ref-aware KV cache eviction with two-tier priority (high_ref/low_ref). Also supported for hybrid SSM models (MambaRadixCache); not yet supported with hierarchical cache for SSM models.",
         )
         parser.add_argument(
             "--high-priority-threshold",

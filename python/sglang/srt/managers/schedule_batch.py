@@ -1618,9 +1618,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
-        if isinstance(self.tree_cache, RefAwareCacheMixin):
+        if isinstance(self.tree_cache, RefAwareCacheCore):
             allow_high = any(
                 self.tree_cache.is_high_priority(req.priority or 0) for req in reqs
             )
@@ -1961,13 +1961,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _evict_for_decode(
         self, num_tokens: int, selected_indices: Optional[List[int]] = None
     ):
-        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
         from sglang.srt.server_args import get_global_server_args
 
         server_args = get_global_server_args()
         if not (
             server_args.enable_ref_aware_kv_buffer
-            and isinstance(self.tree_cache, RefAwareCacheMixin)
+            and isinstance(self.tree_cache, RefAwareCacheCore)
         ):
             evict_from_tree_cache(self.tree_cache, num_tokens)
             return
@@ -2036,9 +2036,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # before any HP req. Within a priority class the original heuristic
             # stands: keep the most-decoded / shortest-input reqs and retract
             # the least-progressed ones first (cheapest work to redo).
-            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+            from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
-            if isinstance(self.tree_cache, RefAwareCacheMixin):
+            if isinstance(self.tree_cache, RefAwareCacheCore):
                 sorted_indices.sort(
                     key=lambda i: (
                         self.tree_cache.is_high_priority(self.reqs[i].priority or 0),

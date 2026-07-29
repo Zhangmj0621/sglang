@@ -212,6 +212,11 @@ def alloc_token_slots(
 
     out_cache_loc = allocator.alloc(num_tokens)
 
+    if out_cache_loc is None and _escalated_mamba_evict(
+        tree_cache, num_tokens=num_tokens
+    ):
+        out_cache_loc = allocator.alloc(num_tokens)
+
     if out_cache_loc is None:
         error_msg = (
             f"Out of memory. Try to lower your batch size.\n"
@@ -252,6 +257,26 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
+def _escalated_mamba_evict(tree_cache, num_tokens: int = 0, mamba_num: int = 0) -> bool:
+    """Last-resort eviction that may touch the high-ref tier. Only applies
+    to ref-aware mamba caches; returns True if an escalated eviction ran."""
+    from sglang.srt.mem_cache.ref_aware_mamba_cache_mixin import (
+        RefAwareMambaCacheMixin,
+    )
+
+    if not isinstance(tree_cache, RefAwareMambaCacheMixin):
+        return False
+    logger.warning(
+        "Ref-aware mamba cache: escalating eviction to high-ref tier "
+        "(num_tokens=%d, mamba_num=%d).",
+        num_tokens,
+        mamba_num,
+    )
+    with tree_cache.scoped_evict(allow_low=True, allow_high=True):
+        tree_cache.evict(EvictParams(num_tokens=num_tokens, mamba_num=mamba_num))
+    return True
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -279,6 +304,18 @@ def alloc_paged_token_slots_extend(
         last_loc,
         extend_num_tokens,
     )
+
+    if out_cache_loc is None and _escalated_mamba_evict(
+        tree_cache, num_tokens=num_tokens
+    ):
+        out_cache_loc = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
 
     if out_cache_loc is None:
         error_msg = (
@@ -313,6 +350,15 @@ def alloc_req_slots(
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+                still_short = (
+                    req_to_token_pool.mamba_pool.available_size() < mamba_state_needed
+                )
+                if still_short:
+                    _escalated_mamba_evict(
+                        tree_cache,
+                        mamba_num=mamba_state_needed
+                        - req_to_token_pool.mamba_pool.available_size(),
+                    )
     req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:

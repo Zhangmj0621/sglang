@@ -891,7 +891,7 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
-    ) -> Tuple[int, bool]:
+    ) -> Tuple[int, bool, Optional[TreeNode]]:
         assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
@@ -900,7 +900,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
-            return 0, True
+            return 0, True, None
 
         child_key = self.get_child_key_fn(key)
 
@@ -939,6 +939,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if len(key):
             new_node = self._add_new_node(node, key, value, mamba_value)
             self._inc_hit_count(new_node, chunked)
+            last_inserted = new_node
         elif node.mamba_value is None:
             node.mamba_value = mamba_value
             if not node.evicted:
@@ -946,14 +947,16 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            last_inserted = node
         else:
             mamba_value_exist = True
             if not node.evicted:
                 self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
+            last_inserted = node
 
-        return total_prefix_length, mamba_value_exist
+        return total_prefix_length, mamba_value_exist, last_inserted
 
     def _add_new_node(
         self,

@@ -479,10 +479,10 @@ class PrefillAdder:
         return available_and_evictable - self.rem_total_token_offset
 
     def _rem_total_tokens_ref_aware(self, is_high: bool):
-        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
         cache = self.tree_cache
-        assert isinstance(cache, RefAwareCacheMixin)
+        assert isinstance(cache, RefAwareCacheCore)
         available = self.token_to_kv_pool_allocator.available_size()
         evictable = cache.safe_evictable_size_by_tier(
             allow_low=True,
@@ -534,6 +534,12 @@ class PrefillAdder:
     def _can_admit_ref_aware_req(
         self, req: Req, req_is_high: bool, total_tokens: int
     ) -> bool:
+        if self.is_hybrid_ssm_cache and not self._mamba_slot_budget_ok(req_is_high):
+            if not req_is_high:
+                return False
+            # High-priority requests fall through: they may evict the
+            # high-ref tier and, as a last resort, rely on the escalated
+            # eviction in common.alloc_req_slots.
         ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
         if total_tokens < ref_aware_budget:
             return True
@@ -546,6 +552,15 @@ class PrefillAdder:
         return self._kick_low_priority_for_high(
             req, total_tokens, get_global_server_args()
         )
+
+    def _mamba_slot_budget_ok(self, req_is_high: bool) -> bool:
+        from sglang.srt.mem_cache.common import MAMBA_STATE_PER_REQ_PREFIX_CACHE
+
+        cache = self.tree_cache
+        mamba_budget = cache.req_to_token_pool.mamba_pool.available_size() + (
+            cache.mamba_evictable_size_by_tier(allow_low=True, allow_high=req_is_high)
+        )
+        return mamba_budget >= MAMBA_STATE_PER_REQ_PREFIX_CACHE
 
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
@@ -970,10 +985,10 @@ class PrefillAdder:
     def _kick_low_priority_for_high(
         self, req: Req, total_tokens_needed: int, server_args: ServerArgs
     ) -> bool:
-        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
+        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
         cache = self.tree_cache
-        if not isinstance(cache, RefAwareCacheMixin):
+        if not isinstance(cache, RefAwareCacheCore):
             return False
 
         low_priority_reqs = []

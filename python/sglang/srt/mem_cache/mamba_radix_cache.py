@@ -103,6 +103,11 @@ class TreeNode:
         self.host_mamba_prev = None
         self.host_mamba_next = None
 
+        # ref-aware tiered eviction counters (see RefAwareCacheCore)
+        self.high_ref = 0
+        self.low_ref = 0
+        self.tracked_rids: set = set()
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -509,10 +514,12 @@ class MambaRadixCache(BasePrefixCache):
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        prefix_len, mamba_exist = self._insert_helper(
+        prefix_len, mamba_exist, last_node = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
-        return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
+        return InsertResult(
+            prefix_len=prefix_len, mamba_exist=mamba_exist, last_node=last_node
+        )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
@@ -660,15 +667,8 @@ class MambaRadixCache(BasePrefixCache):
                 req.req_pool_idx
             ).unsqueeze(-1)
         # radix tree mamba value is forked from req space
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        mamba_value_forked = self._fork_mamba_with_evict(mamba_value)
 
-        # if alloc mamba cache failed, do evict and alloc again
-        if mamba_value_forked is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
         result = self.insert(
             InsertParams(
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
@@ -1049,14 +1049,7 @@ class MambaRadixCache(BasePrefixCache):
         if cow_mamba and last_node.mamba_value is not None:
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
-                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
-                if dst_index is None:
-                    self.inc_lock_ref(last_node)
-                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(last_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
+                dst_index = self._alloc_mamba_slot_with_evict(last_node)
                 src_index = last_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
@@ -1077,6 +1070,29 @@ class MambaRadixCache(BasePrefixCache):
             last_host_node=last_node,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
+
+    def _alloc_mamba_slot_with_evict(self, last_node: TreeNode) -> torch.Tensor:
+        """Alloc one mamba slot, evicting once on failure. Overridden by
+        RefAwareMambaCacheMixin to escalate the eviction scope before
+        giving up."""
+        dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+        if dst_index is None:
+            self.inc_lock_ref(last_node)
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+            self.dec_lock_ref(last_node)
+            assert dst_index is not None, "Can not alloc mamba cache"
+        return dst_index
+
+    def _fork_mamba_with_evict(self, mamba_value: torch.Tensor) -> torch.Tensor:
+        """Fork a mamba state, evicting once on failure. Overridden by
+        RefAwareMambaCacheMixin to escalate the eviction scope."""
+        forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        if forked is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+            assert forked is not None, "Can not alloc mamba cache"
+        return forked
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
@@ -1116,7 +1132,7 @@ class MambaRadixCache(BasePrefixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
-    ) -> Tuple[int, bool]:
+    ) -> Tuple[int, bool, Optional[TreeNode]]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
         assert mamba_value is not None, "Mamba value should not be None here."
@@ -1126,7 +1142,7 @@ class MambaRadixCache(BasePrefixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
-            return 0, True
+            return 0, True, None
 
         child_key = self.get_child_key_fn(key)
 
@@ -1166,19 +1182,35 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
+            self._account_new_node_evictable(new_node)
+            last_inserted = new_node
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            self._account_mamba_refill_evictable(node)
+            last_inserted = node
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
+            last_inserted = node
 
-        return total_prefix_length, mamba_value_exist
+        return total_prefix_length, mamba_value_exist, last_inserted
+
+    def _account_new_node_evictable(self, node: TreeNode) -> None:
+        """Hook: a brand-new leaf just became evictable (full + mamba).
+
+        No-op here; RefAwareMambaCacheMixin overrides it to keep per-tier
+        size counters in sync."""
+        pass
+
+    def _account_mamba_refill_evictable(self, node: TreeNode) -> None:
+        """Hook: an existing (tombstone) node just regained a mamba_value."""
+        pass
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
