@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_extend_allocation_size
 
 _is_npu = is_npu()
 
@@ -377,7 +378,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
+        # Must match the eviction target computed by
+        # mem_cache/common.py:alloc_paged_token_slots_extend. Using the old
+        # `extend_num_tokens + bs * page_size` over-estimate here rejects
+        # allocations the caller already evicted for, surfacing as a spurious
+        # "Prefill out of memory". Both sub-allocators consume exactly this
+        # amount because they each run get_num_new_pages on the same lens.
+        num_tokens = get_extend_allocation_size(
+            prefix_lens=prefix_lens_cpu.tolist(),
+            extend_lens=(seq_lens_cpu - prefix_lens_cpu).tolist(),
+            page_size=self.page_size,
+        )
         if num_tokens > self.full_attn_allocator.available_size():
             return None
         if num_tokens > self.swa_attn_allocator.available_size():

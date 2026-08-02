@@ -3543,10 +3543,16 @@ def get_num_new_pages(
     page_size: int,
     prefix_lens: Optional[torch.Tensor] = None,
     decode: bool = False,
-) -> torch.Tensor:
+) -> int:
     """
     Get the number of new pages for the given prefix and sequence lengths.
     We use cpu tensors to avoid blocking kernel launch.
+
+    NOTE: this stays vectorized on purpose. It runs once per decode step on
+    the scheduler's critical path; a scalar Python loop costs ~50x at large
+    batch sizes. `get_num_new_pages_for_extend` is the scalar twin used by
+    list-based scheduler admission, and
+    test/srt/test_extend_allocation_sizing.py locks the two together.
     """
     cpu_device = torch.device("cpu")
     assert seq_lens.device == cpu_device
@@ -3561,7 +3567,104 @@ def get_num_new_pages(
     num_pages_before = (prefix_lens + page_size - 1) // page_size
     num_new_pages = num_pages_after - num_pages_before
     sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
-    return sum_num_new_pages.item()
+    return int(sum_num_new_pages.item())
+
+
+def get_num_new_pages_for_extend(
+    prefix_lens: Sequence[int],
+    extend_lens: Sequence[int],
+    page_size: int,
+) -> int:
+    """Return the exact number of new pages needed by an extend allocation.
+
+    This is the side-effect-free scalar primitive shared by allocator preflight
+    and scheduler admission. A partial page already owned by a request is not
+    charged again.
+    """
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if len(prefix_lens) != len(extend_lens):
+        raise ValueError(
+            "prefix_lens and extend_lens must have the same length, got "
+            f"{len(prefix_lens)} and {len(extend_lens)}"
+        )
+
+    num_new_pages = 0
+    for prefix_len, extend_len in zip(prefix_lens, extend_lens):
+        prefix_len = int(prefix_len)
+        extend_len = int(extend_len)
+        if prefix_len < 0 or extend_len < 0:
+            raise ValueError(
+                "prefix and extend lengths must be non-negative, got "
+                f"prefix_len={prefix_len}, extend_len={extend_len}"
+            )
+        seq_len = prefix_len + extend_len
+        num_new_pages += (seq_len + page_size - 1) // page_size - (
+            prefix_len + page_size - 1
+        ) // page_size
+    return num_new_pages
+
+
+def get_extend_allocation_size(
+    prefix_lens: Sequence[int],
+    extend_lens: Sequence[int],
+    page_size: int,
+) -> int:
+    """Return extend demand in ``available_size()`` allocation units."""
+    return (
+        get_num_new_pages_for_extend(
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            page_size=page_size,
+        )
+        * page_size
+    )
+
+
+@dataclass(frozen=True)
+class FullKVReservation:
+    """Exact current and future full-KV allocation demand for one request."""
+
+    current_allocation: int
+    future_reservation: int
+
+    @property
+    def total(self) -> int:
+        return self.current_allocation + self.future_reservation
+
+
+def get_full_kv_reservation(
+    prefix_len: int,
+    extend_input_len: int,
+    page_size: int,
+    max_new_tokens_reservation: int = 0,
+) -> FullKVReservation:
+    """Return exact full-KV demand for a candidate prefill request.
+
+    ``future_reservation`` is additional physical allocation after the current
+    extend. Pass zero for an intermediate chunk; a final/non-chunk prefill may
+    pass its capped remaining decode demand.
+    """
+    if max_new_tokens_reservation < 0:
+        raise ValueError(
+            "max_new_tokens_reservation must be non-negative, got "
+            f"{max_new_tokens_reservation}"
+        )
+
+    current_allocation = get_extend_allocation_size(
+        prefix_lens=[prefix_len],
+        extend_lens=[extend_input_len],
+        page_size=page_size,
+    )
+    future_reservation = get_extend_allocation_size(
+        prefix_lens=[prefix_len + extend_input_len],
+        extend_lens=[max_new_tokens_reservation],
+        page_size=page_size,
+    )
+    return FullKVReservation(
+        current_allocation=current_allocation,
+        future_reservation=future_reservation,
+    )
 
 
 class CachedKernel:
