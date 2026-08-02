@@ -164,6 +164,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    ChunkedReqStatus,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -2180,7 +2181,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        self.tree_cache.cache_unfinished_req(req, chunked=True)
+        return self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -2330,47 +2331,136 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
+        if self.pp_size > 1 and not self.enable_ref_aware_kv_buffer:
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def _try_add_deferred_chunk(self, adder: PrefillAdder, req: Req):
-        # A batch can carry at most one chunked request. Deferring the LP chunk
-        # leaves adder.rem_chunk_tokens intact, so a waiting request may already
-        # have opened a chunk of its own by the time we get here. In that case the
-        # deferred chunk must not be admitted as a second one -- that would trip
-        # `assert self.chunked_req is None` below. Skip the admission attempt and
-        # fall through to the retract path.
-        if adder.new_chunked_req is None:
-            self.chunked_req = adder.add_chunked_req(req)
-        else:
-            self.chunked_req = req
+    def _prefill_req_pool_gate_reached(self, num_can_run: int) -> bool:
+        return (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and not self.enable_ref_aware_kv_buffer
+            and num_can_run >= self.req_to_token_pool.available_size()
+        )
 
-        if self.chunked_req is not None and (
-            not adder.can_run_list or adder.can_run_list[-1] is not req
-        ):
-            # LP chunk was not admitted due to insufficient token budget.
-            # Retract it so the slot is free for high-priority requests.
-            # Unlike the community version, retract even when can_run_list is
-            # empty: batch formation increments is_chunked on self.chunked_req
-            # unconditionally, so parking an unadmitted chunk outside the batch
-            # would leave unmatched increments (request hang + locked KV).
-            release_kv_cache(req, self.tree_cache, is_insert=False)
-            req.reset_for_retract()
-            # NOTE: this appends onto self.waiting_queue, which the caller may
-            # still be iterating. Benign: reset_for_retract() has cleared the
-            # per-round state and init_next_round_input() runs again before the
-            # request can be reconsidered in this same pass.
-            self._add_request_to_queue(req)
+    def _ref_aware_running_slot_reclaim_need(self, adder: PrefillAdder) -> int:
+        """Return the running LP count an additional candidate must replace."""
+        pp_max_micro_batch_size = get_global_server_args().pp_max_micro_batch_size
+        assert pp_max_micro_batch_size is not None
+        projected_size = len(self.running_batch.reqs) + len(adder.can_run_list) + 1
+        return max(0, projected_size - pp_max_micro_batch_size)
+
+    def _try_add_deferred_chunk(self, adder: PrefillAdder, req: Req):
+        """Resolve the delayed old owner before any new owner can be committed."""
+        assert self.chunked_req is req
+        assert adder.deferred_chunked_req is req
+        assert adder.new_chunked_req is None
+
+        # A live owner already holds its req slot (req_slot_need == 0), so it
+        # must never be charged a logical microbatch slot.  Doing so made a
+        # full microbatch retract an in-flight chunk -- and with priority
+        # scheduling off there are no LP victims to reclaim, so it always
+        # failed.
+        status = adder.add_chunked_req(req)
+        adder.resolve_deferred_chunked_req(req)
+        if status is ChunkedReqStatus.UNFINISHED:
+            assert req in adder.can_run_list
+        elif status is ChunkedReqStatus.COMPLETED:
+            assert req in adder.can_run_list
             self.chunked_req = None
-        elif self.chunked_req is not None:
-            # The deferred chunk was admitted and is still unfinished, so it now
-            # owns this batch's single chunk slot. Drain the chunk budget so no
-            # later add_one_req can open a second chunk (which would trip the
-            # same assert). This cannot stall the LP chunk: it already advanced
-            # by extend_input_len this round and is re-offered at the top of the
-            # next round.
-            adder.rem_chunk_tokens = 0
+        else:
+            assert status is ChunkedReqStatus.NOT_ADMITTED
+            self._retract_chunked_req(req)
+            adder.append_requeue_after_scan(req)
+        return status
+
+    def _try_add_active_chunk(self, adder: PrefillAdder, req: Req):
+        """Resolve a non-delayed active owner through the same status machine."""
+        assert self.chunked_req is req
+        # See _try_add_deferred_chunk: a live owner reuses its req slot.
+        status = adder.add_chunked_req(req)
+        if status is ChunkedReqStatus.COMPLETED:
+            assert req in adder.can_run_list
+            self.chunked_req = None
+        elif status is ChunkedReqStatus.NOT_ADMITTED:
+            self._retract_chunked_req(req)
+            adder.append_requeue_after_scan(req)
+        else:
+            assert status is ChunkedReqStatus.UNFINISHED
+            assert req in adder.can_run_list
+        return status
+
+    def _record_internal_retraction(self, req: Req) -> None:
+        self.num_retracted_reqs = getattr(self, "num_retracted_reqs", 0) + 1
+        if getattr(self, "enable_metrics", False):
+            self.metrics_collector.increment_retracted_reqs(
+                num_retracted_reqs=1,
+                num_retracted_input_tokens=len(req.origin_input_ids),
+                num_retracted_output_tokens=len(req.output_ids),
+            )
+
+    def _retract_chunked_req(self, req: Req) -> None:
+        """Release every live owner resource before returning it to a queue."""
+        assert self.chunked_req is req
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        req.reset_for_retract()
+        self.chunked_req = None
+        self._record_internal_retraction(req)
+
+    def _commit_batch_chunk_owner(self, adder: PrefillAdder) -> Optional[Req]:
+        """Derive the forwarded unfinished owner solely from the actual batch."""
+        new_owner = adder.new_chunked_req
+        if new_owner is not None:
+            assert new_owner in adder.can_run_list
+            assert self.chunked_req is None or self.chunked_req is new_owner
+            self.chunked_req = new_owner
+
+        batch_owner = (
+            self.chunked_req
+            if self.chunked_req is not None and self.chunked_req in adder.can_run_list
+            else None
+        )
+        if batch_owner is not None:
+            batch_owner.is_chunked += 1
+        return batch_owner
+
+    def _restore_internal_requeued_req(self, req: Req) -> None:
+        """Restore an internal victim without treating it as a new request."""
+        if self.enable_ref_aware_kv_buffer and hasattr(
+            self.tree_cache, "mark_rid_generating"
+        ):
+            self.tree_cache.mark_rid_generating(req.rid)
+
+        if self.disaggregation_mode in (
+            DisaggregationMode.NULL,
+            DisaggregationMode.PREFILL,
+        ):
+            if any(
+                queued is req or queued.rid == req.rid for queued in self.waiting_queue
+            ):
+                return
+            self.waiting_queue.append(req)
+            req.time_stats.set_wait_queue_entry_time()
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            retracted_queue = getattr(
+                self.disagg_decode_prealloc_queue, "retracted_queue", []
+            )
+            if any(
+                queued is req or queued.rid == req.rid for queued in retracted_queue
+            ):
+                return
+            self.disagg_decode_prealloc_queue.add(req, is_retracted=True)
+            req.time_stats.set_retract_time()
+        else:
+            raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _flush_requeue_after_scan(self, adder: PrefillAdder) -> None:
+        seen = set()
+        for req in adder.preempt_list + adder.requeue_after_scan:
+            key = getattr(req, "rid", None) or id(req)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._restore_internal_requeued_req(req)
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
@@ -2406,6 +2496,79 @@ class Scheduler(
 
         return ret
 
+    def _init_waiting_req_for_admission(self, req: Req) -> None:
+        if self.enable_ref_aware_kv_buffer and self.tree_cache.supports_mamba():
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        else:
+            req.init_next_round_input(self.tree_cache)
+
+    @staticmethod
+    def _capture_waiting_req_ownership(req: Req):
+        return (
+            req.req_pool_idx,
+            req.mamba_pool_idx,
+            req.mamba_ping_pong_track_buffer,
+        )
+
+    def _cleanup_failed_waiting_match(self, req: Req, ownership) -> None:
+        """Release only COW state allocated by this waiting-queue match."""
+        req_pool_idx, mamba_pool_idx, ping_pong = ownership
+        if self.enable_ref_aware_kv_buffer:
+            # Ref-aware matching is deliberately COW-free. Existing continuation
+            # ownership is reusable reservation state and must survive a miss.
+            assert req.req_pool_idx is req_pool_idx
+            assert req.mamba_pool_idx is mamba_pool_idx
+            assert req.mamba_ping_pong_track_buffer is ping_pong
+            return
+
+        if mamba_pool_idx is None and req.mamba_pool_idx is not None:
+            self.tree_cache.req_to_token_pool.mamba_pool.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+
+    def _resolve_candidate_chunk_conflict(
+        self,
+        adder: PrefillAdder,
+        req: Req,
+        deferred_chunked_req: Optional[Req],
+    ) -> bool:
+        """Return whether admission may proceed without creating two owners."""
+        if not adder.would_become_chunk(req, self.truncation_align_size):
+            return True
+        if (
+            self.chunked_req is None
+            and adder.deferred_chunked_req is None
+            and adder.new_chunked_req is None
+        ):
+            return True
+        if (
+            deferred_chunked_req is not None
+            and self.enable_ref_aware_kv_buffer
+            and adder.deferred_chunked_req is deferred_chunked_req
+            and self.tree_cache.is_high_priority(req.priority or 0)
+        ):
+            return adder.reclaim_deferred_chunk_for_new_owner()
+        return False
+
+    def _stable_partition_ref_aware_waiting_queue(self) -> None:
+        """Keep policy order within tiers while ensuring HP reserves first."""
+        high = []
+        low = []
+        for req in self.waiting_queue:
+            (
+                high if self.tree_cache.is_high_priority(req.priority or 0) else low
+            ).append(req)
+        self.waiting_queue[:] = high + low
+
+    def _should_scan_ref_aware_full_batch_req(self, req: Req) -> bool:
+        # HP must reach the prefix-locked admission planner; LP may be rejected
+        # before locking but cannot trigger real preemption here.
+        return self.tree_cache.is_high_priority(req.priority or 0)
+
+    def _reclaim_deferred_chunk_for_high(self, req: Req) -> None:
+        self._retract_chunked_req(req)
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2429,21 +2592,17 @@ class Scheduler(
 
         running_bs = len(self.running_batch.reqs)
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
-        if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
-            and not self.enable_priority_preemption
-        ):
-            self.running_batch.batch_is_full = True
-            return None
+        # An active chunk must always reach PrefillAdder's structured status
+        # handling. In PP it may span microbatches even when the current
+        # microbatch request limit is full: self.chunked_req is scheduler-wide
+        # while running_batch is per-microbatch, so gating the owner on the
+        # current microbatch's size would retract an in-flight chunk that the
+        # other microbatch is still advancing.
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        if self.enable_ref_aware_kv_buffer:
+            self._stable_partition_ref_aware_waiting_queue()
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -2478,6 +2637,7 @@ class Scheduler(
             enable_ref_aware_kv_buffer=self.enable_ref_aware_kv_buffer,
             high_priority_threshold=self.high_priority_threshold,
         )
+        adder.set_internal_retraction_recorder(self._record_internal_retraction)
 
         deferred_chunked_req = None
         if self.chunked_req is not None:
@@ -2491,16 +2651,20 @@ class Scheduler(
             if not chunk_is_high:
                 chunk_deferred = True
                 deferred_chunked_req = self.chunked_req
+                adder.set_deferred_chunked_req(
+                    deferred_chunked_req, self._reclaim_deferred_chunk_for_high
+                )
             else:
-                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                self._try_add_active_chunk(adder, self.chunked_req)
         elif self.chunked_req is not None:
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self._try_add_active_chunk(adder, self.chunked_req)
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        waiting_scan = list(self.waiting_queue)
+        for req in waiting_scan:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2519,25 +2683,18 @@ class Scheduler(
 
             running_bs = len(self.running_batch.reqs)
             num_allocatable = self.get_num_allocatable_reqs(running_bs)
-            if self.enable_ref_aware_kv_buffer:
-                req_slot_capacity = self.req_to_token_pool.available_size()
-                if (
-                    self.chunked_req is not None
-                    and self.chunked_req.req_pool_idx is not None
-                ):
-                    # A chunked request already owns a req slot and can reuse it in this batch.
-                    req_slot_capacity += 1
-                num_allocatable = min(num_allocatable, req_slot_capacity)
             if len(adder.can_run_list) >= num_allocatable:
                 self.running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._prefill_req_pool_gate_reached(len(adder.can_run_list)):
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    self.running_batch.batch_is_full = True
+                self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if (
+                if self.enable_ref_aware_kv_buffer:
+                    if not self._should_scan_ref_aware_full_batch_req(req):
+                        break
+                elif (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
@@ -2561,12 +2718,36 @@ class Scheduler(
                     deferred_chunked_req = None
                     chunk_deferred = False
 
-            req.init_next_round_input(self.tree_cache)
+            ownership_before_match = self._capture_waiting_req_ownership(req)
+            self._init_waiting_req_for_admission(req)
+
+            if not self._resolve_candidate_chunk_conflict(
+                adder, req, deferred_chunked_req
+            ):
+                self._cleanup_failed_waiting_match(req, ownership_before_match)
+                break
+            if deferred_chunked_req is not None and adder.deferred_chunked_req is None:
+                deferred_chunked_req = None
+                chunk_deferred = False
+
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=(
+                    self.chunked_req is not None
+                    or adder.deferred_chunked_req is not None
+                    or adder.new_chunked_req is not None
+                ),
                 truncation_align_size=self.truncation_align_size,
+                running_slot_reclaim_need=(
+                    self._ref_aware_running_slot_reclaim_need(adder)
+                    if self.enable_ref_aware_kv_buffer
+                    and self.tree_cache.is_high_priority(req.priority or 0)
+                    else 0
+                ),
             )
+            if deferred_chunked_req is not None and adder.deferred_chunked_req is None:
+                deferred_chunked_req = None
+                chunk_deferred = False
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2580,13 +2761,9 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
-                # revert matched mamba idx to avoid memory leak, if req is not added
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if not added and req.mamba_pool_idx is not None:
-                    self.tree_cache.req_to_token_pool.mamba_pool.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
-                    )
-                    req.mamba_pool_idx = None
+                if not added:
+                    self._cleanup_failed_waiting_match(req, ownership_before_match)
                 break
 
         # If the queue was exhausted without inserting the deferred chunk, handle it
@@ -2599,24 +2776,17 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
-        # Re-queue preempted requests before the `can_run_list` early return
-        # below. Their KV cache is already released and they were removed from
-        # running_batch, so returning without re-queueing them loses the
-        # requests entirely (client hangs until timeout).
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+        # Flush internal victims only after the stable waiting snapshot is no
+        # longer being scanned, including the empty-batch return path.
+        self._flush_requeue_after_scan(adder)
 
+        assert adder.deferred_chunked_req is None
         if len(can_run_list) == 0:
+            assert self.chunked_req is None
             return None
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
-
-        if self.chunked_req is not None:
-            self.chunked_req.is_chunked += 1
+        diagnostic_new_chunked_req = adder.new_chunked_req
+        batch_chunked_req = self._commit_batch_chunk_owner(adder)
 
         # Record for logging prefill stats after forward
         self.adder = adder
@@ -2634,7 +2804,16 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=batch_chunked_req,
+            authorized_high_full_shortfall=adder.authorized_high_full_shortfall,
+            authorized_high_mamba_shortfall=adder.authorized_high_mamba_shortfall,
+            admission_reserved_full_current=adder.reserved_full_current,
+            admission_reserved_full_future=adder.reserved_full_future,
+            admission_reserved_req_slots=adder.reserved_req_slots,
+            admission_reserved_mamba_states=adder.reserved_mamba_states,
+            diagnostic_active_chunked_req=self.chunked_req,
+            diagnostic_deferred_chunked_req=adder.deferred_chunked_req,
+            diagnostic_new_chunked_req=diagnostic_new_chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
