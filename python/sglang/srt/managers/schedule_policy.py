@@ -28,8 +28,9 @@ import os
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Union
 
 import torch
 
@@ -46,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import get_full_kv_reservation
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -372,6 +374,37 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
+class ChunkedReqStatus(Enum):
+    """Result of resolving an already-active chunk continuation."""
+
+    UNFINISHED = auto()
+    COMPLETED = auto()
+    NOT_ADMITTED = auto()
+
+
+@dataclass(frozen=True)
+class ChunkTruncation:
+    """Side-effect-free chunk shape shared by prediction and admission."""
+
+    extend_input_len: int
+    budget_input_tokens: int
+    is_intermediate_chunk: bool
+
+
+@dataclass(frozen=True)
+class PrefillResourceDemand:
+    """Immutable request shape and exact resources charged at admission."""
+
+    prefix_len: int
+    extend_input_len: int
+    budget_input_tokens: int
+    is_intermediate_chunk: bool
+    req_slots: int
+    mamba_states: int
+    full_current: int
+    full_future: int
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -408,10 +441,15 @@ class PrefillAdder:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
         self.rem_total_token_offset = mixed_with_decode_tokens
         self.cur_rem_token_offset = mixed_with_decode_tokens
+        self._running_mixed_token_per_req = int(mixed_with_decode_tokens > 0)
 
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
+        self.requeue_after_scan = []
+        self.deferred_chunked_req = None
+        self._deferred_chunk_reclaimer = None
+        self._internal_retraction_recorder = None
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -424,6 +462,21 @@ class PrefillAdder:
                     for r in running_batch.reqs
                 ]
             )
+
+        # Ref-aware admission uses these immutable round-start offsets plus an
+        # explicit cumulative ledger.  The legacy offsets continue to be
+        # updated for callers and observability, but are not double-counted by
+        # the resource checks below.
+        self._round_start_total_token_offset = self.rem_total_token_offset
+        self._round_start_cur_token_offset = self.cur_rem_token_offset
+        self.reserved_req_slots = 0
+        self.reserved_mamba_states = 0
+        self.reserved_full_current = 0
+        self.reserved_full_future = 0
+        # Task 5 will populate these after real LP reclaim.  Defining them here
+        # keeps the admission ledger complete without granting authorization.
+        self.authorized_high_full_shortfall = 0
+        self.authorized_high_mamba_shortfall = 0
 
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
@@ -442,6 +495,23 @@ class PrefillAdder:
         self.enable_ref_aware_kv_buffer = enable_ref_aware_kv_buffer
         self.high_priority_threshold = high_priority_threshold
 
+    def set_deferred_chunked_req(self, req: Req, reclaimer) -> None:
+        """Expose the scheduler-owned old chunk to the HP resource planner."""
+        self.deferred_chunked_req = req
+        self._deferred_chunk_reclaimer = reclaimer
+
+    def resolve_deferred_chunked_req(self, req: Req) -> None:
+        """Mark the scheduler-owned old chunk as synchronously resolved."""
+        assert self.deferred_chunked_req is req
+        self.deferred_chunked_req = None
+        self._deferred_chunk_reclaimer = None
+
+    def set_internal_retraction_recorder(
+        self, recorder: Optional[Callable[[Req], None]]
+    ) -> None:
+        """Record scheduler-visible metrics after a running victim is reset."""
+        self._internal_retraction_recorder = recorder
+
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
@@ -459,6 +529,12 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
+        if self.enable_ref_aware_kv_buffer:
+            return self._ref_aware_full_capacity() - (
+                self._round_start_total_token_offset
+                + self.reserved_full_current
+                + self.reserved_full_future
+            )
         if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
@@ -483,15 +559,21 @@ class PrefillAdder:
 
         cache = self.tree_cache
         assert isinstance(cache, RefAwareCacheCore)
-        available = self.token_to_kv_pool_allocator.available_size()
-        evictable = cache.safe_evictable_size_by_tier(
-            allow_low=True,
-            allow_high=is_high,
+        # Retain the legacy reporting seam for non-Mamba ref-aware callers.
+        # The Mamba admission planner does not use this value for HP decisions;
+        # it computes a locked batch-wide residual authorization instead.
+        return (
+            self.token_to_kv_pool_allocator.available_size()
+            + cache.safe_evictable_size_by_tier(allow_low=True, allow_high=is_high)
+            - self.rem_total_token_offset
         )
-        return available + evictable - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
+        if self.enable_ref_aware_kv_buffer:
+            return self._ref_aware_full_capacity() - (
+                self._round_start_cur_token_offset + self.reserved_full_current
+            )
         if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
@@ -531,40 +613,447 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
-    def _can_admit_ref_aware_req(
-        self, req: Req, req_is_high: bool, total_tokens: int
-    ) -> bool:
-        if self.is_hybrid_ssm_cache and not self._mamba_slot_budget_ok(req_is_high):
-            if not req_is_high:
-                return False
-            # High-priority requests fall through: they may evict the
-            # high-ref tier and, as a last resort, rely on the escalated
-            # eviction in common.alloc_req_slots.
-        ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
-        if total_tokens < ref_aware_budget:
-            return True
+    def _ref_aware_full_capacity(self) -> int:
+        return (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.safe_evictable_size_by_tier(
+                allow_low=True, allow_high=False
+            )
+        )
 
-        if not req_is_high:
+    def _make_chunk_truncation(
+        self,
+        extend_input_len: int,
+        truncation_align_size: Optional[int],
+    ) -> Optional[ChunkTruncation]:
+        """Return the exact chunk shape without mutating request or budget state."""
+        budget_input_tokens = self.ceil_paged_tokens(max(extend_input_len, 0))
+        if (
+            self.rem_chunk_tokens is None
+            or budget_input_tokens <= self.rem_chunk_tokens
+        ):
+            return ChunkTruncation(
+                extend_input_len=max(extend_input_len, 0),
+                budget_input_tokens=budget_input_tokens,
+                is_intermediate_chunk=False,
+            )
+
+        trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+        if trunc_len <= 0:
+            return None
+        if truncation_align_size is not None:
+            if trunc_len < truncation_align_size:
+                return None
+            trunc_len = truncation_align_size * (trunc_len // truncation_align_size)
+        return ChunkTruncation(
+            extend_input_len=trunc_len,
+            budget_input_tokens=trunc_len,
+            is_intermediate_chunk=True,
+        )
+
+    def would_become_chunk(
+        self, req: Req, truncation_align_size: Optional[int]
+    ) -> bool:
+        """Predict chunk ownership using the admission path's exact arithmetic."""
+        if self.dllm_config is not None:
+            # dLLM staging truncation does not use new_chunked_req ownership.
+            return False
+        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            return (
+                self.rem_chunk_tokens is not None
+                and self.rem_chunk_tokens > 0
+                and req.extend_input_len > self.rem_chunk_tokens
+            )
+
+        # Host hits become device prefix before the final locked admission
+        # shape. Projecting them here gives the same extend length without
+        # initiating load-back or taking ownership of any cache state.
+        extend_input_len = max(req.extend_input_len - req.host_hit_length, 0)
+        shape = self._make_chunk_truncation(extend_input_len, truncation_align_size)
+        return shape is not None and shape.is_intermediate_chunk
+
+    def _make_ref_aware_demand(
+        self,
+        req: Req,
+        truncation_align_size: Optional[int],
+        *,
+        prefix_len: Optional[int] = None,
+        extend_input_len: Optional[int] = None,
+    ) -> Optional[PrefillResourceDemand]:
+        """Build one side-effect-free shape used by check, mutation, and commit."""
+        prefix_len = len(req.prefix_indices) if prefix_len is None else prefix_len
+        extend_input_len = (
+            req.extend_input_len
+            if extend_input_len is None
+            else max(extend_input_len, 0)
+        )
+        shape = self._make_chunk_truncation(extend_input_len, truncation_align_size)
+        if shape is None:
+            return None
+        extend_input_len = shape.extend_input_len
+        budget_input_tokens = shape.budget_input_tokens
+        is_intermediate_chunk = shape.is_intermediate_chunk
+
+        max_new_tokens_reservation = 0
+        if not is_intermediate_chunk:
+            max_new_tokens_reservation = min(
+                max(
+                    req.sampling_params.max_new_tokens - len(req.output_ids),
+                    0,
+                ),
+                CLIP_MAX_NEW_TOKENS,
+            )
+
+        full = get_full_kv_reservation(
+            prefix_len=prefix_len,
+            extend_input_len=extend_input_len,
+            page_size=self.page_size,
+            max_new_tokens_reservation=max_new_tokens_reservation,
+        )
+        req_pool = self.tree_cache.req_to_token_pool
+        return PrefillResourceDemand(
+            prefix_len=prefix_len,
+            extend_input_len=extend_input_len,
+            budget_input_tokens=budget_input_tokens,
+            is_intermediate_chunk=is_intermediate_chunk,
+            req_slots=req_pool.req_slot_need(req),
+            mamba_states=(
+                req_pool.mamba_state_need(req) if self.is_hybrid_ssm_cache else 0
+            ),
+            full_current=full.current_allocation,
+            full_future=full.future_reservation,
+        )
+
+    def _ref_aware_demand_fits(self, demand: PrefillResourceDemand) -> bool:
+        """Check safe capacity without granting a low-priority authorization.
+
+        Once an earlier HP request has established a batch-wide high-ref
+        authorization, a later LP request may reuse resources within that
+        already-fixed bound.  It must never increase either authorization,
+        and request slots remain non-evictable.
+        """
+        full_capacity = self._ref_aware_full_capacity()
+        full_current_required = (
+            self._round_start_cur_token_offset
+            + self.reserved_full_current
+            + demand.full_current
+        )
+        full_total_required = (
+            self._round_start_total_token_offset
+            + self.reserved_full_current
+            + self.reserved_full_future
+            + demand.full_current
+            + demand.full_future
+        )
+        full_deficit = max(
+            0,
+            max(full_current_required, full_total_required) - full_capacity,
+        )
+
+        req_pool = self.tree_cache.req_to_token_pool
+        req_slot_deficit = max(
+            0,
+            self.reserved_req_slots + demand.req_slots - req_pool.available_size(),
+        )
+        if req_slot_deficit:
             return False
 
+        mamba_deficit = 0
+        if self.is_hybrid_ssm_cache:
+            mamba_capacity = (
+                req_pool.mamba_pool.available_size()
+                + self.tree_cache.mamba_evictable_size_by_tier(
+                    allow_low=True, allow_high=False
+                )
+            )
+            mamba_deficit = max(
+                0,
+                self.reserved_mamba_states + demand.mamba_states - mamba_capacity,
+            )
+
+        return (
+            full_deficit <= self.authorized_high_full_shortfall
+            and mamba_deficit <= self.authorized_high_mamba_shortfall
+        )
+
+    def _ref_aware_deficits(
+        self, demand: PrefillResourceDemand
+    ) -> tuple[int, int, int]:
+        """Return the batch-wide safe-capacity deficit vector."""
+        full_required = max(
+            self._round_start_cur_token_offset
+            + self.reserved_full_current
+            + demand.full_current,
+            self._round_start_total_token_offset
+            + self.reserved_full_current
+            + self.reserved_full_future
+            + demand.full_current
+            + demand.full_future,
+        )
+        full_deficit = max(0, full_required - self._ref_aware_full_capacity())
+
+        req_pool = self.tree_cache.req_to_token_pool
+        req_slot_deficit = max(
+            0,
+            self.reserved_req_slots + demand.req_slots - req_pool.available_size(),
+        )
+
+        mamba_deficit = 0
+        if self.is_hybrid_ssm_cache:
+            mamba_safe_capacity = (
+                req_pool.mamba_pool.available_size()
+                + self.tree_cache.mamba_evictable_size_by_tier(
+                    allow_low=True, allow_high=False
+                )
+            )
+            mamba_deficit = max(
+                0,
+                self.reserved_mamba_states + demand.mamba_states - mamba_safe_capacity,
+            )
+        return full_deficit, req_slot_deficit, mamba_deficit
+
+    def _high_evictable_capacity(self) -> tuple[int, int]:
+        full_safe = self.tree_cache.safe_evictable_size_by_tier(
+            allow_low=True, allow_high=False
+        )
+        full_all = self.tree_cache.safe_evictable_size_by_tier(
+            allow_low=True, allow_high=True
+        )
+        mamba_safe = mamba_all = 0
+        if self.is_hybrid_ssm_cache:
+            mamba_safe = self.tree_cache.mamba_evictable_size_by_tier(
+                allow_low=True, allow_high=False
+            )
+            mamba_all = self.tree_cache.mamba_evictable_size_by_tier(
+                allow_low=True, allow_high=True
+            )
+        return max(0, full_all - full_safe), max(0, mamba_all - mamba_safe)
+
+    def _append_requeue_after_scan(self, req: Req) -> None:
+        rid = getattr(req, "rid", None)
+        if any(
+            queued is req or (rid is not None and getattr(queued, "rid", None) == rid)
+            for queued in self.requeue_after_scan
+        ):
+            return
+        self.requeue_after_scan.append(req)
+
+    def append_requeue_after_scan(self, req: Req) -> None:
+        self._append_requeue_after_scan(req)
+
+    def _reclaim_deferred_low_priority_chunk(self) -> bool:
+        req = self.deferred_chunked_req
+        if req is None or self.tree_cache.is_high_priority(req.priority or 0):
+            return False
+        assert self._deferred_chunk_reclaimer is not None
+        self._deferred_chunk_reclaimer(req)
+        self.deferred_chunked_req = None
+        self._deferred_chunk_reclaimer = None
+        self._append_requeue_after_scan(req)
+        return True
+
+    def reclaim_deferred_chunk_for_new_owner(self) -> bool:
+        """Resolve an LP old owner before an HP candidate opens a new chunk."""
+        return self._reclaim_deferred_low_priority_chunk()
+
+    def _running_low_priority_victims(self) -> List[Req]:
+        victims = [
+            req
+            for req in self.running_batch.reqs
+            if req not in self.preempt_list
+            and req not in self.requeue_after_scan
+            and not req.finished()
+            and not self.tree_cache.is_high_priority(req.priority or 0)
+        ]
+        # Preserve the deterministic reclaim order of the old ref-aware path.
+        victims.sort(
+            key=lambda req: len(req.origin_input_ids) + len(req.output_ids),
+            reverse=True,
+        )
+        return victims
+
+    def _release_running_low_priority_req(self, req: Req, server_args) -> None:
+        reqs = self.running_batch.reqs
+        idx = next(i for i, item in enumerate(reqs) if item is req)
+        future_offset = self._get_running_request_total_token_offset(req)
+        mixed_offset = self._running_mixed_token_per_req
+        self.rem_total_token_offset -= future_offset + mixed_offset
+        self.cur_rem_token_offset -= mixed_offset
+        self._round_start_total_token_offset -= future_offset + mixed_offset
+        self._round_start_cur_token_offset -= mixed_offset
+        self.running_batch.release_req(idx, len(reqs) - 1, server_args)
+        if self._internal_retraction_recorder is not None:
+            self._internal_retraction_recorder(req)
+        self.running_batch.filter_batch(
+            keep_indices=[i for i, item in enumerate(reqs) if item is not req]
+        )
+        self._append_requeue_after_scan(req)
+
+    def _release_gain_lower_bound(self, req: Req) -> tuple[int, int, int]:
+        """Conservative (full, req_slot, mamba) gain from releasing ``req``.
+
+        Deliberately an under-estimate: it counts only resources the request
+        provably holds today and ignores prefix nodes that become evictable
+        after release.  Under-estimating can delay an HP that would in fact
+        have fit; over-estimating would let us destroy LP work and then
+        reject the candidate anyway, which is the failure this guards.
+        """
+        req_pool = self.tree_cache.req_to_token_pool
+        mamba_gain = 0
+        if self.is_hybrid_ssm_cache:
+            mamba_gain = int(getattr(req, "mamba_pool_idx", None) is not None)
+            if (
+                getattr(req_pool, "enable_mamba_extra_buffer", False)
+                and getattr(req, "mamba_ping_pong_track_buffer", None) is not None
+            ):
+                mamba_gain += req_pool.mamba_ping_pong_track_buffer_size
+        return (
+            int(self._get_running_request_total_token_offset(req)),
+            int(getattr(req, "req_pool_idx", None) is not None),
+            mamba_gain,
+        )
+
+    def _reclaim_could_satisfy(
+        self, demand: PrefillResourceDemand, victims: List[Req]
+    ) -> bool:
+        """Whether releasing every eligible LP could close the deficit.
+
+        Evaluated BEFORE any destructive release so an impossible candidate
+        costs nothing.  The deferred LP chunk is included because
+        ``_plan_high_priority_admission`` may reclaim it too.
+        """
+        full_deficit, req_slot_deficit, mamba_deficit = self._ref_aware_deficits(demand)
+        if not (full_deficit or req_slot_deficit or mamba_deficit):
+            return True
+
+        candidates = list(victims)
+        deferred = self.deferred_chunked_req
+        if deferred is not None and not self.tree_cache.is_high_priority(
+            deferred.priority or 0
+        ):
+            candidates.append(deferred)
+
+        full_gain = req_slot_gain = mamba_gain = 0
+        for candidate in candidates:
+            gains = self._release_gain_lower_bound(candidate)
+            full_gain += gains[0]
+            req_slot_gain += gains[1]
+            mamba_gain += gains[2]
+
+        high_full, high_mamba = self._high_evictable_capacity()
+        return (
+            full_deficit <= full_gain + high_full
+            and req_slot_deficit <= req_slot_gain
+            and mamba_deficit <= mamba_gain + high_mamba
+        )
+
+    def _plan_high_priority_admission(
+        self,
+        demand: PrefillResourceDemand,
+        running_slot_reclaim_need: int = 0,
+    ) -> bool:
+        """Reclaim LP state, then authorize only the batch residual shortfall.
+
+        Order matters: every feasibility test runs BEFORE the first
+        destructive release, so a candidate we cannot admit never costs an
+        LP request its progress.
+        """
         from sglang.srt.server_args import get_global_server_args
 
-        return self._kick_low_priority_for_high(
-            req, total_tokens, get_global_server_args()
-        )
+        assert running_slot_reclaim_need >= 0
 
-    def _mamba_slot_budget_ok(self, req_is_high: bool) -> bool:
-        from sglang.srt.mem_cache.common import MAMBA_STATE_PER_REQ_PREFIX_CACHE
+        # --- 1/2: feasibility, zero destruction ---
+        victims = self._running_low_priority_victims()
+        if running_slot_reclaim_need > len(victims):
+            return False
+        if not self._reclaim_could_satisfy(demand, victims):
+            return False
 
-        cache = self.tree_cache
-        mamba_budget = cache.req_to_token_pool.mamba_pool.available_size() + (
-            cache.mamba_evictable_size_by_tier(allow_low=True, allow_high=req_is_high)
+        # --- 3: a new chunk owner must retire the deferred owner ---
+        if demand.is_intermediate_chunk:
+            self._reclaim_deferred_low_priority_chunk()
+            if self.deferred_chunked_req is not None:
+                return False
+
+        # --- 4: real release ---
+        # PP's microbatch limit is a logical request-count resource, separate
+        # from request-pool and KV capacity.  HP candidates are allowed past
+        # Scheduler.batch_is_full only so this prefix-locked planner can make
+        # room by truly releasing running LP requests.  Never authorize a
+        # logical shortfall and never reclaim before acquiring the prefix lock.
+        logical_slots_reclaimed = 0
+        if running_slot_reclaim_need:
+            server_args = get_global_server_args()
+            for victim in self._running_low_priority_victims():
+                self._release_running_low_priority_req(victim, server_args)
+                logical_slots_reclaimed += 1
+                if logical_slots_reclaimed == running_slot_reclaim_need:
+                    break
+            assert logical_slots_reclaimed == running_slot_reclaim_need
+
+        deficits = self._ref_aware_deficits(demand)
+        if any(deficits) and self._reclaim_deferred_low_priority_chunk():
+            deficits = self._ref_aware_deficits(demand)
+
+        if any(deficits):
+            server_args = get_global_server_args()
+            for victim in self._running_low_priority_victims():
+                self._release_running_low_priority_req(victim, server_args)
+                deficits = self._ref_aware_deficits(demand)
+                if not any(deficits):
+                    break
+
+        full_deficit, req_slot_deficit, mamba_deficit = deficits
+        if req_slot_deficit:
+            return False
+
+        high_full, high_mamba = self._high_evictable_capacity()
+        if full_deficit > high_full or mamba_deficit > high_mamba:
+            return False
+
+        # --- 5: authorization ---
+        # Batch-wide totals at current live capacities.  Never lower an
+        # existing authorization: allocation may already have consumed it,
+        # and evict_from_tree_cache raises when residual exceeds the cap.
+        self.authorized_high_full_shortfall = max(
+            self.authorized_high_full_shortfall, full_deficit
         )
-        return mamba_budget >= MAMBA_STATE_PER_REQ_PREFIX_CACHE
+        self.authorized_high_mamba_shortfall = max(
+            self.authorized_high_mamba_shortfall, mamba_deficit
+        )
+        return True
+
+    def _commit_ref_aware_demand(self, demand: PrefillResourceDemand) -> None:
+        self.reserved_req_slots += demand.req_slots
+        self.reserved_mamba_states += demand.mamba_states
+        self.reserved_full_current += demand.full_current
+        self.reserved_full_future += demand.full_future
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        resource_demand: Optional[PrefillResourceDemand] = None,
     ):
+        if resource_demand is not None:
+            self._commit_ref_aware_demand(resource_demand)
+            extend_input_len = resource_demand.budget_input_tokens
+            self.rem_total_token_offset += (
+                resource_demand.full_current + resource_demand.full_future
+            )
+            self.cur_rem_token_offset += resource_demand.full_current
+            self.rem_input_tokens -= extend_input_len
+
+            if self.dllm_config is not None:
+                self.rem_dllm_tokens -= extend_input_len
+            elif self.rem_chunk_tokens is not None:
+                self.rem_chunk_tokens -= extend_input_len
+
+            self.log_hit_tokens += resource_demand.prefix_len
+            self.log_input_tokens += extend_input_len
+            return
+
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
@@ -643,27 +1132,56 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(
+        self, req: Req, running_slot_reclaim_need: int = 0
+    ) -> ChunkedReqStatus:
+        """Resolve an active chunk into an explicit per-round state."""
+        assert running_slot_reclaim_need >= 0
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         elif self.enable_ref_aware_kv_buffer:
-            # TODO (zhangmj): need to support is_hybrid_swa.
             req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
-            budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
-            _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
-            if _rem_tokens <= 0 and req_is_high:
-                # HP chunks can evict all tiers (scoped_evict allow_high=True),
-                # same as the non-ref-aware path. Fall back to rem_chunk_tokens
-                # and let eviction handle it, matching the original behavior.
-                _rem_tokens = self.rem_chunk_tokens
-            elif _rem_tokens <= 0 and not req_is_high:
-                return req
+            if running_slot_reclaim_need and not req_is_high:
+                return ChunkedReqStatus.NOT_ADMITTED
+            demand = self._make_ref_aware_demand(req, truncation_align_size=None)
+            if demand is None:
+                return ChunkedReqStatus.NOT_ADMITTED
+            admitted = (
+                self._plan_high_priority_admission(
+                    demand,
+                    running_slot_reclaim_need=running_slot_reclaim_need,
+                )
+                if req_is_high
+                else self._ref_aware_demand_fits(demand)
+            )
+            if not admitted:
+                return ChunkedReqStatus.NOT_ADMITTED
+            if demand.is_intermediate_chunk:
+                req.set_extend_input_len(demand.extend_input_len)
+                req.fill_ids = req.fill_ids[
+                    : len(req.prefix_indices) + demand.extend_input_len
+                ]
+            self.can_run_list.append(req)
+            self._update_prefill_budget(
+                demand.prefix_len,
+                demand.extend_input_len,
+                demand.full_future,
+                resource_demand=demand,
+            )
+            return (
+                ChunkedReqStatus.UNFINISHED
+                if demand.is_intermediate_chunk
+                else ChunkedReqStatus.COMPLETED
+            )
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
+
+        if _rem_tokens is None or _rem_tokens <= 0:
+            return ChunkedReqStatus.NOT_ADMITTED
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
@@ -679,8 +1197,97 @@ class PrefillAdder:
             ),
         )
 
-        # Return if chunked prefill not finished
-        return req if truncated else None
+        return ChunkedReqStatus.UNFINISHED if truncated else ChunkedReqStatus.COMPLETED
+
+    def _add_one_ref_aware_req(
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        running_slot_reclaim_need: int,
+    ) -> AddReqResult:
+        # Host hits describe the shape expected after load-back.  This first
+        # check is deliberately side-effect free and can only reject early; it
+        # never preempts or widens the eviction scope.
+        projected_prefix_len = len(req.prefix_indices) + req.host_hit_length
+        projected_extend_len = req.extend_input_len - req.host_hit_length
+        demand = self._make_ref_aware_demand(
+            req,
+            truncation_align_size,
+            prefix_len=projected_prefix_len,
+            extend_input_len=projected_extend_len,
+        )
+        if demand is None:
+            return AddReqResult.OTHER
+        if has_chunked_req and demand.is_intermediate_chunk:
+            return AddReqResult.OTHER
+        if (
+            demand.budget_input_tokens > self.rem_input_tokens
+            and len(self.can_run_list) != 0
+        ):
+            return AddReqResult.OTHER
+        req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
+        if not req_is_high and not self._ref_aware_demand_fits(demand):
+            return AddReqResult.NO_TOKEN
+
+        with self._lock_node(req.last_node):
+            if req.host_hit_length > 0:
+                new_indices, req.last_node = self.tree_cache.init_load_back(
+                    InitLoadBackParams(
+                        last_host_node=req.last_host_node,
+                        host_hit_length=req.host_hit_length,
+                        req=req,
+                    )
+                )
+                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                req.cache_protected_len = len(req.prefix_indices)
+
+            # The lock can remove prefix resources from the evictable tiers.
+            # Rebuild one final immutable shape after any load-back, then use
+            # that exact object for the check, request mutation, and commit.
+            demand = self._make_ref_aware_demand(req, truncation_align_size)
+            if demand is None:
+                return AddReqResult.OTHER
+            if has_chunked_req and demand.is_intermediate_chunk:
+                return AddReqResult.OTHER
+            if (
+                demand.budget_input_tokens > self.rem_input_tokens
+                and len(self.can_run_list) != 0
+            ):
+                return AddReqResult.OTHER
+            if req_is_high:
+                if not self._plan_high_priority_admission(
+                    demand,
+                    running_slot_reclaim_need=running_slot_reclaim_need,
+                ):
+                    return AddReqResult.NO_TOKEN
+            elif not self._ref_aware_demand_fits(demand):
+                return AddReqResult.NO_TOKEN
+
+            if demand.is_intermediate_chunk:
+                req.set_extend_input_len(demand.extend_input_len)
+                req.fill_ids = req.fill_ids[
+                    : demand.prefix_len + demand.extend_input_len
+                ]
+
+            # Add the persistent request lock while the temporary admission
+            # lock is still held.  Exiting the context then drops only the
+            # temporary reference.
+            self._req_inc_lock_ref(req)
+            self.can_run_list.append(req)
+            if demand.is_intermediate_chunk:
+                assert self.new_chunked_req is None
+                assert self.deferred_chunked_req is None
+                self.new_chunked_req = req
+            self._update_prefill_budget(
+                demand.prefix_len,
+                demand.extend_input_len,
+                demand.full_future,
+                resource_demand=demand,
+            )
+
+        return self.budget_state()
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -697,7 +1304,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -770,6 +1377,8 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
+            if has_chunked_req:
+                return AddReqResult.OTHER
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
@@ -779,13 +1388,18 @@ class PrefillAdder:
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
+            assert self.new_chunked_req is None
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        running_slot_reclaim_need: int = 0,
     ):
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -808,7 +1422,15 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
+
+        if self.enable_ref_aware_kv_buffer:
+            return self._add_one_ref_aware_req(
+                req,
+                has_chunked_req,
+                truncation_align_size,
+                running_slot_reclaim_need,
+            )
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
@@ -820,11 +1442,6 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if self.enable_ref_aware_kv_buffer:
-            req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
-            if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
-                return AddReqResult.NO_TOKEN
-
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
@@ -832,11 +1449,6 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if self.enable_ref_aware_kv_buffer:
-                if not self._can_admit_ref_aware_req(req, req_is_high, total_tokens):
-                    return AddReqResult.NO_TOKEN
-
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
@@ -853,7 +1465,12 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            chunk_shape = self._make_chunk_truncation(
+                req.extend_input_len, truncation_align_size
+            )
+            if chunk_shape is None:
+                return AddReqResult.OTHER
+            input_tokens = chunk_shape.budget_input_tokens
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
@@ -868,7 +1485,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif not chunk_shape.is_intermediate_chunk:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
 
@@ -882,28 +1499,16 @@ class PrefillAdder:
                     ),
                 )
             else:
-                # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
-
-                if trunc_len <= 0:
+                if has_chunked_req:
                     return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
-                        )
+                trunc_len = chunk_shape.extend_input_len
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
+                assert self.new_chunked_req is None
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
@@ -980,59 +1585,4 @@ class PrefillAdder:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
-        return True
-
-    def _kick_low_priority_for_high(
-        self, req: Req, total_tokens_needed: int, server_args: ServerArgs
-    ) -> bool:
-        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
-
-        cache = self.tree_cache
-        if not isinstance(cache, RefAwareCacheCore):
-            return False
-
-        low_priority_reqs = []
-        for r in self.running_batch.reqs:
-            if r in self.preempt_list or r.finished():
-                continue
-            # Classify through the cache, like every other ref-aware site: with
-            # priority scheduling disabled, is_high_priority() is unconditionally
-            # True and req.priority stays None, so a raw `(priority or 0) <
-            # threshold` test would mark the entire running batch preemptible.
-            if not cache.is_high_priority(r.priority or 0):
-                total_tokens = len(r.origin_input_ids) + len(r.output_ids)
-                low_priority_reqs.append((total_tokens, r))
-
-        low_priority_reqs.sort(key=lambda x: x[0], reverse=True)
-
-        kicked_reqs = []
-        for _total_tokens, running_req in low_priority_reqs:
-            kicked_reqs.append(running_req)
-            self.rem_total_token_offset -= self._get_running_request_total_token_offset(
-                running_req
-            )
-            ref_aware_budget = self._rem_total_tokens_ref_aware(is_high=True)
-            if total_tokens_needed < ref_aware_budget:
-                break
-
-        if total_tokens_needed >= self._rem_total_tokens_ref_aware(is_high=True):
-            for running_req in kicked_reqs:
-                self.rem_total_token_offset += (
-                    self._get_running_request_total_token_offset(running_req)
-                )
-            return False
-
-        kicked_set = set(kicked_reqs)
-        keep_indices = []
-        release_counter = 0
-        for i, running_req in enumerate(self.running_batch.reqs):
-            if running_req in kicked_set:
-                release_counter += 1
-                self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
-                )
-            else:
-                keep_indices.append(i)
-        self.running_batch.filter_batch(keep_indices=keep_indices)
-        self.preempt_list.extend(kicked_reqs)
         return True
