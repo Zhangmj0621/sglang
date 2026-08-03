@@ -1309,6 +1309,25 @@ class Req(ReqDllmMixin):
         )
 
 
+def is_prefill_result_stale(batch: Any, index: int, req: Req) -> bool:
+    """Return whether a prefill result belongs to an older Req generation.
+
+    Some focused tests and compatibility callers use batch-like objects rather
+    than ScheduleBatch, so absence of a snapshot preserves the pre-existing
+    ``is_retracted``-only behavior.  Real ScheduleBatch instances always carry
+    an aligned tuple enforced by ``__post_init__`` and batch mutation methods.
+    """
+
+    launch_retraction_counts = getattr(batch, "launch_retraction_counts", None)
+    if launch_retraction_counts is None:
+        return False
+    if len(launch_retraction_counts) != len(batch.reqs):
+        raise RuntimeError(
+            "launch_retraction_counts is not aligned with ScheduleBatch.reqs"
+        )
+    return launch_retraction_counts[index] != getattr(req, "retraction_count", 0)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1331,6 +1350,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
+
+    # Immutable request-generation snapshot captured for this launch.  A Req is
+    # intentionally shared across overlap batches, so ``is_retracted`` alone
+    # cannot identify a late result after that same Req has been readmitted.
+    launch_retraction_counts: Optional[Tuple[int, ...]] = None
+
+    # Admission-granted high-ref eviction budget for this prefill batch.
+    authorized_high_full_shortfall: int = 0
+    authorized_high_mamba_shortfall: int = 0
+    remaining_high_full_authorization: int = 0
+    remaining_high_mamba_authorization: int = 0
+    actual_high_full_evicted: int = 0
+    actual_high_mamba_evicted: int = 0
+
+    # Immutable admission-ledger snapshot used only for fail-loud allocation
+    # diagnostics. ``None`` means the caller did not originate from the
+    # ref-aware PrefillAdder path.
+    admission_reserved_full_current: Optional[int] = None
+    admission_reserved_full_future: Optional[int] = None
+    admission_reserved_req_slots: Optional[int] = None
+    admission_reserved_mamba_states: Optional[int] = None
+    diagnostic_active_chunked_req: Optional[Req] = None
+    diagnostic_deferred_chunked_req: Optional[Req] = None
+    diagnostic_new_chunked_req: Optional[Req] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1440,6 +1483,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
+    def __post_init__(self):
+        if self.launch_retraction_counts is None:
+            self.launch_retraction_counts = tuple(
+                getattr(req, "retraction_count", 0) for req in self.reqs
+            )
+        else:
+            self.launch_retraction_counts = tuple(self.launch_retraction_counts)
+
+        if len(self.launch_retraction_counts) != len(self.reqs):
+            raise ValueError(
+                "launch_retraction_counts must stay aligned with ScheduleBatch.reqs"
+            )
+
     @classmethod
     def init_new(
         cls,
@@ -1452,6 +1508,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        authorized_high_full_shortfall: int = 0,
+        authorized_high_mamba_shortfall: int = 0,
+        admission_reserved_full_current: Optional[int] = None,
+        admission_reserved_full_future: Optional[int] = None,
+        admission_reserved_req_slots: Optional[int] = None,
+        admission_reserved_mamba_states: Optional[int] = None,
+        diagnostic_active_chunked_req: Optional[Req] = None,
+        diagnostic_deferred_chunked_req: Optional[Req] = None,
+        diagnostic_new_chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1461,6 +1526,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return cls(
             reqs=reqs,
+            launch_retraction_counts=tuple(
+                getattr(req, "retraction_count", 0) for req in reqs
+            ),
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -1477,6 +1545,142 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
+            authorized_high_full_shortfall=authorized_high_full_shortfall,
+            authorized_high_mamba_shortfall=authorized_high_mamba_shortfall,
+            remaining_high_full_authorization=authorized_high_full_shortfall,
+            remaining_high_mamba_authorization=authorized_high_mamba_shortfall,
+            admission_reserved_full_current=admission_reserved_full_current,
+            admission_reserved_full_future=admission_reserved_full_future,
+            admission_reserved_req_slots=admission_reserved_req_slots,
+            admission_reserved_mamba_states=admission_reserved_mamba_states,
+            diagnostic_active_chunked_req=diagnostic_active_chunked_req,
+            diagnostic_deferred_chunked_req=diagnostic_deferred_chunked_req,
+            diagnostic_new_chunked_req=diagnostic_new_chunked_req,
+        )
+
+    def capture_allocation_request_reuse(self) -> List[Dict[str, Any]]:
+        """Snapshot ownership before allocation mutates request fields."""
+        return [
+            {
+                "rid": getattr(req, "rid", None),
+                "priority": getattr(req, "priority", None),
+                "req_slot_reuse": getattr(req, "req_pool_idx", None) is not None,
+                "mamba_main_reuse": getattr(req, "mamba_pool_idx", None) is not None,
+                "mamba_ping_pong_reuse": (
+                    getattr(req, "mamba_ping_pong_track_buffer", None) is not None
+                ),
+            }
+            for req in self.reqs
+        ]
+
+    def build_ref_aware_allocation_diagnostic(
+        self,
+        *,
+        stage: str,
+        full_required: int,
+        req_slots_required: int,
+        mamba_required: int,
+        request_reuse: List[Dict[str, Any]],
+    ) -> str:
+        """Build the unified admission/allocation ledger-drift report."""
+
+        def call_or_none(obj, method_name, *args, **kwargs):
+            method = getattr(obj, method_name, None)
+            if method is None:
+                return None
+            try:
+                return int(method(*args, **kwargs))
+            except Exception:
+                # Diagnostics must retain the original allocation failure even
+                # if a counter interface is unavailable on a cache variant.
+                return None
+
+        def tiers(method_name):
+            unused = call_or_none(
+                self.tree_cache,
+                method_name,
+                allow_low=False,
+                allow_high=False,
+            )
+            safe = call_or_none(
+                self.tree_cache,
+                method_name,
+                allow_low=True,
+                allow_high=False,
+            )
+            all_evictable = call_or_none(
+                self.tree_cache,
+                method_name,
+                allow_low=True,
+                allow_high=True,
+            )
+            low = None if unused is None or safe is None else max(0, safe - unused)
+            high = (
+                None
+                if safe is None or all_evictable is None
+                else max(0, all_evictable - safe)
+            )
+            return unused, low, high
+
+        full_available = call_or_none(self.token_to_kv_pool_allocator, "available_size")
+        req_slots_available = call_or_none(self.req_to_token_pool, "available_size")
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        mamba_available = call_or_none(mamba_pool, "available_size")
+        full_unused, full_low, full_high = tiers("safe_evictable_size_by_tier")
+        mamba_unused, mamba_low, mamba_high = tiers("mamba_evictable_size_by_tier")
+
+        request_text = ",".join(
+            "{"
+            f"rid={item['rid']!r},priority={item['priority']!r},"
+            f"req_slot_reuse={item['req_slot_reuse']},"
+            f"mamba_main_reuse={item['mamba_main_reuse']},"
+            f"mamba_ping_pong_reuse={item['mamba_ping_pong_reuse']}"
+            "}"
+            for item in request_reuse
+        )
+
+        def owner_rid(req):
+            return None if req is None else getattr(req, "rid", None)
+
+        return (
+            "Ref-aware allocation ledger drift after successful admission: "
+            f"stage={stage}; "
+            "resources={"
+            f"full={{required={full_required},"
+            "reserved_current="
+            f"{getattr(self, 'admission_reserved_full_current', None)},"
+            "reserved_future="
+            f"{getattr(self, 'admission_reserved_full_future', None)},"
+            f"available={full_available},unused_evictable={full_unused},"
+            f"low_evictable={full_low},high_evictable={full_high}}},"
+            f"req_slots={{required={req_slots_required},"
+            "reserved="
+            f"{getattr(self, 'admission_reserved_req_slots', None)},"
+            f"available={req_slots_available},unused_evictable=0,"
+            "low_evictable=0,high_evictable=0},"
+            f"mamba={{required={mamba_required},"
+            "reserved="
+            f"{getattr(self, 'admission_reserved_mamba_states', None)},"
+            f"available={mamba_available},unused_evictable={mamba_unused},"
+            f"low_evictable={mamba_low},high_evictable={mamba_high}}}"
+            "}; "
+            f"requests=[{request_text}]; "
+            "chunk_owners={"
+            f"active={owner_rid(getattr(self, 'diagnostic_active_chunked_req', None))!r},"
+            f"deferred={owner_rid(getattr(self, 'diagnostic_deferred_chunked_req', None))!r},"
+            f"new={owner_rid(getattr(self, 'diagnostic_new_chunked_req', None))!r},"
+            f"batch={owner_rid(getattr(self, 'chunked_req', None))!r}"
+            "}; "
+            "authorization={"
+            "full={original="
+            f"{getattr(self, 'authorized_high_full_shortfall', None)},"
+            "remaining="
+            f"{getattr(self, 'remaining_high_full_authorization', None)}}},"
+            "mamba={original="
+            f"{getattr(self, 'authorized_high_mamba_shortfall', None)},"
+            "remaining="
+            f"{getattr(self, 'remaining_high_mamba_authorization', None)}}}"
+            "}"
         )
 
     def batch_size(self):
@@ -1563,6 +1767,45 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
+    def _collect_deferred_mamba_cow(self) -> List[Tuple[Req, Any]]:
+        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
+
+        if not (
+            isinstance(self.tree_cache, RefAwareCacheCore)
+            and self.tree_cache.supports_mamba()
+        ):
+            return []
+
+        return [
+            (req, req.last_node)
+            for req in self.reqs
+            if req.mamba_pool_idx is None
+            and req.last_node is not None
+            and req.last_node.mamba_value is not None
+        ]
+
+    def _materialize_deferred_mamba_cow(
+        self, deferred_cow: List[Tuple[Req, Any]]
+    ) -> None:
+        if not deferred_cow:
+            return
+
+        pool = self.req_to_token_pool.mamba_pool
+        for req, source_node in deferred_cow:
+            assert (
+                req.mamba_pool_idx is not None
+            ), "Mamba main state is missing after successful request allocation"
+            assert (
+                source_node.mamba_value is not None
+            ), "Deferred Mamba COW source disappeared while admission lock was held"
+            assert (
+                source_node.mamba_lock_ref > 0
+            ), "Deferred Mamba COW source must remain lock-protected through copy"
+            pool.copy_from(
+                source_node.mamba_value,
+                req.mamba_pool_idx.unsqueeze(-1),
+            )
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -1617,21 +1860,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory
-        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
+        deferred_mamba_cow = self._collect_deferred_mamba_cow()
 
-        if isinstance(self.tree_cache, RefAwareCacheCore):
-            allow_high = any(
-                self.tree_cache.is_high_priority(req.priority or 0) for req in reqs
-            )
-            with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
-                out_cache_loc, req_pool_indices_tensor, req_pool_indices = (
-                    alloc_for_extend(self)
-                )
-        else:
-            out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-                self
-            )
+        # Allocation consumes only the explicit admission authorization carried
+        # by this batch; request priority mix is not an eviction permission.
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+            self
+        )
+
+        self._materialize_deferred_mamba_cow(deferred_mamba_cow)
 
         # Set fields
         input_embeds = []
@@ -2295,6 +2532,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.launch_retraction_counts = ()
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2312,6 +2550,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        self.launch_retraction_counts = tuple(
+            self.launch_retraction_counts[i] for i in keep_indices
+        )
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -2392,6 +2633,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        self.launch_retraction_counts = (
+            self.launch_retraction_counts + other.launch_retraction_counts
+        )
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
@@ -2489,6 +2733,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # merge_batch) on the original don't corrupt this snapshot.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            launch_retraction_counts=self.launch_retraction_counts,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,

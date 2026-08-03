@@ -18,13 +18,24 @@ except Exception:
     pass
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
+from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.mamba_radix_cache import (
+    MambaChunkStashResult,
+    MambaRadixCache,
+    TreeNode,
+)
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     get_child_key,
 )
 from sglang.srt.mem_cache.ref_aware_mamba_radix_cache import RefAwareMambaRadixCache
+from sglang.srt.utils.common import (
+    get_extend_allocation_size,
+    get_full_kv_reservation,
+    get_num_new_pages,
+)
 
 
 class _FakeAllocator:
@@ -71,6 +82,408 @@ class _FakeMambaPool:
 
     def copy_from(self, src, dst):
         pass
+
+
+class _FakeStashReqPool:
+    def __init__(self, mamba_pool, max_context_len=32):
+        self.mamba_pool = mamba_pool
+        self.req_to_token = torch.full((2, max_context_len), -1, dtype=torch.int64)
+        self.req_index_to_mamba_index_mapping = torch.full((2,), -1, dtype=torch.int64)
+        self.enable_mamba_extra_buffer = True
+        self.mamba_ping_pong_track_buffer_size = 2
+        self.freed_req_slots = []
+
+    def get_mamba_indices(self, req_indices):
+        return self.req_index_to_mamba_index_mapping[req_indices]
+
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
+
+    def mamba_state_need(self, req):
+        return int(req.mamba_pool_idx is None) + (
+            2 if req.mamba_ping_pong_track_buffer is None else 0
+        )
+
+    def free_mamba_cache(self, req, mamba_ping_pong_track_buffer_to_keep=None):
+        if req.mamba_pool_idx is not None:
+            self.mamba_pool.free(req.mamba_pool_idx.unsqueeze(0))
+            req.mamba_pool_idx = None
+        if req.mamba_ping_pong_track_buffer is not None:
+            self.mamba_pool.free(req.mamba_ping_pong_track_buffer)
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
+
+    def free(self, req):
+        self.freed_req_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
+
+
+class _FakeHybridMambaPool:
+    def __init__(self, size, *, fail_alloc=False):
+        self.size = size
+        self.free_slots = torch.arange(1, size + 1, dtype=torch.int64)
+        self.fail_alloc = fail_alloc
+
+    def alloc(self, n):
+        if self.fail_alloc or n > len(self.free_slots):
+            return None
+        selected = self.free_slots[:n]
+        self.free_slots = self.free_slots[n:]
+        return selected
+
+    def available_size(self):
+        return len(self.free_slots)
+
+
+class _FailOnceMapping:
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.fail_next_write = True
+
+    def __getitem__(self, index):
+        return self.tensor[index]
+
+    def __setitem__(self, index, value):
+        if self.fail_next_write:
+            self.fail_next_write = False
+            raise RuntimeError("injected mapping write failure")
+        self.tensor[index] = value
+
+
+def _make_req(
+    *,
+    req_pool_idx=None,
+    mamba_pool_idx=None,
+    mamba_ping_pong_track_buffer=None,
+    mamba_next_track_idx=None,
+    is_chunked=0,
+    kv_committed_len=0,
+):
+    return SimpleNamespace(
+        req_pool_idx=req_pool_idx,
+        mamba_pool_idx=mamba_pool_idx,
+        mamba_ping_pong_track_buffer=mamba_ping_pong_track_buffer,
+        mamba_next_track_idx=mamba_next_track_idx,
+        is_chunked=is_chunked,
+        kv_committed_len=kv_committed_len,
+    )
+
+
+def _make_hybrid_pool(
+    *,
+    req_slots,
+    mamba_slots,
+    enable_extra=True,
+    overlap=True,
+    fail_alloc=False,
+    fail_ping_mapping=False,
+):
+    pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
+    pool.size = 16
+    pool.free_slots = list(range(req_slots))
+    pool.enable_mamba_extra_buffer = enable_extra
+    pool.mamba_ping_pong_track_buffer_size = 2 if overlap else 1
+    pool.mamba_pool = _FakeHybridMambaPool(mamba_slots, fail_alloc=fail_alloc)
+    pool.req_index_to_mamba_index_mapping = torch.full(
+        (pool.size,), -1, dtype=torch.int32
+    )
+    pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.full(
+        (pool.size, pool.mamba_ping_pong_track_buffer_size),
+        -1,
+        dtype=torch.int32,
+    )
+    if fail_ping_mapping:
+        pool.req_index_to_mamba_ping_pong_track_buffer_mapping = _FailOnceMapping(
+            pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+        )
+    return pool
+
+
+class TestExactResourceDemand(unittest.TestCase):
+    def test_req_slot_and_mamba_demand_matrix_with_overlap(self):
+        pool = _make_hybrid_pool(req_slots=8, mamba_slots=16, overlap=True)
+        main = torch.tensor(11)
+        ping_pong = torch.tensor([12, 13])
+        cases = [
+            (_make_req(), 1, 3),
+            (_make_req(req_pool_idx=1, is_chunked=1), 0, 3),
+            (_make_req(mamba_pool_idx=main), 1, 2),
+            (_make_req(mamba_ping_pong_track_buffer=ping_pong), 1, 1),
+            (
+                _make_req(
+                    mamba_pool_idx=main,
+                    mamba_ping_pong_track_buffer=ping_pong,
+                ),
+                1,
+                0,
+            ),
+            (
+                _make_req(
+                    req_pool_idx=1,
+                    mamba_pool_idx=main,
+                    mamba_ping_pong_track_buffer=ping_pong,
+                    is_chunked=1,
+                ),
+                0,
+                0,
+            ),
+        ]
+        for req, req_slot_need, mamba_need in cases:
+            with self.subTest(req=req):
+                self.assertEqual(pool.req_slot_need(req), req_slot_need)
+                self.assertEqual(pool.mamba_state_need(req), mamba_need)
+
+        self.assertEqual(pool.req_slots_need([req for req, _, _ in cases]), 4)
+        self.assertEqual(pool.mamba_states_need([req for req, _, _ in cases]), 9)
+
+    def test_mamba_demand_without_overlap(self):
+        pool = _make_hybrid_pool(
+            req_slots=8, mamba_slots=16, enable_extra=True, overlap=False
+        )
+        main = torch.tensor(11)
+        ping_pong = torch.tensor([12])
+        self.assertEqual(pool.mamba_state_need(_make_req()), 2)
+        self.assertEqual(pool.mamba_state_need(_make_req(mamba_pool_idx=main)), 1)
+        self.assertEqual(
+            pool.mamba_state_need(_make_req(mamba_ping_pong_track_buffer=ping_pong)),
+            1,
+        )
+        self.assertEqual(
+            pool.mamba_state_need(
+                _make_req(
+                    mamba_pool_idx=main,
+                    mamba_ping_pong_track_buffer=ping_pong,
+                )
+            ),
+            0,
+        )
+
+    def test_mamba_demand_without_extra_buffer_only_charges_main(self):
+        pool = _make_hybrid_pool(
+            req_slots=8, mamba_slots=16, enable_extra=False, overlap=True
+        )
+        self.assertEqual(pool.mamba_state_need(_make_req()), 1)
+        self.assertEqual(
+            pool.mamba_state_need(_make_req(mamba_pool_idx=torch.tensor(11))),
+            0,
+        )
+
+    def test_full_kv_page_size_one_separates_current_and_future(self):
+        reservation = get_full_kv_reservation(
+            prefix_len=7,
+            extend_input_len=5,
+            page_size=1,
+            max_new_tokens_reservation=2,
+        )
+        self.assertEqual(reservation.current_allocation, 5)
+        self.assertEqual(reservation.future_reservation, 2)
+        self.assertEqual(reservation.total, 7)
+
+    def test_paged_extend_reservation_matches_allocator_preflight(self):
+        page_size = 4
+        for prefix_lens, extend_lens in [
+            ([0], [4]),
+            ([4], [1]),
+            ([3], [1]),
+            ([3], [2]),
+            ([0, 3, 4], [1, 2, 4]),
+        ]:
+            seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+            allocator_pages = get_num_new_pages(
+                seq_lens=torch.tensor(seq_lens, dtype=torch.int64),
+                prefix_lens=torch.tensor(prefix_lens, dtype=torch.int64),
+                page_size=page_size,
+            )
+            with self.subTest(prefix_lens=prefix_lens, extend_lens=extend_lens):
+                self.assertEqual(
+                    get_extend_allocation_size(
+                        prefix_lens=prefix_lens,
+                        extend_lens=extend_lens,
+                        page_size=page_size,
+                    ),
+                    allocator_pages * page_size,
+                )
+
+    def test_paged_reservation_accounts_only_for_pages_actually_needed(self):
+        # Filling the already allocated partial page needs no additional pool unit.
+        aligned = get_full_kv_reservation(4, 1, 4)
+        unaligned = get_full_kv_reservation(3, 1, 4)
+        self.assertEqual(aligned.current_allocation, 4)
+        self.assertEqual(unaligned.current_allocation, 0)
+
+        intermediate = get_full_kv_reservation(4, 1, 4, 0)
+        final = get_full_kv_reservation(4, 1, 4, 4)
+        self.assertEqual(intermediate.future_reservation, 0)
+        self.assertEqual(final.future_reservation, 4)
+
+    def test_decode_page_count_keeps_existing_allocator_semantics(self):
+        seq_lens = torch.tensor([1, 4, 5, 8, 9], dtype=torch.int64)
+        self.assertEqual(
+            get_num_new_pages(seq_lens=seq_lens, page_size=4, decode=True),
+            3,
+        )
+
+
+class TestBaseReqAllocation(unittest.TestCase):
+    def test_base_pool_allocates_new_and_reuses_committed_slots(self):
+        pool = ReqToTokenPool.__new__(ReqToTokenPool)
+        pool.free_slots = [0]
+        new_req = _make_req()
+        reused_req = _make_req(req_pool_idx=7, kv_committed_len=1)
+
+        self.assertEqual(pool.alloc([new_req, reused_req]), [0, 7])
+        self.assertEqual(pool.free_slots, [])
+
+    def test_base_pool_keeps_reuse_validation(self):
+        pool = ReqToTokenPool.__new__(ReqToTokenPool)
+        pool.free_slots = [0]
+        invalid_reuse = _make_req(req_pool_idx=7)
+
+        with self.assertRaisesRegex(AssertionError, "chunked or have committed KV"):
+            pool.alloc([invalid_reuse])
+
+
+class TestHybridReqAllocationAtomicity(unittest.TestCase):
+    def test_req_slot_capacity_failure_mutates_nothing(self):
+        pool = _make_hybrid_pool(req_slots=0, mamba_slots=3)
+        req = _make_req()
+        mamba_free_before = pool.mamba_pool.free_slots.clone()
+
+        self.assertIsNone(pool.alloc([req]))
+        self.assertEqual(pool.free_slots, [])
+        self.assertTrue(torch.equal(pool.mamba_pool.free_slots, mamba_free_before))
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_next_track_idx)
+
+    def test_mamba_capacity_failure_mutates_nothing(self):
+        pool = _make_hybrid_pool(req_slots=1, mamba_slots=2)
+        req = _make_req()
+        req_free_before = list(pool.free_slots)
+        mamba_free_before = pool.mamba_pool.free_slots.clone()
+
+        self.assertIsNone(pool.alloc([req]))
+        self.assertEqual(pool.free_slots, req_free_before)
+        self.assertTrue(torch.equal(pool.mamba_pool.free_slots, mamba_free_before))
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_next_track_idx)
+
+    def test_mixed_reused_and_new_requests_charge_only_missing_state(self):
+        pool = _make_hybrid_pool(req_slots=1, mamba_slots=3)
+        existing_main = torch.tensor(50)
+        existing_ping_pong = torch.tensor([51, 52])
+        reused = _make_req(
+            req_pool_idx=7,
+            mamba_pool_idx=existing_main,
+            is_chunked=1,
+        )
+        new = _make_req(mamba_ping_pong_track_buffer=existing_ping_pong)
+
+        self.assertEqual(pool.alloc([reused, new]), [7, 0])
+        self.assertEqual(pool.free_slots, [])
+        self.assertEqual(pool.mamba_pool.available_size(), 0)
+        self.assertIs(reused.mamba_pool_idx, existing_main)
+        self.assertIs(new.mamba_ping_pong_track_buffer, existing_ping_pong)
+
+    def test_exact_fit_allocation_succeeds(self):
+        pool = _make_hybrid_pool(req_slots=1, mamba_slots=3)
+        req = _make_req()
+
+        self.assertEqual(pool.alloc([req]), [0])
+        self.assertEqual(pool.free_slots, [])
+        self.assertEqual(pool.mamba_pool.available_size(), 0)
+        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertEqual(len(req.mamba_ping_pong_track_buffer), 2)
+        self.assertEqual(req.mamba_next_track_idx, 0)
+
+    def test_non_extra_buffer_allocation_only_consumes_main_state(self):
+        pool = _make_hybrid_pool(req_slots=1, mamba_slots=1, enable_extra=False)
+        req = _make_req()
+
+        self.assertEqual(pool.alloc([req]), [0])
+        self.assertEqual(pool.mamba_pool.available_size(), 0)
+        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_next_track_idx)
+
+    def test_chunk_continuation_reuses_every_mapping(self):
+        pool = _make_hybrid_pool(req_slots=2, mamba_slots=4)
+        main = torch.tensor(50)
+        ping_pong = torch.tensor([51, 52])
+        req = _make_req(
+            req_pool_idx=7,
+            mamba_pool_idx=main,
+            mamba_ping_pong_track_buffer=ping_pong,
+            mamba_next_track_idx=1,
+            is_chunked=1,
+        )
+        req_free_before = list(pool.free_slots)
+        mamba_free_before = pool.mamba_pool.free_slots.clone()
+
+        self.assertEqual(pool.alloc([req]), [7])
+        self.assertEqual(pool.free_slots, req_free_before)
+        self.assertTrue(torch.equal(pool.mamba_pool.free_slots, mamba_free_before))
+        self.assertIs(req.mamba_pool_idx, main)
+        self.assertIs(req.mamba_ping_pong_track_buffer, ping_pong)
+        self.assertEqual(req.mamba_next_track_idx, 1)
+
+    def test_impossible_post_preflight_failure_rolls_back_and_raises(self):
+        pool = _make_hybrid_pool(
+            req_slots=1, mamba_slots=3, enable_extra=True, fail_alloc=True
+        )
+        req = _make_req()
+        req_free_before = list(pool.free_slots)
+        mamba_free_before = pool.mamba_pool.free_slots.clone()
+
+        with self.assertRaisesRegex(RuntimeError, "HybridReqToTokenPool allocation"):
+            pool.alloc([req])
+
+        self.assertEqual(pool.free_slots, req_free_before)
+        self.assertTrue(torch.equal(pool.mamba_pool.free_slots, mamba_free_before))
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_next_track_idx)
+
+    def test_post_mutation_failure_restores_free_lists_fields_and_mappings(self):
+        pool = _make_hybrid_pool(
+            req_slots=1,
+            mamba_slots=3,
+            enable_extra=True,
+            fail_ping_mapping=True,
+        )
+        req = _make_req()
+        req_free_before = list(pool.free_slots)
+        mamba_free_before = pool.mamba_pool.free_slots.clone()
+        main_mapping_before = pool.req_index_to_mamba_index_mapping.clone()
+        ping_mapping_before = (
+            pool.req_index_to_mamba_ping_pong_track_buffer_mapping.tensor.clone()
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "HybridReqToTokenPool allocation"):
+            pool.alloc([req])
+
+        self.assertEqual(pool.free_slots, req_free_before)
+        self.assertTrue(torch.equal(pool.mamba_pool.free_slots, mamba_free_before))
+        self.assertTrue(
+            torch.equal(
+                pool.req_index_to_mamba_index_mapping,
+                main_mapping_before,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                pool.req_index_to_mamba_ping_pong_track_buffer_mapping.tensor,
+                ping_mapping_before,
+            )
+        )
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_next_track_idx)
 
 
 def _make_plain_mamba_cache():
@@ -140,12 +553,14 @@ class TestMambaBaseSeams(unittest.TestCase):
         self.assertIsNone(cache._account_mamba_refill_evictable(TreeNode()))
 
 
-def _make_cache():
+def _make_cache(mamba_slots=64):
     cache = RefAwareMambaRadixCache.__new__(RefAwareMambaRadixCache)
     cache._init_ref_aware_state(
         SimpleNamespace(high_priority_threshold=1, enable_priority_scheduling=True)
     )
-    cache.req_to_token_pool = SimpleNamespace(mamba_pool=_FakeMambaPool())
+    cache.req_to_token_pool = SimpleNamespace(
+        mamba_pool=_FakeMambaPool(size=mamba_slots)
+    )
     cache.token_to_kv_pool_allocator = _FakeAllocator()
     cache.page_size = 1
     cache.disable = False
@@ -404,104 +819,327 @@ class TestMambaTieredEviction(unittest.TestCase):
         _assert_conservation(self, cache)
 
 
-class TestOOMEscalation(unittest.TestCase):
+class TestMambaTombstoneBoundary(unittest.TestCase):
+    def test_safe_eviction_preserves_every_reusable_high_node_and_rid(self):
+        cache = _make_cache()
+        high_parent = _insert(cache, [1, 2]).last_node
+        high_leaf = _insert(cache, [1, 2, 3, 4]).last_node
+        cache.register_ref(
+            SimpleNamespace(rid="high-chain", priority=1, last_node=high_leaf)
+        )
+        safe_leaf = _insert(cache, [9, 10]).last_node
+
+        tracked_nodes = set(cache.rid_to_ref_info["high-chain"].nodes)
+        self.assertEqual(tracked_nodes, {high_parent, high_leaf})
+        high_states = {
+            high_parent: high_parent.mamba_value,
+            high_leaf: high_leaf.mamba_value,
+        }
+        high_tiers_before = (
+            cache.full_high_ref_evictable_size_,
+            cache.mamba_high_ref_evictable_size_,
+        )
+
+        self.assertEqual(cache.evict_mamba(99, allow_low=True, allow_high=False), 1)
+        self.assertNotIn(safe_leaf.id, cache.mamba_lru_list.cache)
+        self.assertEqual(cache.evict_full(99, allow_low=True, allow_high=False), 0)
+
+        for node, state in high_states.items():
+            self.assertIs(node.mamba_value, state)
+            self.assertIn(node.id, cache.full_lru_list.cache)
+            self.assertIn(node.id, cache.mamba_lru_list.cache)
+            self.assertIn("high-chain", node.tracked_rids)
+        self.assertIs(high_parent.children[get_child_key(RadixKey([3, 4]))], high_leaf)
+        self.assertEqual(cache.rid_to_ref_info["high-chain"].nodes, tracked_nodes)
+        self.assertEqual(
+            (
+                cache.full_high_ref_evictable_size_,
+                cache.mamba_high_ref_evictable_size_,
+            ),
+            high_tiers_before,
+        )
+        _assert_conservation(self, cache)
+        cache._sanity_check_tier_counters()
+
+    def test_high_metadata_tombstone_cascades_after_safe_child_deletion(self):
+        cache = _make_cache()
+        tombstone = _insert(cache, [1, 2]).last_node
+        safe_child = _insert(cache, [1, 2, 3, 4]).last_node
+        cache.register_ref(
+            SimpleNamespace(rid="stale-high", priority=1, last_node=tombstone)
+        )
+        _set_ref(cache, safe_child, high=1)
+
+        # Make the internal high-ref node a tombstone while its child keeps it
+        # structurally reachable.  The child is temporarily high only to make
+        # the high-tier LRU pass select the older internal node first.
+        self.assertEqual(cache.evict_mamba(1, allow_low=False, allow_high=True), 1)
+        self.assertIsNone(tombstone.mamba_value)
+        self.assertIn("stale-high", tombstone.tracked_rids)
+        cache._dec_priority_ref_single(safe_child, True)
+
+        full_before = cache.full_evictable_size_
+        mamba_before = cache.mamba_evictable_size_
+        freed_full_before = cache.token_to_kv_pool_allocator.freed_total
+        freed_mamba_before = len(cache.req_to_token_pool.mamba_pool.freed)
+
+        # Deleting the now-unused child exposes a childless tombstone.  Its
+        # stale high-ref metadata must not prevent structural GC.
+        self.assertEqual(cache.evict_full(1, allow_low=True, allow_high=False), 4)
+
+        self.assertEqual(cache.root_node.children, {})
+        self.assertEqual(full_before, 4)
+        self.assertEqual(mamba_before, 1)
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed_total - freed_full_before, 4
+        )
+        self.assertEqual(
+            len(cache.req_to_token_pool.mamba_pool.freed) - freed_mamba_before, 1
+        )
+        self.assertEqual(cache.rid_to_ref_info["stale-high"].nodes, set())
+        self.assertEqual(tombstone.tracked_rids, set())
+        _assert_conservation(self, cache)
+        cache._sanity_check_tier_counters()
+
+    def test_unused_high_authorization_does_not_delete_reusable_high_parent(self):
+        cache = _make_cache()
+        reusable_high = _insert(cache, [1, 2]).last_node
+        safe_child = _insert(cache, [1, 2, 3, 4]).last_node
+        cache.register_ref(
+            SimpleNamespace(rid="reusable-high", priority=1, last_node=reusable_high)
+        )
+        high_state = reusable_high.mamba_value
+        high_full_value = reusable_high.value
+
+        # Force a one-token allocator shortfall.  The safe child satisfies it
+        # at radix-leaf granularity, so the available high authorization must
+        # remain unused and cannot turn the still-reusable parent into GC.
+        cache.token_to_kv_pool_allocator.size = (
+            cache.token_to_kv_pool_allocator._next
+            - cache.token_to_kv_pool_allocator.freed_total
+        )
+        high_evicted = evict_from_tree_cache(cache, 1, high_authorization=1)
+
+        self.assertEqual(high_evicted, 0)
+        self.assertIs(reusable_high.mamba_value, high_state)
+        self.assertIs(reusable_high.value, high_full_value)
+        self.assertEqual(reusable_high.children, {})
+        self.assertIn(reusable_high.id, cache.full_lru_list.cache)
+        self.assertIn(reusable_high.id, cache.mamba_lru_list.cache)
+        self.assertEqual(cache.rid_to_ref_info["reusable-high"].nodes, {reusable_high})
+        self.assertEqual(reusable_high.tracked_rids, {"reusable-high"})
+        self.assertNotIn(safe_child.id, cache.full_lru_list.cache)
+        _assert_conservation(self, cache)
+        cache._sanity_check_tier_counters()
+
+
+class TestBestEffortChunkStash(unittest.TestCase):
+    def _make_live_req_with_only_high_evictable(self, *, priority=0):
+        cache = _make_cache(mamba_slots=5)
+        prefix = _insert(cache, [1, 2]).last_node
+        high = _insert(cache, [9, 10]).last_node
+        _set_ref(cache, high, high=1)
+        cache.inc_lock_ref(prefix)
+
+        req_pool = _FakeStashReqPool(cache.req_to_token_pool.mamba_pool)
+        cache.req_to_token_pool = req_pool
+        live_main = req_pool.mamba_pool.alloc(1)[0]
+        live_ping_pong = req_pool.mamba_pool.alloc(2)
+        self.assertEqual(req_pool.mamba_pool.available_size(), 0)
+        req_pool.req_index_to_mamba_index_mapping[0] = live_main
+        suffix_indices = cache.token_to_kv_pool_allocator.alloc(2)
+        live_indices = torch.cat([prefix.value, suffix_indices])
+        req_pool.req_to_token[0, :4] = live_indices
+
+        req = SimpleNamespace(
+            rid="live-chunk",
+            priority=priority,
+            req_pool_idx=0,
+            fill_ids=[1, 2, 3, 4],
+            origin_input_ids=[1, 2, 3, 4, 5, 6],
+            output_ids=[],
+            extra_key=None,
+            prefix_indices=prefix.value.clone(),
+            cache_protected_len=2,
+            mamba_last_track_seqlen=4,
+            mamba_pool_idx=live_main,
+            mamba_ping_pong_track_buffer=live_ping_pong,
+            mamba_next_track_idx=1,
+            last_node=prefix,
+        )
+        return cache, req, prefix, high, live_indices
+
+    def test_only_high_ref_capacity_returns_live_fallback_without_mutation(self):
+        cache, req, prefix, high, live_indices = (
+            self._make_live_req_with_only_high_evictable()
+        )
+        high_state = high.mamba_value
+        high_full_before = cache.full_high_ref_evictable_size_
+        high_mamba_before = cache.mamba_high_ref_evictable_size_
+        main_before = req.mamba_pool_idx
+        ping_pong_before = req.mamba_ping_pong_track_buffer
+        lock_before = (prefix.full_lock_ref, prefix.mamba_lock_ref)
+
+        result = cache.cache_unfinished_req(req, chunked=True)
+
+        self.assertIs(result, MambaChunkStashResult.LIVE_PREFIX_FALLBACK)
+        self.assertTrue(torch.equal(req.prefix_indices, live_indices))
+        self.assertIs(req.last_node, prefix)
+        self.assertEqual(req.cache_protected_len, 2)
+        self.assertEqual(req.mamba_last_track_seqlen, 4)
+        self.assertIs(req.mamba_pool_idx, main_before)
+        self.assertIs(req.mamba_ping_pong_track_buffer, ping_pong_before)
+        self.assertEqual(req.mamba_next_track_idx, 1)
+        self.assertEqual((prefix.full_lock_ref, prefix.mamba_lock_ref), lock_before)
+        self.assertIs(high.mamba_value, high_state)
+        self.assertEqual(cache.full_high_ref_evictable_size_, high_full_before)
+        self.assertEqual(cache.mamba_high_ref_evictable_size_, high_mamba_before)
+        self.assertEqual(cache.req_to_token_pool.mamba_state_need(req), 0)
+
+    def test_hp_stash_has_the_same_no_high_fallback(self):
+        cache, req, _prefix, high, _ = self._make_live_req_with_only_high_evictable(
+            priority=99
+        )
+        high_state = high.mamba_value
+
+        # Even an enclosing HP allocation scope must not leak into stash.
+        with cache.scoped_evict(allow_low=True, allow_high=True):
+            result = cache.cache_unfinished_req(req, chunked=True)
+
+        self.assertIs(result, MambaChunkStashResult.LIVE_PREFIX_FALLBACK)
+        self.assertIs(high.mamba_value, high_state)
+        self.assertEqual(cache.mamba_high_ref_evictable_size_, 1)
+
+    def test_later_chunk_retries_and_inserts_a_longer_snapshot(self):
+        cache, req, old_node, high, _ = self._make_live_req_with_only_high_evictable()
+        self.assertIs(
+            cache.cache_unfinished_req(req, chunked=True),
+            MambaChunkStashResult.LIVE_PREFIX_FALLBACK,
+        )
+
+        cache.req_to_token_pool.mamba_pool.free(torch.tensor([17]))
+        req.fill_ids.extend([5, 6])
+        suffix_indices = cache.token_to_kv_pool_allocator.alloc(2)
+        cache.req_to_token_pool.req_to_token[0, 4:6] = suffix_indices
+
+        result = cache.cache_unfinished_req(req, chunked=True)
+
+        self.assertIs(result, MambaChunkStashResult.SNAPSHOT_INSERTED)
+        self.assertEqual(len(req.prefix_indices), 6)
+        self.assertEqual(req.cache_protected_len, 6)
+        self.assertIsNot(req.last_node, old_node)
+        # The new descendant lock continues to protect its full-KV ancestors,
+        # while Mamba ownership transfers to the new snapshot node only.
+        self.assertEqual(old_node.full_lock_ref, 1)
+        self.assertEqual(old_node.mamba_lock_ref, 0)
+        self.assertGreater(req.last_node.full_lock_ref, 0)
+        self.assertGreater(req.last_node.mamba_lock_ref, 0)
+        self.assertIsNotNone(high.mamba_value)
+        self.assertIsNone(req.mamba_last_track_seqlen)
+
+    def test_safe_low_ref_slot_is_used_for_snapshot(self):
+        cache = _make_cache(mamba_slots=3)
+        prefix = _insert(cache, [1]).last_node
+        low = _insert(cache, [8]).last_node
+        _set_ref(cache, low, low=1)
+        cache.inc_lock_ref(prefix)
+        req_pool = _FakeStashReqPool(cache.req_to_token_pool.mamba_pool)
+        cache.req_to_token_pool = req_pool
+        main = req_pool.mamba_pool.alloc(1)[0]
+        req_pool.req_index_to_mamba_index_mapping[0] = main
+        suffix = cache.token_to_kv_pool_allocator.alloc(1)
+        req_pool.req_to_token[0, :2] = torch.cat([prefix.value, suffix])
+        req = SimpleNamespace(
+            rid="safe-stash",
+            priority=0,
+            req_pool_idx=0,
+            fill_ids=[1, 2],
+            origin_input_ids=[1, 2, 3],
+            output_ids=[],
+            extra_key=None,
+            prefix_indices=prefix.value.clone(),
+            cache_protected_len=1,
+            mamba_last_track_seqlen=2,
+            mamba_pool_idx=main,
+            mamba_ping_pong_track_buffer=torch.tensor([30, 31]),
+            mamba_next_track_idx=0,
+            last_node=prefix,
+        )
+
+        result = cache.cache_unfinished_req(req, chunked=True)
+
+        self.assertIs(result, MambaChunkStashResult.SNAPSHOT_INSERTED)
+        self.assertNotIn(low.id, cache.mamba_lru_list.cache)
+        self.assertEqual(req.cache_protected_len, 2)
+
+    def test_fallback_then_hp_preemption_releases_all_live_ownership(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        cache, req, prefix, high, _ = self._make_live_req_with_only_high_evictable()
+        self.assertIs(
+            cache.cache_unfinished_req(req, chunked=True),
+            MambaChunkStashResult.LIVE_PREFIX_FALLBACK,
+        )
+        high_state = high.mamba_value
+        freed_kv_before = cache.token_to_kv_pool_allocator.freed_total
+        reset_calls = []
+        req.pop_committed_kv_cache = lambda: len(req.fill_ids)
+        req.pop_overallocated_kv_cache = lambda: (
+            len(req.fill_ids),
+            len(req.fill_ids),
+        )
+        req.reset_for_retract = lambda: reset_calls.append(True)
+        req.kv_committed_len = len(req.fill_ids)
+        req.kv_allocated_len = len(req.fill_ids)
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tree_cache = cache
+        scheduler.chunked_req = req
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.common.get_global_server_args",
+            return_value=SimpleNamespace(page_size=1, speculative_algorithm=None),
+        ):
+            scheduler._reclaim_deferred_chunk_for_high(req)
+
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertEqual(reset_calls, [True])
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertEqual(prefix.full_lock_ref, 0)
+        self.assertEqual(prefix.mamba_lock_ref, 0)
+        self.assertGreater(
+            cache.token_to_kv_pool_allocator.freed_total, freed_kv_before
+        )
+        self.assertIs(high.mamba_value, high_state)
+
+
+class TestNoHiddenEscalation(unittest.TestCase):
     def _drain_mamba_pool(self, cache):
         pool = cache.req_to_token_pool.mamba_pool
         while pool.available_size() > 0:
             pool.alloc(1)
 
-    def test_fork_escalates_to_high_tier_before_asserting(self):
+    def test_fork_never_escalates_to_high_tier(self):
         cache = _make_cache()
         r = _insert(cache, [1, 2, 3])
         _set_ref(cache, r.last_node, high=1)  # only evictable mamba is high
         self._drain_mamba_pool(cache)
         src = r.last_node.mamba_value
-        # default-scope eviction finds nothing; escalation must free the
-        # high-ref node's slot and let fork succeed
-        forked = cache._fork_mamba_with_evict(src)
-        self.assertIsNotNone(forked)
+        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
+            cache._fork_mamba_with_evict(src)
+        self.assertIsNotNone(r.last_node.mamba_value)
 
-    def test_cow_alloc_escalates_to_high_tier(self):
+    def test_cow_allocator_never_escalates_to_high_tier(self):
         cache = _make_cache()
         r_hot = _insert(cache, [1, 2, 3])
         _set_ref(cache, r_hot.last_node, high=1)
         r_target = _insert(cache, [9, 8, 7])
         _set_ref(cache, r_target.last_node, high=1)
         self._drain_mamba_pool(cache)
-        # target node is lock-protected inside the seam; the OTHER high node
-        # gets evicted
-        dst = cache._alloc_mamba_slot_with_evict(r_target.last_node)
-        self.assertIsNotNone(dst)
+        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
+            cache._alloc_mamba_slot_with_evict(r_target.last_node)
         self.assertIsNotNone(r_target.last_node.mamba_value)
-
-
-class TestCommonEscalatedEvict(unittest.TestCase):
-    def test_escalated_helper_is_noop_for_plain_cache(self):
-        from sglang.srt.mem_cache.common import _escalated_mamba_evict
-
-        cache = _make_plain_mamba_cache()
-        self.assertFalse(_escalated_mamba_evict(cache, mamba_num=1))
-
-    def test_escalated_helper_evicts_high_tier(self):
-        from sglang.srt.mem_cache.common import _escalated_mamba_evict
-
-        cache = _make_cache()
-        r = _insert(cache, [1, 2, 3])
-        _set_ref(cache, r.last_node, high=1)
-        self.assertTrue(_escalated_mamba_evict(cache, mamba_num=1))
-        self.assertEqual(cache.mamba_high_ref_evictable_size_, 0)
-
-
-class TestPrefillAdderMambaGate(unittest.TestCase):
-    def _make_adder(self, *, mamba_available, mamba_low, mamba_high):
-        from sglang.srt.managers.schedule_policy import PrefillAdder
-
-        adder = PrefillAdder.__new__(PrefillAdder)
-        cache = _make_cache()
-        cache.mamba_low_ref_evictable_size_ = mamba_low
-        cache.mamba_high_ref_evictable_size_ = mamba_high
-        cache.req_to_token_pool = SimpleNamespace(
-            mamba_pool=SimpleNamespace(available_size=lambda: mamba_available)
-        )
-        # generous full-token budget so only the mamba gate can reject
-        cache.full_unused_evictable_size_ = 10**6
-        cache.full_evictable_size_ = 10**6
-        adder.tree_cache = cache
-        adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: 10**6)
-        adder.rem_total_token_offset = 0
-        adder.is_hybrid_ssm_cache = True
-        adder.enable_ref_aware_kv_buffer = True
-        return adder
-
-    def test_lp_rejected_when_mamba_budget_short(self):
-        # MAMBA_STATE_PER_REQ_PREFIX_CACHE == 3; LP budget = 0 + 2 = 2 < 3
-        adder = self._make_adder(mamba_available=0, mamba_low=2, mamba_high=50)
-        req = SimpleNamespace(priority=0)
-        self.assertFalse(
-            adder._can_admit_ref_aware_req(req, req_is_high=False, total_tokens=10)
-        )
-
-    def test_hp_passes_gate_via_high_tier(self):
-        adder = self._make_adder(mamba_available=0, mamba_low=2, mamba_high=50)
-        req = SimpleNamespace(priority=1)
-        self.assertTrue(
-            adder._can_admit_ref_aware_req(req, req_is_high=True, total_tokens=10)
-        )
-
-    def test_lp_passes_when_mamba_budget_sufficient(self):
-        adder = self._make_adder(mamba_available=3, mamba_low=0, mamba_high=0)
-        req = SimpleNamespace(priority=0)
-        self.assertTrue(
-            adder._can_admit_ref_aware_req(req, req_is_high=False, total_tokens=10)
-        )
-
-    def test_non_ssm_cache_skips_mamba_gate(self):
-        adder = self._make_adder(mamba_available=0, mamba_low=0, mamba_high=0)
-        adder.is_hybrid_ssm_cache = False
-        req = SimpleNamespace(priority=0)
-        self.assertTrue(
-            adder._can_admit_ref_aware_req(req, req_is_high=False, total_tokens=10)
-        )
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
     ScheduleBatch,
+    is_prefill_result_stale,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
@@ -496,6 +497,20 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if is_prefill_result_stale(batch, i, req):
+                if batch.return_logprob:
+                    logprob_pt += (
+                        extend_input_len_per_req[i]
+                        - extend_logprob_start_len_per_req[i]
+                    )
+                continue
+            # An overlap result can arrive after a higher-priority request has
+            # retracted this chunk owner and released all of its pool state.
+            # Treat it like the standard prefill processor: the stale result
+            # must not cache or transfer through the released mapping.
+            if req.is_retracted:
+                continue
+
             if req.is_chunked <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -708,11 +723,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         return transferred_rids
 
-    def process_prefill_chunk(self: Scheduler) -> None:
+    def process_prefill_chunk(self: Scheduler):
         chunked_req_to_exclude = set()
+        stash_result = None
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            stash_result = self.stash_chunked_request(self.chunked_req)
             if self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
@@ -735,6 +751,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
+
+        return stash_result
 
     def send_kv_chunk(
         self: Scheduler,

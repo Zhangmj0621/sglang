@@ -372,44 +372,10 @@ class RefAwareMambaCacheMixin(RefAwareCacheCore):
             evicted += self._evict_mamba_one_tier(mamba_num - evicted, tier)
         return evicted
 
-    # ---- OOM escalation (last resort before crashing) ----
-
-    def _escalate_and_evict_mamba(self, mamba_num: int):
-        logger.warning(
-            "Ref-aware mamba cache: scoped eviction exhausted; escalating to "
-            "high-ref tier to avoid OOM (mamba_num=%d).",
-            mamba_num,
-        )
-        with self.scoped_evict(allow_low=True, allow_high=True):
-            self.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-
-    def _alloc_mamba_slot_with_evict(self, last_node):
-        pool = self.req_to_token_pool.mamba_pool
-        dst_index = pool.alloc(1)
-        if dst_index is None:
-            self.inc_lock_ref(last_node)
-            try:
-                self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                dst_index = pool.alloc(1)
-                if dst_index is None:
-                    self._escalate_and_evict_mamba(1)
-                    dst_index = pool.alloc(1)
-            finally:
-                self.dec_lock_ref(last_node)
-            assert dst_index is not None, "Can not alloc mamba cache"
-        return dst_index
-
-    def _fork_mamba_with_evict(self, mamba_value):
-        pool = self.req_to_token_pool.mamba_pool
-        forked = pool.fork_from(mamba_value)
-        if forked is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            forked = pool.fork_from(mamba_value)
-        if forked is None:
-            self._escalate_and_evict_mamba(1)
-            forked = pool.fork_from(mamba_value)
-        assert forked is not None, "Can not alloc mamba cache"
-        return forked
+    def _try_fork_mamba_for_chunk_stash(self, mamba_value):
+        """Best-effort stash always excludes high-ref cache, even in HP scope."""
+        with self.scoped_evict(allow_low=True, allow_high=False):
+            return super()._try_fork_mamba_for_chunk_stash(mamba_value)
 
     def _evict_mamba_one_tier(self, mamba_num: int, tier: int) -> int:
         evicted = 0

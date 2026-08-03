@@ -80,6 +80,16 @@ _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
+def req_slot_need(req: "Req") -> int:
+    """Return the number of missing request-to-token slots for ``req``."""
+    return int(req.req_pool_idx is None)
+
+
+def req_slots_need(reqs: List["Req"]) -> int:
+    """Return the exact aggregate request-slot demand for ``reqs``."""
+    return sum(req_slot_need(req) for req in reqs)
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -152,21 +162,30 @@ class ReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
-        # Indices of reqs that already have a req_pool_idx and will reuse
-        # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+    @staticmethod
+    def req_slot_need(req: "Req") -> int:
+        return req_slot_need(req)
+
+    @staticmethod
+    def req_slots_need(reqs: List["Req"]) -> int:
+        return req_slots_need(reqs)
+
+    @staticmethod
+    def _validate_reused_req_slots(reqs: List["Req"]) -> None:
+        reusing = [req for req in reqs if req.req_pool_idx is not None]
         # NOTE: this check is relaxed temporarily
         # https://github.com/sgl-project/sglang/pull/20476
         # if not any(r.is_dllm() for r in reqs):
         #     assert (
-        #         sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
+        #         sum(1 for r in reusing if r.is_chunked > 0) <= 1
         #     ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+            req.is_chunked > 0 or req.kv_committed_len > 0 for req in reusing
         ), "reusing request must be chunked or have committed KV"
 
-        need_size = len(reqs) - len(reusing)
+    def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
+        self._validate_reused_req_slots(reqs)
+        need_size = self.req_slots_need(reqs)
         if need_size > len(self.free_slots):
             return None
         select_index = self.free_slots[:need_size]
@@ -527,52 +546,144 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
+    def mamba_state_need(self, req: "Req") -> int:
+        need = int(req.mamba_pool_idx is None)
+        if self.enable_mamba_extra_buffer and req.mamba_ping_pong_track_buffer is None:
+            need += self.mamba_ping_pong_track_buffer_size
+        return need
+
+    def mamba_states_need(self, reqs: List["Req"]) -> int:
+        return sum(self.mamba_state_need(req) for req in reqs)
+
     def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
-        select_index = super().alloc(reqs)
-        if select_index is None:
+        if not reqs:
+            return []
+
+        # Keep the base validation for reused request slots, but perform it
+        # before any hybrid-pool mutation.
+        self._validate_reused_req_slots(reqs)
+        req_slot_needed = self.req_slots_need(reqs)
+        mamba_state_needed = self.mamba_states_need(reqs)
+        req_slots_available = len(self.free_slots)
+        mamba_states_available = self.mamba_pool.available_size()
+        if (
+            req_slot_needed > req_slots_available
+            or mamba_state_needed > mamba_states_available
+        ):
             return None
 
-        mamba_indices: list[torch.Tensor] = []
-        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
-        for req in reqs:
-            mid = None
-            if req.mamba_pool_idx is not None:  # for radix cache
-                mid = req.mamba_pool_idx
-            else:
-                mid = self.mamba_pool.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
-                mid = mid[0]
-                req.mamba_pool_idx = mid
-            mamba_indices.append(mid)
+        original_req_free_slots = list(self.free_slots)
+        original_mamba_free_slots = self.mamba_pool.free_slots.clone()
+        original_req_fields = [
+            (
+                req.req_pool_idx,
+                req.mamba_pool_idx,
+                req.mamba_ping_pong_track_buffer,
+                req.mamba_next_track_idx,
+            )
+            for req in reqs
+        ]
+        select_index = None
+        original_mamba_mapping = None
+        original_ping_pong_mapping = None
+
+        try:
+            select_index = super().alloc(reqs)
+            if select_index is None:
+                raise RuntimeError("request-slot allocation failed after preflight")
+
+            original_mamba_mapping = self.req_index_to_mamba_index_mapping[
+                select_index
+            ].clone()
             if self.enable_mamba_extra_buffer:
+                original_ping_pong_mapping = (
+                    self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                        select_index
+                    ].clone()
+                )
+
+            allocated_mamba = (
+                self.mamba_pool.alloc(mamba_state_needed)
+                if mamba_state_needed
+                else None
+            )
+            if mamba_state_needed and allocated_mamba is None:
+                raise RuntimeError("Mamba-state allocation failed after preflight")
+
+            mamba_offset = 0
+            mamba_indices: list[torch.Tensor] = []
+            mamba_ping_pong_track_buffers: list[torch.Tensor] = []
+            for req in reqs:
+                if req.mamba_pool_idx is None:
+                    req.mamba_pool_idx = allocated_mamba[mamba_offset]
+                    mamba_offset += 1
+                mamba_indices.append(req.mamba_pool_idx)
+
+                if not self.enable_mamba_extra_buffer:
+                    continue
                 if req.mamba_ping_pong_track_buffer is None:
-                    req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
-                        self.mamba_ping_pong_track_buffer_size
-                    )
-                    assert (
-                        req.mamba_ping_pong_track_buffer is not None
-                    ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+                    next_offset = mamba_offset + self.mamba_ping_pong_track_buffer_size
+                    req.mamba_ping_pong_track_buffer = allocated_mamba[
+                        mamba_offset:next_offset
+                    ]
+                    mamba_offset = next_offset
                     req.mamba_next_track_idx = 0
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert len(select_index) == len(
-            mamba_indices
-        ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
-        if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
-        if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
-                dtype=torch.int32
-            )
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                ping_pong_tensor
-            )
-        return select_index
+
+            if mamba_offset != mamba_state_needed:
+                raise RuntimeError(
+                    "Mamba-state demand drift after preflight: "
+                    f"consumed={mamba_offset}, required={mamba_state_needed}"
+                )
+
+            mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
+            self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+            if self.enable_mamba_extra_buffer:
+                ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
+                    dtype=torch.int32
+                )
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+                    ping_pong_tensor
+                )
+            return select_index
+        except Exception as exc:
+            # A capacity miss was ruled out above. Restore the exact pool and
+            # request state, then report this as scheduler/pool ledger drift.
+            self.free_slots = original_req_free_slots
+            self.mamba_pool.free_slots = original_mamba_free_slots
+            for req, fields_before in zip(reqs, original_req_fields):
+                (
+                    req.req_pool_idx,
+                    req.mamba_pool_idx,
+                    req.mamba_ping_pong_track_buffer,
+                    req.mamba_next_track_idx,
+                ) = fields_before
+            if select_index is not None and original_mamba_mapping is not None:
+                self.req_index_to_mamba_index_mapping[select_index] = (
+                    original_mamba_mapping
+                )
+            if select_index is not None and original_ping_pong_mapping is not None:
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+                    original_ping_pong_mapping
+                )
+
+            ownership = [
+                {
+                    "req_pool_idx": fields_before[0],
+                    "mamba_pool_idx": fields_before[1],
+                    "has_ping_pong": fields_before[2] is not None,
+                }
+                for fields_before in original_req_fields
+            ]
+            raise RuntimeError(
+                "HybridReqToTokenPool allocation invariant failed after "
+                "successful preflight: "
+                f"required_req_slots={req_slot_needed}, "
+                f"available_req_slots={req_slots_available}, "
+                f"required_mamba_states={mamba_state_needed}, "
+                f"available_mamba_states={mamba_states_available}, "
+                f"per_request_ownership={ownership}"
+            ) from exc
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]

@@ -1485,6 +1485,124 @@ class TestPrefillAdderResourceLedger(unittest.TestCase):
         self.assertEqual(adder.rem_total_token_offset, 1)
         self.assertEqual(adder.cur_rem_token_offset, 1)
 
+    def _make_deferred_owner(self, adder, *, max_new_tokens=512):
+        """Register a live LP chunk owner plus a reclaimer that records calls."""
+        owner = self._make_req(
+            "deferred-owner",
+            priority=0,
+            max_new_tokens=max_new_tokens,
+            reuse_req_slot=True,
+            reuse_main=True,
+            reuse_ping_pong=True,
+        )
+        owner.origin_input_ids = [1]
+        owner.output_ids = []
+        reclaimed = []
+        adder.set_deferred_chunked_req(owner, reclaimed.append)
+        return owner, reclaimed
+
+    def test_rejected_hp_leaves_the_deferred_owner_intact(self):
+        # The pre-check passes -- releasing the deferred owner could cover the
+        # req-slot and mamba demand -- but no high-ref full capacity exists, so
+        # the residual check below rejects.  The owner must survive: the credit
+        # is a simulation, and only step 4 may really retract it.
+        adder, _ = self._make_adder(
+            full_available=0,
+            full_safe_evictable=0,
+            full_high_evictable=0,
+            req_slots=1,
+            mamba_states=3,
+            mamba_high_evictable=0,
+        )
+        owner, reclaimed = self._make_deferred_owner(adder)
+        hp = self._make_req("hp", priority=1)
+        demand = adder._make_ref_aware_demand(hp, truncation_align_size=None)
+
+        admitted = adder._plan_high_priority_admission(demand)
+
+        self.assertFalse(admitted)
+        self.assertIs(adder.deferred_chunked_req, owner)
+        self.assertEqual(reclaimed, [])
+        self.assertNotIn(owner, adder.requeue_after_scan)
+
+    def test_admitted_hp_really_retracts_the_deferred_owner_once(self):
+        # Same shape as the rejection above, with enough high-ref full capacity
+        # to clear the residual check.  Now admission is certain, so the
+        # modelled release must actually happen -- exactly once.
+        adder, _ = self._make_adder(
+            full_available=0,
+            full_safe_evictable=0,
+            full_high_evictable=5,
+            req_slots=1,
+            mamba_states=3,
+            mamba_high_evictable=0,
+        )
+        owner, reclaimed = self._make_deferred_owner(adder)
+        hp = self._make_req("hp", priority=1)
+        demand = adder._make_ref_aware_demand(hp, truncation_align_size=None)
+
+        admitted = adder._plan_high_priority_admission(demand)
+
+        self.assertTrue(admitted)
+        self.assertEqual(reclaimed, [owner])
+        self.assertIsNone(adder.deferred_chunked_req)
+        self.assertIn(owner, adder.requeue_after_scan)
+
+    def test_deferred_credit_never_under_authorizes_the_full_residual(self):
+        # Regression guard for the phantom full-KV credit.  Retracting a
+        # deferred owner yields ~0 full tokens: its reservation was never in
+        # _round_start_total_token_offset (that is summed over
+        # running_batch.reqs, and the owner is the stashed chunked_req), and the
+        # retract frees only the tail past cache_protected_len.  Crediting the
+        # running-request formula -- min(max_new_tokens, CLIP) * ratio, here 512
+        # -- would zero this live deficit of 3 and authorize 0, and allocation
+        # would then raise "shortfall exceeds high-ref authorization".
+        adder, _ = self._make_adder(
+            full_available=0,
+            full_safe_evictable=0,
+            full_high_evictable=10,
+            req_slots=1,
+            mamba_states=3,
+            mamba_high_evictable=0,
+        )
+        owner, reclaimed = self._make_deferred_owner(adder, max_new_tokens=512)
+        hp = self._make_req("hp", priority=1, extend=3)
+        demand = adder._make_ref_aware_demand(hp, truncation_align_size=None)
+        live_full_deficit = adder._ref_aware_deficits(demand)[0]
+        self.assertEqual(live_full_deficit, 3)
+
+        admitted = adder._plan_high_priority_admission(demand)
+
+        self.assertTrue(admitted)
+        self.assertEqual(reclaimed, [owner])
+        # The real retract frees no full KV, so the authorization must still
+        # cover the whole live deficit.
+        self.assertEqual(adder._deferred_release_gain_lower_bound(owner)[0], 0)
+        self.assertGreaterEqual(adder.authorized_high_full_shortfall, live_full_deficit)
+
+    def test_deferred_credit_alone_releases_no_running_lp(self):
+        # Victim order: the credit is applied before the running-LP loop, so a
+        # candidate the deferred owner's resources alone can satisfy must never
+        # cost a running LP request its progress.
+        running_lp = self._make_running_lp("running-lp")
+        adder, _ = self._make_adder(
+            full_available=4,
+            req_slots=1,
+            mamba_states=0,
+            running_reqs=[running_lp],
+        )
+        owner, reclaimed = self._make_deferred_owner(adder)
+        hp = self._make_req("hp", priority=1)
+        demand = adder._make_ref_aware_demand(hp, truncation_align_size=None)
+
+        admitted = adder._plan_high_priority_admission(demand)
+
+        self.assertTrue(admitted)
+        self.assertEqual(reclaimed, [owner])
+        self.assertEqual(adder.running_batch.reqs, [running_lp])
+        adder.running_batch.release_req.assert_not_called()
+        self.assertNotIn(running_lp, adder.requeue_after_scan)
+
 
 if __name__ == "__main__":
     unittest.main()

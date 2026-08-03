@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
     ScheduleBatch,
+    is_prefill_result_stale,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
@@ -133,6 +134,7 @@ class SchedulerOutputProcessorMixin:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        stale_result_indices = set()
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -180,6 +182,20 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                if is_prefill_result_stale(batch, i, req):
+                    stale_result_indices.add(i)
+                    if batch.return_logprob:
+                        logprob_pt += self._calculate_num_input_logprobs(
+                            req,
+                            extend_input_len_per_req[i],
+                            extend_logprob_start_len_per_req[i],
+                        )
+                    if (
+                        req.return_hidden_states
+                        and logits_output.hidden_states is not None
+                    ):
+                        hidden_state_offset += len(req.origin_input_ids)
+                    continue
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
@@ -310,6 +326,9 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
+                if is_prefill_result_stale(batch, i, req):
+                    stale_result_indices.add(i)
+                    continue
                 if req.is_retracted:
                     continue
 
@@ -331,7 +350,10 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        stream_reqs = [
+            req for i, req in enumerate(batch.reqs) if i not in stale_result_indices
+        ]
+        self.stream_output(stream_reqs, batch.return_logprob, skip_stream_req)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(

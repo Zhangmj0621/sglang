@@ -21,6 +21,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 
 import heapq
 from collections import defaultdict
+from enum import Enum, auto
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -61,6 +62,13 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class MambaChunkStashResult(Enum):
+    """Outcome of best-effort caching for a live chunked-prefill request."""
+
+    SNAPSHOT_INSERTED = auto()
+    LIVE_PREFIX_FALLBACK = auto()
 
 
 class TreeNode:
@@ -609,17 +617,21 @@ class MambaRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(
+        self, req: Req, chunked=False
+    ) -> Optional[MambaChunkStashResult]:
         """Cache request when it is unfinished."""
 
-        def _skip_cache_unfinished_req(req: Req) -> None:
+        def _skip_cache_unfinished_req(
+            req: Req,
+        ) -> Optional[MambaChunkStashResult]:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.fill_ids)
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            return
+            return MambaChunkStashResult.LIVE_PREFIX_FALLBACK if chunked else None
 
         token_ids = req.fill_ids
         cache_len = (
@@ -666,8 +678,15 @@ class MambaRadixCache(BasePrefixCache):
             mamba_value = self.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
-        # radix tree mamba value is forked from req space
-        mamba_value_forked = self._fork_mamba_with_evict(mamba_value)
+        # A chunk stash is an optimization: lack of one safe snapshot slot must
+        # not abort or mutate the live request. Non-chunked unfinished caching
+        # keeps its existing required-cache behavior.
+        if chunked:
+            mamba_value_forked = self._try_fork_mamba_for_chunk_stash(mamba_value)
+            if mamba_value_forked is None:
+                return _skip_cache_unfinished_req(req)
+        else:
+            mamba_value_forked = self._fork_mamba_with_evict(mamba_value)
 
         result = self.insert(
             InsertParams(
@@ -717,6 +736,7 @@ class MambaRadixCache(BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
+        return MambaChunkStashResult.SNAPSHOT_INSERTED if chunked else None
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -1072,9 +1092,7 @@ class MambaRadixCache(BasePrefixCache):
         )
 
     def _alloc_mamba_slot_with_evict(self, last_node: TreeNode) -> torch.Tensor:
-        """Alloc one mamba slot, evicting once on failure. Overridden by
-        RefAwareMambaCacheMixin to escalate the eviction scope before
-        giving up."""
+        """Allocate one Mamba slot under the caller's current eviction scope."""
         dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
         if dst_index is None:
             self.inc_lock_ref(last_node)
@@ -1085,13 +1103,22 @@ class MambaRadixCache(BasePrefixCache):
         return dst_index
 
     def _fork_mamba_with_evict(self, mamba_value: torch.Tensor) -> torch.Tensor:
-        """Fork a mamba state, evicting once on failure. Overridden by
-        RefAwareMambaCacheMixin to escalate the eviction scope."""
+        """Fork a Mamba state using only the caller's current eviction scope."""
         forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
         if forked is None:
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
             forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
             assert forked is not None, "Can not alloc mamba cache"
+        return forked
+
+    def _try_fork_mamba_for_chunk_stash(
+        self, mamba_value: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Try one free/safe-eviction cycle without making stash mandatory."""
+        forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        if forked is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
         return forked
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:

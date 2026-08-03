@@ -804,10 +804,21 @@ class PrefillAdder:
     def append_requeue_after_scan(self, req: Req) -> None:
         self._append_requeue_after_scan(req)
 
-    def _reclaim_deferred_low_priority_chunk(self) -> bool:
+    def _deferred_chunk_is_reclaimable(self) -> bool:
+        """Whether a displaceable deferred low-priority chunk owner exists.
+
+        Shared by the release-stage simulation and the real reclaim below so
+        the release we model can never diverge from the one we perform.
+        """
         req = self.deferred_chunked_req
-        if req is None or self.tree_cache.is_high_priority(req.priority or 0):
+        return req is not None and not self.tree_cache.is_high_priority(
+            req.priority or 0
+        )
+
+    def _reclaim_deferred_low_priority_chunk(self) -> bool:
+        if not self._deferred_chunk_is_reclaimable():
             return False
+        req = self.deferred_chunked_req
         assert self._deferred_chunk_reclaimer is not None
         self._deferred_chunk_reclaimer(req)
         self.deferred_chunked_req = None
@@ -871,6 +882,31 @@ class PrefillAdder:
             int(getattr(req, "req_pool_idx", None) is not None),
             mamba_gain,
         )
+
+    def _deferred_release_gain_lower_bound(self, req: Req) -> tuple[int, int, int]:
+        """Provable (full, req_slot, mamba) gain from retracting the deferred owner.
+
+        The full component is deliberately zero, not an unmodelled resource:
+
+        * The owner's future reservation was never counted in
+          ``_round_start_total_token_offset``.  That offset is summed only over
+          ``running_batch.reqs``, and the deferred owner is ``chunked_req``,
+          which ``get_next_batch_to_run`` excludes and stashes before any merge
+          into the running batch.  There is nothing for a retract to give back,
+          and unlike ``_release_running_low_priority_req`` the reclaim performs
+          no offset arithmetic at all.
+        * The retract frees only the tail past ``cache_protected_len``:
+          ``release_kv_cache(is_insert=False)`` keeps the owner's committed KV
+          in the radix tree on purpose -- that is exactly why displacing a
+          merely deferred owner is cheap -- and ``stash_chunked_request`` has
+          already advanced ``cache_protected_len`` to the last chunk boundary.
+
+        Crediting the running-request formula here instead would inject a
+        phantom of up to CLIP_MAX_NEW_TOKENS tokens, masking real deficits and
+        under-authorizing allocation into a hard failure.
+        """
+        _, req_slot_gain, mamba_gain = self._release_gain_lower_bound(req)
+        return (0, req_slot_gain, mamba_gain)
 
     def _reclaim_could_satisfy(
         self, demand: PrefillResourceDemand, victims: List[Req]
@@ -944,15 +980,36 @@ class PrefillAdder:
                     break
             assert logical_slots_reclaimed == running_slot_reclaim_need
 
-        deficits = self._ref_aware_deficits(demand)
-        if any(deficits) and self._reclaim_deferred_low_priority_chunk():
-            deficits = self._ref_aware_deficits(demand)
+        # The deferred owner's retract is modelled, not performed: step 4 below
+        # is the single place that really retracts it, once every rejection
+        # path is behind us.  Until then the credit exists only here, so every
+        # later recomputation must go through live_deficits() -- reading
+        # _ref_aware_deficits directly would discard the credit and over-release
+        # running LP victims for capacity the deferred retract already covers.
+        credit = (0, 0, 0)
+        credited_deferred = False
 
+        def live_deficits() -> tuple[int, int, int]:
+            full, req_slot, mamba = self._ref_aware_deficits(demand)
+            return (
+                max(0, full - credit[0]),
+                max(0, req_slot - credit[1]),
+                max(0, mamba - credit[2]),
+            )
+
+        if (
+            any(self._ref_aware_deficits(demand))
+            and self._deferred_chunk_is_reclaimable()
+        ):
+            credit = self._deferred_release_gain_lower_bound(self.deferred_chunked_req)
+            credited_deferred = True
+
+        deficits = live_deficits()
         if any(deficits):
             server_args = get_global_server_args()
             for victim in self._running_low_priority_victims():
                 self._release_running_low_priority_req(victim, server_args)
-                deficits = self._ref_aware_deficits(demand)
+                deficits = live_deficits()
                 if not any(deficits):
                     break
 
@@ -965,13 +1022,20 @@ class PrefillAdder:
             return False
 
         # --- 4: the last destructive act, once admission is certain ---
-        # A new chunk owner must retire the deferred owner, but only now that
-        # every rejection path above is behind us: retracting first and then
-        # failing a residual check would destroy the LP owner's progress and
-        # still not run the HP candidate.
-        if demand.is_intermediate_chunk:
+        # Fires either because a new chunk owner must retire the deferred one,
+        # or because the deficits above were credited with its release: the
+        # release we modelled must be the one that actually happens, or the
+        # authorization would rest on capacity nobody freed.  Only now that
+        # every rejection path is behind us -- retracting first and then failing
+        # a residual check would destroy the LP owner's progress and still not
+        # run the HP candidate.
+        if demand.is_intermediate_chunk or credited_deferred:
             self._reclaim_deferred_low_priority_chunk()
-            if self.deferred_chunked_req is not None:
+            # Chunk-scoped: a surviving owner means two owners, which is
+            # unrepresentable.  A non-chunk candidate that merely took the
+            # credit creates no second owner, and the credit is only ever
+            # granted when the owner is reclaimable, so it cannot survive here.
+            if demand.is_intermediate_chunk and self.deferred_chunked_req is not None:
                 return False
 
         # --- 5: authorization ---

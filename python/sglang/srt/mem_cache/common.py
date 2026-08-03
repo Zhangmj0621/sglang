@@ -12,14 +12,10 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, get_extend_allocation_size
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-
-# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
-MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
 
@@ -202,20 +198,16 @@ def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
+    high_authorization: int | None = None,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache(tree_cache, num_tokens, high_authorization=high_authorization)
 
     state = None
     if backup_state:
         state = allocator.backup_state()
 
     out_cache_loc = allocator.alloc(num_tokens)
-
-    if out_cache_loc is None and _escalated_mamba_evict(
-        tree_cache, num_tokens=num_tokens
-    ):
-        out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
         error_msg = (
@@ -231,12 +223,16 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    high_authorization: int | None = None,
+) -> int:
     if tree_cache is None:
-        return
+        return 0
 
     if tree_cache.is_chunk_cache():
-        return
+        return 0
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
@@ -253,28 +249,39 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             )
     else:
         # Standard allocator
-        if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+        shortfall = max(0, num_tokens - allocator.available_size())
+        if shortfall <= 0:
+            return 0
 
+        from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
 
-def _escalated_mamba_evict(tree_cache, num_tokens: int = 0, mamba_num: int = 0) -> bool:
-    """Last-resort eviction that may touch the high-ref tier. Only applies
-    to ref-aware mamba caches; returns True if an escalated eviction ran."""
-    from sglang.srt.mem_cache.ref_aware_mamba_cache_mixin import (
-        RefAwareMambaCacheMixin,
-    )
+        if not isinstance(tree_cache, RefAwareCacheCore):
+            tree_cache.evict(EvictParams(num_tokens=shortfall))
+            return 0
 
-    if not isinstance(tree_cache, RefAwareMambaCacheMixin):
-        return False
-    logger.warning(
-        "Ref-aware mamba cache: escalating eviction to high-ref tier "
-        "(num_tokens=%d, mamba_num=%d).",
-        num_tokens,
-        mamba_num,
-    )
-    with tree_cache.scoped_evict(allow_low=True, allow_high=True):
-        tree_cache.evict(EvictParams(num_tokens=num_tokens, mamba_num=mamba_num))
-    return True
+        with tree_cache.scoped_evict(allow_low=True, allow_high=False):
+            tree_cache.evict(EvictParams(num_tokens=shortfall))
+        residual = max(0, num_tokens - allocator.available_size())
+        if residual <= 0:
+            return 0
+        if high_authorization is None:
+            return 0
+        authorization = high_authorization
+        if residual > authorization:
+            raise RuntimeError(
+                "Ref-aware full KV allocation shortfall exceeds high-ref "
+                f"authorization: required={num_tokens}, "
+                f"available={allocator.available_size()}, residual={residual}, "
+                f"authorization={authorization}"
+            )
+        # Pass only the authorized residual target. Radix leaf granularity may
+        # evict more than the target; callers record the actual result without
+        # enlarging the requested authorization.
+        with tree_cache.scoped_evict(allow_low=False, allow_high=True):
+            result = tree_cache.evict(EvictParams(num_tokens=residual))
+        return result.num_tokens_evicted
+
+    return 0
 
 
 def alloc_paged_token_slots_extend(
@@ -286,11 +293,15 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     backup_state: bool = False,
+    high_authorization: int | None = None,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
+    num_tokens = get_extend_allocation_size(
+        prefix_lens=prefix_lens_cpu.tolist(),
+        extend_lens=(seq_lens_cpu - prefix_lens_cpu).tolist(),
+        page_size=allocator.page_size,
+    )
+    evict_from_tree_cache(tree_cache, num_tokens, high_authorization=high_authorization)
 
     state = None
     if backup_state:
@@ -304,18 +315,6 @@ def alloc_paged_token_slots_extend(
         last_loc,
         extend_num_tokens,
     )
-
-    if out_cache_loc is None and _escalated_mamba_evict(
-        tree_cache, num_tokens=num_tokens
-    ):
-        out_cache_loc = allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
 
     if out_cache_loc is None:
         error_msg = (
@@ -331,34 +330,63 @@ def alloc_paged_token_slots_extend(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+def evict_mamba_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    required: int,
+    high_authorization: int | None = None,
+) -> int:
+    if tree_cache is None or required <= 0 or not tree_cache.supports_mamba():
+        return 0
+
+    pool = tree_cache.req_to_token_pool.mamba_pool
+    shortfall = max(0, required - pool.available_size())
+    if shortfall <= 0:
+        return 0
+
+    from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
+
+    if not isinstance(tree_cache, RefAwareCacheCore):
+        tree_cache.evict(EvictParams(num_tokens=0, mamba_num=shortfall))
+        return 0
+
+    with tree_cache.scoped_evict(allow_low=True, allow_high=False):
+        tree_cache.evict(EvictParams(num_tokens=0, mamba_num=shortfall))
+    residual = max(0, required - pool.available_size())
+    if residual <= 0:
+        return 0
+
+    if high_authorization is None:
+        return 0
+    authorization = high_authorization
+    if residual > authorization:
+        raise RuntimeError(
+            "Ref-aware Mamba allocation shortfall exceeds high-ref "
+            f"authorization: required={required}, "
+            f"available={pool.available_size()}, residual={residual}, "
+            f"authorization={authorization}"
+        )
+    with tree_cache.scoped_evict(allow_low=False, allow_high=True):
+        result = tree_cache.evict(EvictParams(num_tokens=0, mamba_num=residual))
+    return result.mamba_num_evicted
+
+
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
-) -> list[int]:
+    high_authorization: int | None = None,
+    return_high_evicted: bool = False,
+) -> list[int] | tuple[list[int], int]:
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
+    high_evicted = 0
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
-        factor = (
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            if tree_cache.supports_mamba()
-            else MAMBA_STATE_PER_REQ_NO_CACHE
+        mamba_state_needed = req_to_token_pool.mamba_states_need(reqs)
+        high_evicted = evict_mamba_from_tree_cache(
+            tree_cache,
+            mamba_state_needed,
+            high_authorization=high_authorization,
         )
-        mamba_state_needed = num_reqs * factor
-        if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-                still_short = (
-                    req_to_token_pool.mamba_pool.available_size() < mamba_state_needed
-                )
-                if still_short:
-                    _escalated_mamba_evict(
-                        tree_cache,
-                        mamba_num=mamba_state_needed
-                        - req_to_token_pool.mamba_pool.available_size(),
-                    )
     req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:
@@ -368,6 +396,8 @@ def alloc_req_slots(
             f"{req_to_token_pool.available_size()=}, "
             f"{num_reqs=}, "
         )
+    if return_high_evicted:
+        return req_pool_indices, high_evicted
     return req_pool_indices
 
 
@@ -387,37 +417,140 @@ def alloc_for_extend(
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
+    from sglang.srt.mem_cache.ref_aware_cache_core import RefAwareCacheCore
+
+    is_ref_aware = isinstance(batch.tree_cache, RefAwareCacheCore)
+    request_reuse = batch.capture_allocation_request_reuse() if is_ref_aware else []
+    req_slots_required = (
+        batch.req_to_token_pool.req_slots_need(batch.reqs) if is_ref_aware else 0
+    )
+    mamba_required = (
+        batch.req_to_token_pool.mamba_states_need(batch.reqs)
+        if is_ref_aware
+        and batch.tree_cache.supports_mamba()
+        and hasattr(batch.req_to_token_pool, "mamba_states_need")
+        else 0
+    )
+
+    def fail_ref_aware_preflight(stage: str, cause: Exception | None = None):
+        error_msg = batch.build_ref_aware_allocation_diagnostic(
+            stage=stage,
+            full_required=full_required,
+            req_slots_required=req_slots_required,
+            mamba_required=mamba_required,
+            request_reuse=request_reuse,
+        )
+        logger.error(error_msg)
+        if cause is None:
+            raise RuntimeError(error_msg)
+        raise RuntimeError(error_msg) from cause
+
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots
-    req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
-    )
+    if batch.tree_cache.page_size == 1:
+        full_required = batch.extend_num_tokens
+    else:
+        full_required = get_extend_allocation_size(
+            prefix_lens=batch.prefix_lens,
+            extend_lens=batch.extend_lens,
+            page_size=batch.tree_cache.page_size,
+        )
+
+    try:
+        full_high_evicted = evict_from_tree_cache(
+            batch.tree_cache,
+            full_required,
+            high_authorization=getattr(
+                batch, "remaining_high_full_authorization", None
+            ),
+        )
+    except Exception as exc:
+        if is_ref_aware:
+            fail_ref_aware_preflight("full_kv_preflight", exc)
+        raise
+    if hasattr(batch, "remaining_high_full_authorization"):
+        batch.actual_high_full_evicted += full_high_evicted
+        batch.remaining_high_full_authorization = max(
+            0, batch.remaining_high_full_authorization - full_high_evicted
+        )
+    if (
+        is_ref_aware
+        and batch.token_to_kv_pool_allocator.available_size() < full_required
+    ):
+        fail_ref_aware_preflight("full_kv_preflight")
+
+    if is_ref_aware and batch.req_to_token_pool.available_size() < req_slots_required:
+        fail_ref_aware_preflight("req_slot_preflight")
+
+    # Re-read Mamba capacity only after full eviction: deleting a full leaf can
+    # release its paired Mamba snapshot as well.
+    try:
+        req_pool_indices, mamba_high_evicted = alloc_req_slots(
+            batch.req_to_token_pool,
+            batch.reqs,
+            batch.tree_cache,
+            high_authorization=getattr(
+                batch, "remaining_high_mamba_authorization", None
+            ),
+            return_high_evicted=True,
+        )
+    except Exception as exc:
+        if is_ref_aware:
+            mamba_pool = getattr(batch.req_to_token_pool, "mamba_pool", None)
+            mamba_available = (
+                mamba_pool.available_size() if mamba_pool is not None else 0
+            )
+            stage = (
+                "mamba_preflight"
+                if mamba_available < mamba_required
+                else "req_mamba_atomic_allocation"
+            )
+            fail_ref_aware_preflight(stage, exc)
+        raise
+    if hasattr(batch, "remaining_high_mamba_authorization"):
+        batch.actual_high_mamba_evicted += mamba_high_evicted
+        batch.remaining_high_mamba_authorization = max(
+            0, batch.remaining_high_mamba_authorization - mamba_high_evicted
+        )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
-        )
+    try:
+        if batch.tree_cache.page_size == 1:
+            out_cache_loc = alloc_token_slots(
+                batch.tree_cache,
+                batch.extend_num_tokens,
+                high_authorization=getattr(
+                    batch, "remaining_high_full_authorization", None
+                ),
+            )
+        else:
+            # Paged allocation - build last_loc
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+                for t in prefix_tensors
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_device,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.extend_num_tokens,
+                high_authorization=getattr(
+                    batch, "remaining_high_full_authorization", None
+                ),
+            )
+    except Exception as exc:
+        if is_ref_aware:
+            fail_ref_aware_preflight("full_kv_allocation", exc)
+        raise
 
     # Write to req_to_token_pool
     write_cache_indices(
