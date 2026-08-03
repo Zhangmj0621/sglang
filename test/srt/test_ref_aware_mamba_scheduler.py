@@ -671,6 +671,14 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         scheduler.running_batch = SimpleNamespace(reqs=[])
         return scheduler
 
+    def _takeover_scheduler(self, old, *, old_priority=0):
+        old.priority = old_priority
+        scheduler = self._scheduler(old)
+        scheduler.truncation_align_size = None
+        scheduler.enable_ref_aware_kv_buffer = True
+        scheduler.tree_cache.is_high_priority = lambda priority: priority >= 1
+        return scheduler
+
     def test_deferred_old_chunk_status_table_converges_to_one_owner(self):
         cases = (
             (ChunkedReqStatus.UNFINISHED, True, 1, False),
@@ -1142,7 +1150,7 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         old = _ChunkReq("deferred-lp")
         scheduler = self._scheduler(old)
         scheduler.truncation_align_size = None
-        scheduler.tree_cache.is_high_priority = Mock(return_value=True)
+        scheduler.tree_cache.is_high_priority = lambda priority: priority >= 1
         adder = _ConflictAdder(old, would_chunk=True)
         candidate = _ChunkReq("hp-candidate")
         candidate.priority = 1
@@ -1182,6 +1190,83 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         self.assertIs(adder.deferred_chunked_req, old)
         self.assertIs(scheduler.chunked_req, old)
         self.assertEqual(old.reset_calls, 0)
+
+    def test_hp_candidate_may_displace_a_deferred_lp_owner(self):
+        old = _ChunkReq("deferred-lp")
+        scheduler = self._takeover_scheduler(old)
+        adder = _ConflictAdder(old, would_chunk=True)
+        candidate = _ChunkReq("hp-candidate")
+        candidate.priority = 1
+
+        self.assertTrue(
+            scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+        )
+        # The slot is displaceable, so add_one_req must NOT be told the slot
+        # is taken -- that gate is what previously made takeover unreachable.
+        self.assertFalse(scheduler._chunk_slot_is_taken(adder, candidate, old))
+        # Still side-effect free: the planner owns the retract.
+        self.assertIs(scheduler.chunked_req, old)
+        self.assertIs(adder.deferred_chunked_req, old)
+        self.assertEqual(old.reset_calls, 0)
+
+    def test_lp_candidate_may_not_displace_a_deferred_lp_owner(self):
+        old = _ChunkReq("deferred-lp")
+        scheduler = self._takeover_scheduler(old)
+        adder = _ConflictAdder(old, would_chunk=True)
+        candidate = _ChunkReq("lp-candidate")
+        candidate.priority = 0
+
+        self.assertFalse(
+            scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+        )
+        self.assertTrue(scheduler._chunk_slot_is_taken(adder, candidate, old))
+        self.assertIs(adder.deferred_chunked_req, old)
+
+    def test_hp_candidate_may_not_displace_a_committed_new_owner(self):
+        old = _ChunkReq("deferred-lp")
+        scheduler = self._takeover_scheduler(old)
+        adder = _ConflictAdder(old, would_chunk=True)
+        adder.new_chunked_req = _ChunkReq("already-new-owner")
+        candidate = _ChunkReq("hp-candidate")
+        candidate.priority = 1
+
+        self.assertTrue(scheduler._chunk_slot_is_taken(adder, candidate, old))
+        self.assertFalse(
+            scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+        )
+
+    def test_hp_candidate_may_not_displace_a_deferred_hp_owner(self):
+        old = _ChunkReq("deferred-hp")
+        scheduler = self._takeover_scheduler(old, old_priority=1)
+        adder = _ConflictAdder(old, would_chunk=True)
+        candidate = _ChunkReq("hp-candidate")
+        candidate.priority = 1
+
+        self.assertTrue(scheduler._chunk_slot_is_taken(adder, candidate, old))
+
+    def test_non_ref_aware_never_displaces_an_owner(self):
+        old = _ChunkReq("owner")
+        scheduler = self._takeover_scheduler(old)
+        scheduler.enable_ref_aware_kv_buffer = False
+        adder = _ConflictAdder(old, would_chunk=True)
+        candidate = _ChunkReq("candidate")
+        candidate.priority = 1
+
+        self.assertTrue(scheduler._chunk_slot_is_taken(adder, candidate, old))
+        self.assertFalse(
+            scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+        )
+
+    def test_non_chunking_candidate_ignores_the_slot_entirely(self):
+        old = _ChunkReq("deferred-lp")
+        scheduler = self._takeover_scheduler(old)
+        adder = _ConflictAdder(old, would_chunk=False)
+        candidate = _ChunkReq("small-lp")
+        candidate.priority = 0
+
+        self.assertTrue(
+            scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+        )
 
 
 if __name__ == "__main__":

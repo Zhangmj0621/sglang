@@ -2527,6 +2527,53 @@ class Scheduler(
             )
             req.mamba_pool_idx = None
 
+    def _deferred_owner_is_displaceable_by(
+        self, adder: PrefillAdder, req: Req, deferred_chunked_req: Optional[Req]
+    ) -> bool:
+        """Whether a would-chunk HP candidate may take the single chunk slot.
+
+        A merely deferred LP owner has not been forwarded this round, and its
+        progress up to the last chunk boundary is already committed to the
+        radix cache by stash_chunked_request, so retracting it costs only the
+        un-stashed tail and it re-prefills from that snapshot next round.
+        Deliberate policy: HP wins the current round, the LP owner slips to a
+        later one.
+
+        The retract itself is NOT performed here -- only
+        _plan_high_priority_admission does it, and only after its feasibility
+        pre-check, so a candidate that cannot be admitted costs the LP owner
+        nothing.
+        """
+        if not self.enable_ref_aware_kv_buffer:
+            return False
+        deferred = adder.deferred_chunked_req
+        if deferred is None or deferred is not deferred_chunked_req:
+            return False
+        # A new owner already committed this round holds the slot outright.
+        if adder.new_chunked_req is not None:
+            return False
+        # The deferred owner must still be the scheduler-side owner.
+        if self.chunked_req is not deferred:
+            return False
+        # Only an LP owner yields, and only to an HP candidate.
+        if self.tree_cache.is_high_priority(deferred.priority or 0):
+            return False
+        return self.tree_cache.is_high_priority(req.priority or 0)
+
+    def _chunk_slot_is_taken(
+        self, adder: PrefillAdder, req: Req, deferred_chunked_req: Optional[Req]
+    ) -> bool:
+        """Whether the single unfinished-chunk slot is unavailable to ``req``."""
+        if (
+            self.chunked_req is None
+            and adder.deferred_chunked_req is None
+            and adder.new_chunked_req is None
+        ):
+            return False
+        return not self._deferred_owner_is_displaceable_by(
+            adder, req, deferred_chunked_req
+        )
+
     def _resolve_candidate_chunk_conflict(
         self,
         adder: PrefillAdder,
@@ -2535,34 +2582,15 @@ class Scheduler(
     ) -> bool:
         """Return whether admission may proceed without creating two owners.
 
-        This decision is side-effect free.  Retracting the deferred owner is
-        deferred to _plan_high_priority_admission, which only does so after
-        its feasibility pre-check has confirmed the HP candidate can actually
-        be admitted -- otherwise a mere prediction would cost the LP chunk its
-        progress while the HP fails anyway.
+        Side-effect free by design.  It shares _chunk_slot_is_taken with the
+        has_chunked_req computation at the add_one_req call site so the two
+        can never disagree -- a disagreement would either let a candidate
+        past this gate only to be rejected downstream, or admit a second
+        owner.
         """
         if not adder.would_become_chunk(req, self.truncation_align_size):
             return True
-        if (
-            self.chunked_req is None
-            and adder.deferred_chunked_req is None
-            and adder.new_chunked_req is None
-        ):
-            return True
-        if (
-            deferred_chunked_req is not None
-            and self.enable_ref_aware_kv_buffer
-            and adder.deferred_chunked_req is deferred_chunked_req
-            and self.tree_cache.is_high_priority(req.priority or 0)
-        ):
-            # Let the candidate through without destroying anything.  The
-            # deferred LP owner still holds self.chunked_req, so add_one_req
-            # sees has_chunked_req=True and rejects a would-chunk candidate
-            # with OTHER; the old owner is then admitted by the end-of-scan
-            # _try_add_deferred_chunk.  HP takeover of a deferred owner is
-            # deliberately not supported -- the LP owner wins the round.
-            return True
-        return False
+        return not self._chunk_slot_is_taken(adder, req, deferred_chunked_req)
 
     def _stable_partition_ref_aware_waiting_queue(self) -> None:
         """Keep policy order within tiers while ensuring HP reserves first."""
@@ -2745,10 +2773,8 @@ class Scheduler(
 
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(
-                    self.chunked_req is not None
-                    or adder.deferred_chunked_req is not None
-                    or adder.new_chunked_req is not None
+                has_chunked_req=self._chunk_slot_is_taken(
+                    adder, req, deferred_chunked_req
                 ),
                 truncation_align_size=self.truncation_align_size,
                 running_slot_reclaim_need=(
