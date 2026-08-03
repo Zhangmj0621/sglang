@@ -928,13 +928,7 @@ class PrefillAdder:
         if not self._reclaim_could_satisfy(demand, victims):
             return False
 
-        # --- 3: a new chunk owner must retire the deferred owner ---
-        if demand.is_intermediate_chunk:
-            self._reclaim_deferred_low_priority_chunk()
-            if self.deferred_chunked_req is not None:
-                return False
-
-        # --- 4: real release ---
+        # --- 3: real release ---
         # PP's microbatch limit is a logical request-count resource, separate
         # from request-pool and KV capacity.  HP candidates are allowed past
         # Scheduler.batch_is_full only so this prefix-locked planner can make
@@ -969,6 +963,16 @@ class PrefillAdder:
         high_full, high_mamba = self._high_evictable_capacity()
         if full_deficit > high_full or mamba_deficit > high_mamba:
             return False
+
+        # --- 4: the last destructive act, once admission is certain ---
+        # A new chunk owner must retire the deferred owner, but only now that
+        # every rejection path above is behind us: retracting first and then
+        # failing a residual check would destroy the LP owner's progress and
+        # still not run the HP candidate.
+        if demand.is_intermediate_chunk:
+            self._reclaim_deferred_low_priority_chunk()
+            if self.deferred_chunked_req is not None:
+                return False
 
         # --- 5: authorization ---
         # Batch-wide totals at current live capacities.  Never lower an
