@@ -558,6 +558,42 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [req])
         self.assertEqual(adder.req_states, [(10.0, 1)])
 
+    def test_non_ref_aware_chunk_is_admitted_when_mixed_chunk_exhausts_budget(self):
+        """rem_chunk_tokens = chunked_prefill_size - running_bs can go <= 0
+        under --enable-mixed-chunk.  HEAD always admitted the owner in that
+        case ('otherwise it will cause a memory leak'); returning
+        NOT_ADMITTED makes the scheduler retract and requeue the chunk every
+        round, which livelocks the request."""
+        tree_cache = self.create_tree_cache()
+        allocator = self.create_token_allocator()
+        running_batch = self.create_running_batch()
+        adder = PrefillAdder(
+            page_size=1,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=running_batch,
+            new_token_ratio=1.0,
+            rem_input_tokens=4096,
+            rem_chunk_tokens=512,
+            mixed_with_decode_tokens=512,  # running_bs == chunked_prefill_size
+        )
+        self.assertLessEqual(adder.rem_chunk_tokens, 0)
+
+        owner = self.create_mock_req("owner", priority=0, max_new_tokens=8)
+        owner.extend_input_len = 256
+        owner.prefix_indices = []
+        owner.fill_ids = list(range(256))
+
+        def set_extend_input_len(value):
+            owner.extend_input_len = value
+
+        owner.set_extend_input_len.side_effect = set_extend_input_len
+
+        status = adder.add_chunked_req(owner)
+
+        self.assertIsNot(status, ChunkedReqStatus.NOT_ADMITTED)
+        self.assertIn(owner, adder.can_run_list)
+
 
 class TestPrefillAdderResourceLedger(unittest.TestCase):
     def setUp(self):

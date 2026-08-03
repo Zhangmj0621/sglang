@@ -1174,17 +1174,27 @@ class PrefillAdder:
                 else ChunkedReqStatus.COMPLETED
             )
         else:
+            # chunked_req can only exist when chunked prefill is enabled, so
+            # rem_chunk_tokens is never None on this path.
+            assert self.rem_chunk_tokens is not None
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+            # The chunked_req must be added to the list; otherwise, it will
+            # cause a memory leak.  Under --enable-mixed-chunk,
+            # rem_chunk_tokens = chunked_prefill_size - running_bs can be <= 0;
+            # rejecting the owner would make the scheduler retract and requeue
+            # it every round, livelocking the request.  Admit unconditionally.
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
+            return self._admit_chunked_req(req, _rem_tokens)
 
+        # Only the dllm branch reaches here; its budget really can be empty.
         if _rem_tokens is None or _rem_tokens <= 0:
             return ChunkedReqStatus.NOT_ADMITTED
+        return self._admit_chunked_req(req, _rem_tokens)
 
-        truncated = req.extend_input_len > _rem_tokens
-        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
+    def _admit_chunked_req(self, req: Req, rem_tokens: int) -> ChunkedReqStatus:
+        truncated = req.extend_input_len > rem_tokens
+        req.set_extend_input_len(min(req.extend_input_len, rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1196,7 +1206,6 @@ class PrefillAdder:
                 else 0
             ),
         )
-
         return ChunkedReqStatus.UNFINISHED if truncated else ChunkedReqStatus.COMPLETED
 
     def _add_one_ref_aware_req(
