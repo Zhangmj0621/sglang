@@ -725,56 +725,19 @@ class PrefillAdder:
         )
 
     def _ref_aware_demand_fits(self, demand: PrefillResourceDemand) -> bool:
-        """Check safe capacity without granting a low-priority authorization.
+        """Whether a low-priority candidate fits entirely in safe capacity.
 
-        Once an earlier HP request has established a batch-wide high-ref
-        authorization, a later LP request may reuse resources within that
-        already-fixed bound.  It must never increase either authorization,
-        and request slots remain non-evictable.
+        HP authorization is not a shared pool: it is derived from HP deficits
+        and consumed by batch-wide eviction in alloc_for_extend.  Letting LP
+        validate against it would let LP absorb capacity that a later HP's
+        preemption just freed.
+
+        Known cost (deliberate, see spec 4.4.1): deficits are cumulative, so
+        after an HP reserves beyond safe capacity every later LP is rejected,
+        including zero-marginal-demand chunk continuations.
         """
-        full_capacity = self._ref_aware_full_capacity()
-        full_current_required = (
-            self._round_start_cur_token_offset
-            + self.reserved_full_current
-            + demand.full_current
-        )
-        full_total_required = (
-            self._round_start_total_token_offset
-            + self.reserved_full_current
-            + self.reserved_full_future
-            + demand.full_current
-            + demand.full_future
-        )
-        full_deficit = max(
-            0,
-            max(full_current_required, full_total_required) - full_capacity,
-        )
-
-        req_pool = self.tree_cache.req_to_token_pool
-        req_slot_deficit = max(
-            0,
-            self.reserved_req_slots + demand.req_slots - req_pool.available_size(),
-        )
-        if req_slot_deficit:
-            return False
-
-        mamba_deficit = 0
-        if self.is_hybrid_ssm_cache:
-            mamba_capacity = (
-                req_pool.mamba_pool.available_size()
-                + self.tree_cache.mamba_evictable_size_by_tier(
-                    allow_low=True, allow_high=False
-                )
-            )
-            mamba_deficit = max(
-                0,
-                self.reserved_mamba_states + demand.mamba_states - mamba_capacity,
-            )
-
-        return (
-            full_deficit <= self.authorized_high_full_shortfall
-            and mamba_deficit <= self.authorized_high_mamba_shortfall
-        )
+        full_deficit, req_slot_deficit, mamba_deficit = self._ref_aware_deficits(demand)
+        return not (full_deficit or req_slot_deficit or mamba_deficit)
 
     def _ref_aware_deficits(
         self, demand: PrefillResourceDemand

@@ -799,7 +799,15 @@ class TestPrefillAdderResourceLedger(unittest.TestCase):
         self.assertEqual(adder.reserved_full_current, 1)
         self.assertEqual(adder.reserved_full_future, 0)
 
-    def test_zero_increment_lp_reuse_may_share_existing_hp_authorization(self):
+    def test_zero_increment_lp_reuse_is_rejected_under_hp_authorization(self):
+        """Strict semantics: LP admission ignores authorized_high_*.
+
+        Deficits are cumulative, so once an HP commits a reservation beyond
+        safe capacity every later LP is rejected -- including a chunk
+        continuation whose marginal demand is zero.  This throughput cost is
+        accepted deliberately (see spec 4.4.1); do not "fix" it by letting
+        LP read the authorization again.
+        """
         adder, _ = self._make_adder(
             full_available=0,
             req_slots=1,
@@ -820,11 +828,23 @@ class TestPrefillAdderResourceLedger(unittest.TestCase):
         self._add(adder, hp)
         full_authorization = adder.authorized_high_full_shortfall
         mamba_authorization = adder.authorized_high_mamba_shortfall
-        self._add(adder, reused_lp)
+        result = self._add(adder, reused_lp)
 
-        self.assertEqual(adder.can_run_list, [hp, reused_lp])
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [hp])
         self.assertEqual(adder.authorized_high_full_shortfall, full_authorization)
         self.assertEqual(adder.authorized_high_mamba_shortfall, mamba_authorization)
+
+    def test_lp_within_safe_capacity_is_still_admitted(self):
+        adder, _ = self._make_adder(full_available=100, req_slots=10, mamba_states=10)
+        lp = self._make_req("lp", priority=0)
+
+        result = self._add(adder, lp)
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [lp])
+        self.assertEqual(adder.authorized_high_full_shortfall, 0)
+        self.assertEqual(adder.authorized_high_mamba_shortfall, 0)
 
     def test_lp_cannot_expand_existing_hp_authorization(self):
         adder, _ = self._make_adder(
