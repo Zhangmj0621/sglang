@@ -947,6 +947,40 @@ class TestPrefillAdderResourceLedger(unittest.TestCase):
 
         self.assertFalse(adder._reclaim_could_satisfy(demand, [victim]))
 
+    def test_pre_check_credits_no_full_gain_for_the_deferred_owner(self):
+        # Retracting the deferred chunk owner frees essentially no full KV: its
+        # future reservation was never in _round_start_total_token_offset, and
+        # release_kv_cache(is_insert=False) keeps the committed KV in the radix
+        # tree.  Crediting its max_new_tokens here would let a candidate pass
+        # the pre-check on capacity nobody frees, then release running LP
+        # victims and still fail the full residual gate -- destroy-then-reject
+        # on a more expensive victim than the deferred owner.
+        adder, _ = self._make_adder(
+            full_available=0,
+            full_safe_evictable=0,
+            full_high_evictable=0,
+        )
+        deferred = self._make_req(
+            "deferred-lp",
+            priority=0,
+            max_new_tokens=4096,
+            reuse_req_slot=True,
+            reuse_main=True,
+            reuse_ping_pong=True,
+        )
+        adder.set_deferred_chunked_req(deferred, lambda _req: None)
+        hp = self._make_req("hp", priority=1, extend=8)
+        demand = adder._make_ref_aware_demand(hp, truncation_align_size=None)
+
+        # The full deficit is real and nothing can cover it, so the pre-check
+        # must refuse rather than bank the owner's phantom reservation.
+        self.assertGreater(adder._ref_aware_deficits(demand)[0], 0)
+        self.assertEqual(
+            adder._deferred_release_gain_lower_bound(deferred)[0],
+            0,
+        )
+        self.assertFalse(adder._reclaim_could_satisfy(demand, []))
+
     def test_authorization_is_never_lowered_by_a_later_smaller_hp(self):
         adder, _ = self._make_adder(
             full_available=0,

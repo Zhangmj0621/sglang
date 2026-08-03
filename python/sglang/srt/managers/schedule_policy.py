@@ -915,22 +915,23 @@ class PrefillAdder:
 
         Evaluated BEFORE any destructive release so an impossible candidate
         costs nothing.  The deferred LP chunk is included because
-        ``_plan_high_priority_admission`` may reclaim it too.
+        ``_plan_high_priority_admission`` may reclaim it too -- but through
+        its own gain helper, because a deferred owner frees different
+        resources than a running request does.
         """
         full_deficit, req_slot_deficit, mamba_deficit = self._ref_aware_deficits(demand)
         if not (full_deficit or req_slot_deficit or mamba_deficit):
             return True
 
-        candidates = list(victims)
-        deferred = self.deferred_chunked_req
-        if deferred is not None and not self.tree_cache.is_high_priority(
-            deferred.priority or 0
-        ):
-            candidates.append(deferred)
-
         full_gain = req_slot_gain = mamba_gain = 0
-        for candidate in candidates:
+        for candidate in victims:
             gains = self._release_gain_lower_bound(candidate)
+            full_gain += gains[0]
+            req_slot_gain += gains[1]
+            mamba_gain += gains[2]
+
+        if self._deferred_chunk_is_reclaimable():
+            gains = self._deferred_release_gain_lower_bound(self.deferred_chunked_req)
             full_gain += gains[0]
             req_slot_gain += gains[1]
             mamba_gain += gains[2]
