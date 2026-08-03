@@ -2533,7 +2533,14 @@ class Scheduler(
         req: Req,
         deferred_chunked_req: Optional[Req],
     ) -> bool:
-        """Return whether admission may proceed without creating two owners."""
+        """Return whether admission may proceed without creating two owners.
+
+        This decision is side-effect free.  Retracting the deferred owner is
+        deferred to _plan_high_priority_admission, which only does so after
+        its feasibility pre-check has confirmed the HP candidate can actually
+        be admitted -- otherwise a mere prediction would cost the LP chunk its
+        progress while the HP fails anyway.
+        """
         if not adder.would_become_chunk(req, self.truncation_align_size):
             return True
         if (
@@ -2548,7 +2555,9 @@ class Scheduler(
             and adder.deferred_chunked_req is deferred_chunked_req
             and self.tree_cache.is_high_priority(req.priority or 0)
         ):
-            return adder.reclaim_deferred_chunk_for_new_owner()
+            # Let the candidate through; the planner retires the old owner
+            # only if the candidate is truly admissible.
+            return True
         return False
 
     def _stable_partition_ref_aware_waiting_queue(self) -> None:

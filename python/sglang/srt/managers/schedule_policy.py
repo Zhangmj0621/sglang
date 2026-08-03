@@ -815,10 +815,6 @@ class PrefillAdder:
         self._append_requeue_after_scan(req)
         return True
 
-    def reclaim_deferred_chunk_for_new_owner(self) -> bool:
-        """Resolve an LP old owner before an HP candidate opens a new chunk."""
-        return self._reclaim_deferred_low_priority_chunk()
-
     def _running_low_priority_victims(self) -> List[Req]:
         victims = [
             req

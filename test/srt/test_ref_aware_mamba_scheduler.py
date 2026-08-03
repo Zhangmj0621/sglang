@@ -645,6 +645,25 @@ class _DeferredChunkAdder:
             self.requeue_after_scan.append(req)
 
 
+class _ConflictAdder(_DeferredChunkAdder):
+    """Records whether the conflict check itself destroyed the old owner."""
+
+    def __init__(self, req, would_chunk, reclaim_returns=False):
+        super().__init__(req, ChunkedReqStatus.UNFINISHED)
+        self._would_chunk = would_chunk
+        self._reclaim_returns = reclaim_returns
+        self.reclaim_calls = 0
+
+    def would_become_chunk(self, req, truncation_align_size):
+        return self._would_chunk
+
+    def reclaim_deferred_chunk_for_new_owner(self):
+        self.reclaim_calls += 1
+        if self._reclaim_returns:
+            self.deferred_chunked_req = None
+        return self._reclaim_returns
+
+
 class TestDelayedChunkSingleOwner(unittest.TestCase):
     def _scheduler(self, old):
         try:
@@ -786,14 +805,24 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         self.assertEqual(old.is_chunked, 0)
         self.assertEqual(new.is_chunked, 1)
 
-    def test_candidate_conflict_table_resolves_old_before_new_owner_branch(self):
+    def test_candidate_conflict_table_never_retracts_the_old_owner(self):
+        """The conflict check must never retract the deferred owner itself.
+
+        is_high_priority is a real lambda keyed off the candidate's
+        ``priority`` field (not a Mock return_value), so this also exercises
+        the actual priority comparison across the (high, would_chunk) grid
+        in one place -- catching a future edit that flips one branch.
+        _resolve_candidate_chunk_conflict is side-effect free: the deferred
+        owner survives until _plan_high_priority_admission decides the HP
+        candidate is actually admissible.
+        """
         cases = (
-            # high, would_chunk, expected proceed, expected reclaim
-            (True, False, True, False),
-            (True, True, True, True),
-            (False, True, False, False),
+            # high, would_chunk, expected proceed
+            (True, False, True),
+            (True, True, True),
+            (False, True, False),
         )
-        for high, would_chunk, expected, should_reclaim in cases:
+        for high, would_chunk, expected in cases:
             with self.subTest(high=high, would_chunk=would_chunk):
                 old = _ChunkReq("old")
                 candidate = _ChunkReq("candidate")
@@ -806,25 +835,14 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
                 adder.new_chunked_req = None
                 adder.would_become_chunk.return_value = would_chunk
 
-                def reclaim():
-                    scheduler.chunked_req = None
-                    adder.deferred_chunked_req = None
-                    return True
-
-                adder.reclaim_deferred_chunk_for_new_owner.side_effect = reclaim
-
                 proceed = scheduler._resolve_candidate_chunk_conflict(
                     adder, candidate, old
                 )
 
                 self.assertEqual(proceed, expected)
-                self.assertEqual(
-                    adder.reclaim_deferred_chunk_for_new_owner.call_count,
-                    int(should_reclaim),
-                )
-                if should_reclaim:
-                    self.assertIsNone(scheduler.chunked_req)
-                    self.assertIsNone(adder.deferred_chunked_req)
+                adder.reclaim_deferred_chunk_for_new_owner.assert_not_called()
+                self.assertIs(scheduler.chunked_req, old)
+                self.assertIs(adder.deferred_chunked_req, old)
 
     def test_non_ref_active_owner_conflict_does_not_require_priority_api(self):
         old = _ChunkReq("old")
@@ -1122,6 +1140,58 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         adder.deferred_chunked_req = None
 
         self.assertGreater(scheduler._ref_aware_running_slot_reclaim_need(adder), 0)
+
+    def test_conflict_check_does_not_retract_the_deferred_owner(self):
+        """The check runs before capacity is known, so it must not destroy.
+
+        would_become_chunk() is a prediction: init_load_back can change the
+        post-lock shape, and the HP candidate may still be rejected for
+        capacity.  Retracting here cost the LP chunk its progress while the
+        HP did not run either.
+        """
+        old = _ChunkReq("deferred-lp")
+        scheduler = self._scheduler(old)
+        scheduler.truncation_align_size = None
+        scheduler.tree_cache.is_high_priority = Mock(return_value=True)
+        adder = _ConflictAdder(old, would_chunk=True)
+        candidate = _ChunkReq("hp-candidate")
+        candidate.priority = 1
+
+        proceed = scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+
+        self.assertTrue(proceed)
+        self.assertEqual(adder.reclaim_calls, 0)
+        self.assertIs(adder.deferred_chunked_req, old)
+        self.assertIs(scheduler.chunked_req, old)
+        self.assertEqual(old.reset_calls, 0)
+        self.assertEqual(adder.requeue_after_scan, [])
+
+    def test_conflict_check_still_blocks_a_second_owner(self):
+        """A non-HP candidate that would chunk must not be let through."""
+        old = _ChunkReq("deferred-lp")
+        scheduler = self._scheduler(old)
+        scheduler.truncation_align_size = None
+        scheduler.tree_cache.is_high_priority = Mock(return_value=False)
+        adder = _ConflictAdder(old, would_chunk=True)
+        candidate = _ChunkReq("lp-candidate")
+
+        proceed = scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+
+        self.assertFalse(proceed)
+        self.assertEqual(adder.reclaim_calls, 0)
+        self.assertIs(adder.deferred_chunked_req, old)
+
+    def test_non_chunking_candidate_always_proceeds(self):
+        old = _ChunkReq("deferred-lp")
+        scheduler = self._scheduler(old)
+        scheduler.truncation_align_size = None
+        adder = _ConflictAdder(old, would_chunk=False)
+        candidate = _ChunkReq("small-candidate")
+
+        self.assertTrue(
+            scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
+        )
+        self.assertEqual(adder.reclaim_calls, 0)
 
 
 if __name__ == "__main__":
