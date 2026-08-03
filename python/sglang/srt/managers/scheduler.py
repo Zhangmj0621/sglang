@@ -2555,8 +2555,12 @@ class Scheduler(
             and adder.deferred_chunked_req is deferred_chunked_req
             and self.tree_cache.is_high_priority(req.priority or 0)
         ):
-            # Let the candidate through; the planner retires the old owner
-            # only if the candidate is truly admissible.
+            # Let the candidate through without destroying anything.  The
+            # deferred LP owner still holds self.chunked_req, so add_one_req
+            # sees has_chunked_req=True and rejects a would-chunk candidate
+            # with OTHER; the old owner is then admitted by the end-of-scan
+            # _try_add_deferred_chunk.  HP takeover of a deferred owner is
+            # deliberately not supported -- the LP owner wins the round.
             return True
         return False
 

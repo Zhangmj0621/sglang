@@ -473,8 +473,8 @@ class PrefillAdder:
         self.reserved_mamba_states = 0
         self.reserved_full_current = 0
         self.reserved_full_future = 0
-        # Task 5 will populate these after real LP reclaim.  Defining them here
-        # keeps the admission ledger complete without granting authorization.
+        # Populated by _plan_high_priority_admission after real LP reclaim;
+        # only a high-priority candidate's residual shortfall is authorized.
         self.authorized_high_full_shortfall = 0
         self.authorized_high_mamba_shortfall = 0
 

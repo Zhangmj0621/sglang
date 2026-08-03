@@ -648,20 +648,12 @@ class _DeferredChunkAdder:
 class _ConflictAdder(_DeferredChunkAdder):
     """Records whether the conflict check itself destroyed the old owner."""
 
-    def __init__(self, req, would_chunk, reclaim_returns=False):
+    def __init__(self, req, would_chunk):
         super().__init__(req, ChunkedReqStatus.UNFINISHED)
         self._would_chunk = would_chunk
-        self._reclaim_returns = reclaim_returns
-        self.reclaim_calls = 0
 
     def would_become_chunk(self, req, truncation_align_size):
         return self._would_chunk
-
-    def reclaim_deferred_chunk_for_new_owner(self):
-        self.reclaim_calls += 1
-        if self._reclaim_returns:
-            self.deferred_chunked_req = None
-        return self._reclaim_returns
 
 
 class TestDelayedChunkSingleOwner(unittest.TestCase):
@@ -840,7 +832,6 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
                 )
 
                 self.assertEqual(proceed, expected)
-                adder.reclaim_deferred_chunk_for_new_owner.assert_not_called()
                 self.assertIs(scheduler.chunked_req, old)
                 self.assertIs(adder.deferred_chunked_req, old)
 
@@ -861,7 +852,6 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         )
 
         self.assertFalse(proceed)
-        adder.reclaim_deferred_chunk_for_new_owner.assert_not_called()
 
     def test_merely_deferred_owner_is_never_a_batch_owner(self):
         old = _ChunkReq("old")
@@ -1160,7 +1150,6 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         proceed = scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
 
         self.assertTrue(proceed)
-        self.assertEqual(adder.reclaim_calls, 0)
         self.assertIs(adder.deferred_chunked_req, old)
         self.assertIs(scheduler.chunked_req, old)
         self.assertEqual(old.reset_calls, 0)
@@ -1178,7 +1167,6 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         proceed = scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
 
         self.assertFalse(proceed)
-        self.assertEqual(adder.reclaim_calls, 0)
         self.assertIs(adder.deferred_chunked_req, old)
 
     def test_non_chunking_candidate_always_proceeds(self):
@@ -1191,7 +1179,9 @@ class TestDelayedChunkSingleOwner(unittest.TestCase):
         self.assertTrue(
             scheduler._resolve_candidate_chunk_conflict(adder, candidate, old)
         )
-        self.assertEqual(adder.reclaim_calls, 0)
+        self.assertIs(adder.deferred_chunked_req, old)
+        self.assertIs(scheduler.chunked_req, old)
+        self.assertEqual(old.reset_calls, 0)
 
 
 if __name__ == "__main__":
