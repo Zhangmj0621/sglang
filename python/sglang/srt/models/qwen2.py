@@ -38,6 +38,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rmsnorm_fused_ar import get_fused_ar_staging_view
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -96,6 +97,7 @@ class Qwen2MLP(nn.Module):
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
         skip_all_reduce: bool = False,
+        output_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
@@ -103,7 +105,10 @@ class Qwen2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, forward_batch=forward_batch, skip_all_reduce=skip_all_reduce
+            x,
+            forward_batch=forward_batch,
+            skip_all_reduce=skip_all_reduce,
+            output_tensor=output_tensor,
         )
         return x
 
@@ -208,12 +213,17 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         skip_all_reduce: bool = False,
+        output_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_all_reduce)
+        output, _ = self.o_proj(
+            attn_output,
+            skip_all_reduce=skip_all_reduce,
+            output_tensor=output_tensor,
+        )
         return output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
@@ -298,6 +308,20 @@ class Qwen2DecoderLayer(nn.Module):
         # every branch below is identical to the pre-fusion code.
         use_fused_ar = self._fuse_ar_norm and hidden_states.shape[0] != 0
 
+        # Direct-write: let the producer GEMM write its partial sum straight
+        # into the fused-AR symm buffer, eliminating the staging copy inside
+        # the fused norm (it detects pointer equality and skips copy_). None
+        # (flag off / resources not built yet / payload too large) means the
+        # GEMM allocates its own output and the fused norm's copy_ is the
+        # fallback — behavior identical to the pre-direct-write code.
+        staging = (
+            get_fused_ar_staging_view(
+                num_tokens=hidden_states.shape[0], hidden=self.hidden_size
+            )
+            if use_fused_ar
+            else None
+        )
+
         # Self Attention
         if residual is None:
             # First layer of the model (embedding output is already
@@ -324,6 +348,7 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             skip_all_reduce=use_fused_ar,
+            output_tensor=staging,
         )
 
         # Fully Connected
@@ -337,7 +362,12 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual, quant_linear=self.mlp.gate_up_proj
             )
-        hidden_states = self.mlp(hidden_states, skip_all_reduce=use_fused_ar)
+        # Same view as the attention side: the fused norm above has already
+        # consumed the buffer (its output was copied out), so down_proj may
+        # overwrite it — same-stream ordering keeps this race-free.
+        hidden_states = self.mlp(
+            hidden_states, skip_all_reduce=use_fused_ar, output_tensor=staging
+        )
         return hidden_states, residual
 
 

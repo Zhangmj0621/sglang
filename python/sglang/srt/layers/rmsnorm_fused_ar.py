@@ -205,6 +205,32 @@ def _prepare_residual(
     return ensure_full_residual(residual)
 
 
+def get_fused_ar_staging_view(
+    *, num_tokens: int, hidden: int, use_attn_tp_group: bool = True
+) -> Optional[torch.Tensor]:
+    """Return a [num_tokens, hidden] view of the fused-AR symm buffer for a
+    producer GEMM to write into, or None when the fused path is off/not ready.
+
+    None (instead of raise) because the caller decides between direct-write
+    and the plain path BEFORE the GEMM; returning None keeps that call site
+    branch-free-safe during warmup (resources not built yet) and under
+    capture of the very first forward."""
+    if not rmsnorm_fused_ar_enabled():
+        return None
+    group = _select_group(use_attn_tp_group)
+    comm = group.torch_symm_mem_comm
+    if comm is None or comm.disabled:
+        return None
+    key = comm.group.group_name
+    res = _RESOURCES.get(key)
+    if res is None:
+        return None  # first eager call will build; that call still does copy_
+    n = num_tokens * hidden
+    if n * 2 > res.max_size:
+        return None
+    return res.buffer[:n].view(num_tokens, hidden)
+
+
 def rmsnorm_fused_ar_forward(
     *,
     x: torch.Tensor,
@@ -243,7 +269,13 @@ def rmsnorm_fused_ar_forward(
     start, end = _token_shard(num_tokens, res.rank, res.world_size)
 
     buf = res.buffer[: x.numel()].view(num_tokens, hidden)
-    buf.copy_(x)  # staging copy: this rank's partial sums, all tokens
+    if x.data_ptr() == buf.data_ptr():
+        # Producer GEMM already wrote into the staging buffer (see
+        # get_fused_ar_staging_view); pointer equality suffices because the
+        # direct-write path passes back the very same view.
+        pass
+    else:
+        buf.copy_(x)  # staging copy: this rank's partial sums, all tokens
     mega_ops.rmsnorm_fused_ar(
         input=buf[start:end],
         residual=residual[start:end],
