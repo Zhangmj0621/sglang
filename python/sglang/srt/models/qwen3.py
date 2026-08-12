@@ -33,7 +33,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
@@ -383,6 +383,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -423,12 +424,30 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+
+        fuse_mlp_allreduce = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+
+        if fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
         return hidden_states, residual
 
 
@@ -447,6 +466,46 @@ class Qwen3Model(Qwen2Model):
             decoder_layer_type=Qwen3DecoderLayer,
             alt_stream=alt_stream,
         )
+        # Unlike Qwen2DecoderLayer (hand-wired: every layer unconditionally
+        # defers its own AR to the next consumer norm), Qwen3DecoderLayer
+        # goes through LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer,
+        # which returns False for the last layer. That means the last layer's
+        # mlp runs its down_proj's own ordinary all-reduce (fuse_mlp_allreduce
+        # is False, so should_skip_mlp_all_reduce() is False), and
+        # postprocess_layer's tensor-pair fn resolves to `_trivial` here
+        # (FULL and TP_ATTN_FULL are the same process-group size once
+        # dp-attention and attn-cp are startup-blocked), passing hidden_states
+        # through unchanged. So by the time Qwen2Model.forward reaches the
+        # final norm, hidden_states is already fully reduced — only the
+        # residual is still shard-marked (from prepare_mlp's fused branch).
+        # The inherited `_fuse_ar_norm` branch would call
+        # norm.forward_with_allreduce_fusion(hidden_states, residual), which
+        # unconditionally all-reduces `hidden_states` again (double-reduce).
+        # Keep it off: the plain `self.norm(hidden_states, residual)` path
+        # already completes a shard-marked residual via
+        # RMSNorm.forward_cuda's `_mega_residual_shard` check (see
+        # layernorm.py), so it is the correct path for a fully-reduced
+        # hidden_states paired with a still-sharded residual.
+        #
+        # Cost note (accepted, not restructured): unlike qwen2's hand-wired
+        # path — which defers AR all the way to the final norm on every
+        # layer including the last, so there is no *extra* collective at
+        # the model's final norm beyond what every other layer already
+        # pays — this final norm now runs one more `ensure_full_residual`
+        # all_gather per forward pass than qwen2's design needs, since the
+        # last layer's residual is still shard-marked when it arrives here.
+        # That all_gather is the same shape/cost class as the per-layer AG
+        # the fused kernel already issues at every other layer's
+        # prepare_attn (~N/tp_size * H elements), i.e. roughly 1/(2L) of
+        # this forward's total fused-ar communication for an L-layer model
+        # — not a new order of cost, just one extra instance of an
+        # existing one. Restructuring to fuse the final norm into the last
+        # layer's chain (avoiding this instance entirely) is deferred: do
+        # NOT restructure now. If GPU measurement later shows this AG is
+        # actually visible in end-to-end latency, revisit by folding the
+        # final norm into the last decoder layer's postprocess step instead
+        # of leaving it to Qwen2Model.forward's standalone final-norm call.
+        self._fuse_ar_norm = False
 
 
 class Qwen3ForCausalLM(nn.Module):

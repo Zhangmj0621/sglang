@@ -4326,6 +4326,7 @@ class ServerArgs:
             raise ValueError("--enable-rmsnorm-fused-ar is not supported on ROCm.")
         allowed_archs = {
             "Qwen2ForCausalLM",
+            "Qwen3ForCausalLM",
             "Qwen3MoeForCausalLM",
             "Glm4MoeForCausalLM",
             "NemotronHForCausalLM",
@@ -4353,6 +4354,23 @@ class ServerArgs:
             raise ValueError(
                 "--enable-rmsnorm-fused-ar requires TP world size in "
                 f"{{2, 4, 6, 8}}, got tp_size={self.tp_size}."
+            )
+        if self.ep_size > 1:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar is incompatible with expert "
+                "parallelism (ep_size > 1): allowlisted MoE models consume "
+                "the deferred-AR marker with use_attn_tp_group=False, which "
+                "routes the completing collective over the moe_ep/moe_tp "
+                f"group instead of the full TP group (ep_size={self.ep_size})."
+            )
+        if self.moe_dp_size > 1:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar is incompatible with MoE data "
+                "parallelism (moe_dp_size > 1): moe_tp_size is derived as "
+                "tp_size // moe_ep_size // moe_dp_size, so moe_dp_size > 1 "
+                "shrinks the moe_tp group below the full TP group the "
+                "producer actually skipped its all-reduce over "
+                f"(moe_dp_size={self.moe_dp_size})."
             )
         if self.enable_dp_attention:
             raise ValueError(

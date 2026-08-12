@@ -179,6 +179,15 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
+def apply_rmsnorm_fused_ar() -> bool:
+    """True when the multimem fused-AR path should take the fusion branches.
+
+    Startup validation (_handle_rmsnorm_fused_ar) guarantees every config
+    reaching a fusion branch with this flag on is eligible — no per-shape
+    checks needed here; ineligible inputs raise inside the fused call."""
+    return get_exec().comm.enable_rmsnorm_fused_ar
+
+
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
@@ -604,7 +613,8 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_aiter_all_reduce_fusion(hidden_states)
+                    apply_rmsnorm_fused_ar()
+                    or apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
@@ -863,7 +873,8 @@ class LayerCommunicator:
 
         return (
             (
-                apply_flashinfer_allreduce_fusion(batch_size)
+                apply_rmsnorm_fused_ar()
+                or apply_flashinfer_allreduce_fusion(batch_size)
                 or (
                     _use_aiter
                     and batch_size > 0
@@ -1138,7 +1149,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # runs a collective all_gather over that group; calling it from only
         # one rank would hang. This one call dominates both the layernorm
         # call and the `+=` read in the branches that follow.
-        residual = _ensure_full_residual_for_fused_ar(residual)
+        # Skipped when our flag is on: the `context.attn_dp_size != 1` branch
+        # below (the only other consumer of `residual` before the fused
+        # branch) is unreachable in that case — --enable-dp-attention is
+        # hard-blocked at startup by _handle_rmsnorm_fused_ar, so
+        # attn_dp_size == 1 is guaranteed — and the `else:` branch's fused
+        # call (`apply_rmsnorm_fused_ar() or ...` below) consumes the
+        # still-sharded residual itself. Completing it here first would just
+        # be a wasted all_gather (un-shard then immediately re-shard) on
+        # every layer. `apply_rmsnorm_fused_ar()` is a plain config read
+        # (uniform across ranks), so this guard itself stays rank-uniform.
+        if not apply_rmsnorm_fused_ar():
+            residual = _ensure_full_residual_for_fused_ar(residual)
         if context.attn_dp_size != 1:
             use_layer_norm_before_gather = (
                 context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
@@ -1172,7 +1194,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             handled = False
             if (
-                apply_aiter_all_reduce_fusion(hidden_states)
+                apply_rmsnorm_fused_ar()
+                or apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
