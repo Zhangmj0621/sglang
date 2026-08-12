@@ -194,6 +194,20 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     )
 
 
+def _ensure_full_residual_for_fused_ar(
+    residual: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Complete a residual left sharded by the rmsnorm-fused-ar path before
+    any transform that would drop its shard marker (slicing, cloning,
+    gather-rebinding) and silently expose stale rows. No-op when the flag is
+    off (one config read) or the tensor is unmarked (one attribute check)."""
+    if residual is None or not get_exec().comm.enable_rmsnorm_fused_ar:
+        return residual
+    from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
+
+    return ensure_full_residual(residual)
+
+
 class ScatterMode(Enum):
     """
     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
@@ -519,6 +533,15 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
+            # rmsnorm-fused-ar: complete residual before any aux-capture read
+            # below — both the `hidden_states=residual` alias call right here
+            # (into `_scattered_to_tp_attn_full`'s gather) and the clone
+            # further down. A fused-AR residual is always full-shaped, so it
+            # can never legally hit that call's SCATTERED->TP_ATTN_FULL gather
+            # path (DFLASH/DSPARK aux capture is not startup-blocked, unlike
+            # eagle3) — this call is defense in depth and a no-op when
+            # residual is unmarked or the flag is off.
+            residual = _ensure_full_residual_for_fused_ar(residual)
             gathered_last_layer_output = self._communicate_simple_fn(
                 hidden_states=residual,
                 forward_batch=forward_batch,
@@ -751,6 +774,7 @@ class LayerCommunicator:
         output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
         get_tp_group().reduce_scatter_tensor(output, hidden_states)
         if residual is not None:
+            residual = _ensure_full_residual_for_fused_ar(residual)
             residual = residual.tensor_split(self._context.tp_size)[
                 self._context.tp_rank
             ]
@@ -1102,11 +1126,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
+            residual = _ensure_full_residual_for_fused_ar(residual)
             residual, local_residual = (
                 get_local_dp_buffer(get_parallel().attn_tp_group),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
+        # rmsnorm-fused-ar: hoisted here (rank-uniform — every rank of the
+        # attn_tp group reaches this point together) rather than inside the
+        # `attn_tp_rank == 0`-only branch below, since `ensure_full_residual`
+        # runs a collective all_gather over that group; calling it from only
+        # one rank would hang. This one call dominates both the layernorm
+        # call and the `+=` read in the branches that follow.
+        residual = _ensure_full_residual_for_fused_ar(residual)
         if context.attn_dp_size != 1:
             use_layer_norm_before_gather = (
                 context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
@@ -1182,6 +1214,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         ]
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+            residual = _ensure_full_residual_for_fused_ar(residual)
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
@@ -1198,6 +1231,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             return hidden_states, hidden_states
 
         scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
+        residual = _ensure_full_residual_for_fused_ar(residual)
         scattered_states += residual
         residual = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = layernorm(residual)

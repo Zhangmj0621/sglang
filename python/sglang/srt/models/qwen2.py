@@ -95,13 +95,16 @@ class Qwen2MLP(nn.Module):
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, forward_batch=forward_batch)
+        x, _ = self.down_proj(
+            x, forward_batch=forward_batch, skip_all_reduce=skip_all_reduce
+        )
         return x
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
@@ -204,12 +207,13 @@ class Qwen2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_all_reduce)
         return output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
@@ -280,6 +284,7 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._fuse_ar_norm = get_exec().comm.enable_rmsnorm_fused_ar
 
     def forward(
         self,
@@ -288,11 +293,27 @@ class Qwen2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # When on, o_proj/down_proj skip their internal all-reduce and the
+        # consumer norm below performs it fused with the residual-add. Off ⇒
+        # every branch below is identical to the pre-fusion code.
+        use_fused_ar = self._fuse_ar_norm and hidden_states.shape[0] != 0
+
         # Self Attention
         if residual is None:
+            # First layer of the model (embedding output is already
+            # replicated across TP ranks, so no all-reduce is needed here
+            # regardless of the flag).
             residual = hidden_states
             hidden_states = self.input_layernorm(
                 hidden_states, quant_linear=self.self_attn.qkv_proj
+            )
+        elif use_fused_ar:
+            # `hidden_states` here is the previous layer's down_proj partial
+            # sum (AR skipped there); fuse that AR into this norm.
+            hidden_states, residual = (
+                self.input_layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual
+                )
             )
         else:
             hidden_states, residual = self.input_layernorm(
@@ -302,13 +323,21 @@ class Qwen2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            skip_all_reduce=use_fused_ar,
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual, quant_linear=self.mlp.gate_up_proj
-        )
-        hidden_states = self.mlp(hidden_states)
+        if use_fused_ar:
+            hidden_states, residual = (
+                self.post_attention_layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual
+                )
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual, quant_linear=self.mlp.gate_up_proj
+            )
+        hidden_states = self.mlp(hidden_states, skip_all_reduce=use_fused_ar)
         return hidden_states, residual
 
 
@@ -380,6 +409,7 @@ class Qwen2Model(nn.Module):
             )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        self._fuse_ar_norm = get_exec().comm.enable_rmsnorm_fused_ar
 
         # For EAGLE3 support
         self.layers_to_capture = []
@@ -437,6 +467,12 @@ class Qwen2Model(nn.Module):
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
+                elif self._fuse_ar_norm:
+                    # Last layer's down_proj partial sum (AR skipped there);
+                    # fuse that AR into the final norm.
+                    hidden_states, _ = self.norm.forward_with_allreduce_fusion(
+                        hidden_states, residual
+                    )
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -592,9 +628,16 @@ class Qwen2ForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
+            if self.model._fuse_ar_norm and forward_batch.residual is not None:
+                # Last layer's down_proj partial sum (AR skipped there);
+                # fuse that AR into the final norm, same as Qwen2Model.forward.
+                hidden_states, _ = self.model.norm.forward_with_allreduce_fusion(
+                    forward_batch.hidden_states, forward_batch.residual
+                )
+            else:
+                hidden_states, _ = self.model.norm(
+                    forward_batch.hidden_states, forward_batch.residual
+                )
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(

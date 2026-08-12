@@ -212,6 +212,42 @@ def _forward_with_allreduce_fusion(
             else:
                 world_size = get_parallel().moe_tp_size
 
+        if get_exec().comm.enable_rmsnorm_fused_ar:
+            if post_residual_addition is not None:
+                # The fused kernel folds the residual in place per shard;
+                # a full-tensor pre-addition would silently combine with a
+                # possibly-sharded residual. Hard-fail per the flag's
+                # crash-on-ineligible contract.
+                raise RuntimeError(
+                    "--enable-rmsnorm-fused-ar does not support "
+                    "post_residual_addition."
+                )
+            if world_size <= 1:
+                # The producer linear skips its all-reduce over the full TP
+                # group whenever this flag is on (see communicator.py), so a
+                # fused group of size 1 here cannot reduce the partial sum —
+                # falling through would silently norm unreduced data. Hard-
+                # fail per the flag's crash-on-ineligible contract instead.
+                raise RuntimeError(
+                    "--enable-rmsnorm-fused-ar: fused-AR norm reached with "
+                    f"world_size={world_size}; the producer linear skipped "
+                    "its all-reduce over the full TP group, so a fused "
+                    "group of size 1 cannot reduce it (check attn_tp_size "
+                    "== tp_size)."
+                )
+
+            from sglang.srt.layers.rmsnorm_fused_ar import (
+                rmsnorm_fused_ar_forward,
+            )
+
+            return rmsnorm_fused_ar_forward(
+                x=x,
+                residual=residual,
+                weight=weight,
+                eps=norm_module.variance_epsilon,
+                use_attn_tp_group=use_attn_tp_group,
+            )
+
         if world_size > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
@@ -240,6 +276,18 @@ def _forward_with_allreduce_fusion(
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
+    if (
+        residual is not None
+        and getattr(residual, "_mega_residual_shard", None) is not None
+    ):
+        # A residual left sharded by an earlier fused-AR call (this call's
+        # own flag-ON path never reaches here — it always raises or returns
+        # above) must be completed before any non-fused consumer reads it.
+        # The marker's presence implies the flag was on, so no config read
+        # is needed on the common (unmarked) path.
+        from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
+
+        residual = ensure_full_residual(residual)
     return norm_module.forward(x, residual, post_residual_addition)
 
 
@@ -473,6 +521,19 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            residual is not None
+            and getattr(residual, "_mega_residual_shard", None) is not None
+        ):
+            # A residual left sharded by the fused-AR path must be completed
+            # before any non-fused consumer reads it — this covers the final
+            # model.norm(hidden_states, residual). The marker can only exist
+            # when --enable-rmsnorm-fused-ar produced it, so checking the
+            # tensor attribute first (free, publish-independent) avoids an
+            # unconditional get_exec() read on the flag-off common path.
+            from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
+
+            residual = ensure_full_residual(residual)
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:

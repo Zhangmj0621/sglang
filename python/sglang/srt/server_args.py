@@ -1998,6 +1998,15 @@ class ServerArgs:
     enforce_disable_flashinfer_allreduce_fusion: A[
         bool, "Enforce disable FlashInfer allreduce fusion.", NS("exec.comm")
     ] = False
+    enable_rmsnorm_fused_ar: A[
+        bool,
+        "Fuse TP all-reduce + residual-add + RMSNorm into a single multimem "
+        "kernel (reduce-scatter + all-gather via NVLink Switch multicast). "
+        "Requires SM90+, NVSwitch multicast, --enable-torch-symm-mem, TP "
+        "world size in {2,4,6,8}, and bf16 models. Ineligible inputs raise "
+        "instead of falling back.",
+        NS("exec.comm"),
+    ] = False
     flashinfer_allreduce_fusion_backend: A[
         Optional[Literal["auto", "trtllm", "mnnvl"]],
         Arg(
@@ -3571,6 +3580,9 @@ class ServerArgs:
         # Must run before _handle_attention_backend_compatibility so the
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
+        # Must run after _handle_deterministic_inference, which may disable
+        # torch symm mem.
+        self._handle_rmsnorm_fused_ar()
         self._handle_attention_backend_compatibility()
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
@@ -4301,6 +4313,103 @@ class ServerArgs:
             logger.warning(
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
+            )
+
+    def _handle_rmsnorm_fused_ar(self):
+        """Fail fast on any configuration the fused RS+RMSNorm+AG kernel
+        cannot serve. Flag on is a hard commitment: no silent fallback."""
+        if not self.enable_rmsnorm_fused_ar:
+            return
+        from sglang.srt.utils import is_hip
+
+        if is_hip():
+            raise ValueError("--enable-rmsnorm-fused-ar is not supported on ROCm.")
+        allowed_archs = {
+            "Qwen2ForCausalLM",
+            "Qwen3MoeForCausalLM",
+            "Glm4MoeForCausalLM",
+            "NemotronHForCausalLM",
+        }
+        model_arch = self.get_model_config().hf_config.architectures[0]
+        if model_arch not in allowed_archs:
+            raise ValueError(
+                f"--enable-rmsnorm-fused-ar does not support model architecture "
+                f"{model_arch!r}. Only decoder layers verified to skip their "
+                "own all-reduce under this flag (dense Qwen2, or MoE models "
+                "that set hidden_states._sglang_needs_allreduce_fusion) are "
+                f"eligible: {sorted(allowed_archs)}."
+            )
+        if self.enable_deterministic_inference:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar is incompatible with "
+                "--enable-deterministic-inference (which disables torch symm mem)."
+            )
+        if not self.enable_torch_symm_mem:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar requires --enable-torch-symm-mem "
+                "(it reuses the torch symm-mem buffer and rendezvous)."
+            )
+        if self.tp_size not in (2, 4, 6, 8):
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar requires TP world size in "
+                f"{{2, 4, 6, 8}}, got tp_size={self.tp_size}."
+            )
+        if self.enable_dp_attention:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar is incompatible with "
+                "--enable-dp-attention: the fused kernel must reduce over "
+                "the full TP group, but DP attention shrinks the attention-TP "
+                "group."
+            )
+        if self.attn_cp_size > 1:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar is incompatible with "
+                "--attention-context-parallel-size > 1: the fused kernel "
+                "must reduce over the full TP group, but attention context "
+                "parallelism shrinks the attention-TP group "
+                f"(attn_cp_size={self.attn_cp_size})."
+            )
+        if self.pp_size > 1:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar requires pp_size == 1: the "
+                "sharded-residual state does not survive pipeline-parallel "
+                "transport."
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar is incompatible with speculative "
+                "decoding: draft models reuse decoder layers outside the "
+                "fused-norm contract."
+            )
+        if self.enable_torch_compile:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar is incompatible with "
+                "--enable-torch-compile: torch.compile dispatches RMSNorm "
+                "through forward_native, which has no fused-AR completion "
+                "hook, so a sharded (unreduced) residual would be silently "
+                "read as complete."
+            )
+        for _phase in Phase.ALL:
+            if getattr(self.cuda_graph_config, _phase).backend == Backend.TC_PIECEWISE:
+                raise ValueError(
+                    "--enable-rmsnorm-fused-ar is incompatible with the "
+                    f"tc_piecewise CUDA graph backend ({_phase} phase): like "
+                    "--enable-torch-compile, it dispatches RMSNorm through "
+                    "forward_native, which has no fused-AR completion hook, "
+                    "so a sharded (unreduced) residual would be silently "
+                    "read as complete."
+                )
+        try:
+            import mega_ops
+        except ImportError as e:
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar requires the mega_ops package "
+                "(pip install -e <MegaAttention-v2 repo root>)."
+            ) from e
+        if not mega_ops.is_available():
+            raise ValueError(
+                "--enable-rmsnorm-fused-ar: mega_ops is installed but "
+                "unavailable (needs CUDA and SM90+)."
             )
 
     def _apply_deepep_adjustments(self):
