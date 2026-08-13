@@ -33,7 +33,12 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+    apply_rmsnorm_fused_ar,
+)
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -55,6 +60,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rmsnorm_fused_ar import get_fused_ar_staging_view
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -673,7 +679,11 @@ class Qwen3MoeAttention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-    def forward_core(self, intermediate_state):
+    def forward_core(
+        self,
+        intermediate_state,
+        output_tensor: Optional[torch.Tensor] = None,
+    ):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
@@ -692,7 +702,7 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, output_tensor=output_tensor)
         return output
 
     def forward(
@@ -700,13 +710,14 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        output_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        return self.forward_core(s)
+        return self.forward_core(s, output_tensor=output_tensor)
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
@@ -819,10 +830,33 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         if hidden_states.shape[0] != 0:
+            # Direct-write (attention side): let o_proj write its partial sum
+            # straight into the fused-AR symm buffer; prepare_mlp's fused
+            # branch (communicator._gather_hidden_states_and_residual with
+            # use_attn_tp_group=True) detects pointer equality and skips its
+            # staging copy_. Only when mlp_mode is FULL is that branch the
+            # consumer (under this flag's startup constraints — no a2a
+            # backend, no moe-cp allgather, no dwdp — it always is; the mode
+            # check keeps the write provably tied to its reader). None (flag
+            # off / resources not built yet / payload too large) keeps o_proj
+            # allocating its own output — byte-identical to the
+            # pre-direct-write code. The MoE side is untouched: the experts'
+            # output comes from MoE kernels that allocate their own tensors.
+            attn_staging = (
+                get_fused_ar_staging_view(
+                    num_tokens=hidden_states.shape[0],
+                    hidden=self.hidden_size,
+                    use_attn_tp_group=True,
+                )
+                if apply_rmsnorm_fused_ar()
+                and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
+                else None
+            )
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                output_tensor=attn_staging,
             )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
