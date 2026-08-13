@@ -38,7 +38,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rmsnorm_fused_ar import get_fused_ar_staging_view
+from sglang.srt.layers.rmsnorm_fused_ar import (
+    get_fused_ar_staging_view,
+    is_fused_ar_buffer_view,
+)
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -674,6 +677,13 @@ class Qwen2ForCausalLM(nn.Module):
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
             )
         else:
+            # rmsnorm-fused-ar zero-copy returns a view of the symmetric
+            # buffer, which the next call's producer GEMM overwrites. This
+            # path parks hidden_states on forward_batch across calls, so it
+            # needs a private copy. clone() is a no-op cost-wise relative to
+            # the copy the fused path would otherwise have done every layer.
+            if is_fused_ar_buffer_view(forward_batch.hidden_states):
+                forward_batch.hidden_states = forward_batch.hidden_states.clone()
             result = None
 
         return result

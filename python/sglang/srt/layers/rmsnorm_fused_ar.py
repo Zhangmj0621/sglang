@@ -60,6 +60,26 @@ def _max_ctas() -> int:
     return max_ctas
 
 
+@functools.lru_cache(maxsize=1)
+def _needs_outbound_copy() -> bool:
+    """Whether the fused output must be copied out of the symm buffer.
+
+    The buffer is overwritten by the next layer's producer GEMM, so a
+    consumer that holds the normalized output past the immediately
+    following GEMM needs a private copy. Today that is hidden-state
+    capture: both the boolean flag and any non-None mode capture hidden
+    states (see get_server_return_hidden_states_mode), and `last` keeps a
+    reference to the final layer's output. Read once — the fields are
+    server-level config, frozen for the process lifetime.
+    """
+    from sglang.srt.runtime_context import get_exec
+
+    features = get_exec().features
+    return bool(features.enable_return_hidden_states) or (
+        features.return_hidden_states_mode is not None
+    )
+
+
 class _FusedArResources(msgspec.Struct):
     buffer: torch.Tensor  # the group's TorchSymmMemCommunicator buffer
     multicast_ptr: int
@@ -205,6 +225,20 @@ def _prepare_residual(
     return ensure_full_residual(residual)
 
 
+def is_fused_ar_buffer_view(tensor: Optional[torch.Tensor]) -> bool:
+    """True when `tensor` is a zero-copy view of a fused-AR symm buffer.
+
+    Callers that park a fused-AR output across a boundary the buffer's
+    lifetime does not cover (e.g. split-prefill stashing hidden_states on
+    the ForwardBatch between calls) must clone it first: the next call's
+    producer GEMM direct-writes the same buffer.
+    """
+    if tensor is None or not _RESOURCES:
+        return False
+    ptr = tensor.data_ptr()
+    return any(res.buffer.data_ptr() == ptr for res in _RESOURCES.values())
+
+
 def get_fused_ar_staging_view(
     *, num_tokens: int, hidden: int, use_attn_tp_group: bool = True
 ) -> Optional[torch.Tensor]:
@@ -288,8 +322,15 @@ def rmsnorm_fused_ar_forward(
         max_ctas=min(_max_ctas(), max(end - start, 1)),
         eps=eps,
     )
-    out = torch.empty_like(x)
-    out.copy_(buf)  # kernel's multimem.st already all-gathered the result
+    if x.data_ptr() == buf.data_ptr() and not _needs_outbound_copy():
+        # Zero-copy: the normalized result the kernel just wrote stays
+        # resident in the symm buffer. Safe because the only consumer (the
+        # next GEMM) reads it before the next producer direct-write
+        # overwrites it — same-stream program order.
+        out = buf
+    else:
+        out = torch.empty_like(x)
+        out.copy_(buf)  # kernel's multimem.st already all-gathered the result
     setattr(residual, _SHARD_ATTR, (start, end, group))
     return out, residual
 
