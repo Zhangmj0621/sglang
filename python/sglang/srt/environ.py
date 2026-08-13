@@ -884,7 +884,7 @@ class Envs:
     # communication-bound, so a small count saturates NVLink while leaving
     # SMs free for overlapped compute. Hard-capped at 256 (barrier resource
     # limit) by the kernel.
-    SGLANG_RMSNORM_FUSED_AR_MAX_CTAS = EnvInt(8)
+    SGLANG_RMSNORM_FUSED_AR_MAX_CTAS = EnvInt(32)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

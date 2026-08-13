@@ -8,13 +8,18 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    apply_rmsnorm_fused_ar,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rmsnorm_fused_ar import get_fused_ar_staging_view
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -270,6 +275,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        output_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
@@ -303,7 +309,7 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, output_tensor=output_tensor)
         return output
 
 
@@ -402,10 +408,27 @@ class Qwen3DecoderLayer(nn.Module):
             post_residual_addition=post_residual_addition,
         )
         if hidden_states.shape[0] != 0:
+            # Direct-write (attention side): let o_proj write its partial sum
+            # straight into the fused-AR symm buffer; prepare_mlp's fused
+            # branch (communicator._gather_hidden_states_and_residual with
+            # use_attn_tp_group=True) detects pointer equality and skips its
+            # staging copy_. None (flag off / resources not built yet /
+            # payload too large) keeps o_proj allocating its own output —
+            # byte-identical to the pre-direct-write code.
+            attn_staging = (
+                get_fused_ar_staging_view(
+                    num_tokens=hidden_states.shape[0],
+                    hidden=self.hidden_size,
+                    use_attn_tp_group=True,
+                )
+                if apply_rmsnorm_fused_ar()
+                else None
+            )
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                output_tensor=attn_staging,
             )
 
         # Fully Connected
@@ -438,7 +461,30 @@ class Qwen3DecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+            # Direct-write (MLP side): with fuse_mlp_allreduce on, down_proj
+            # skips its all-reduce and the marked output is consumed by the
+            # NEXT layer's prepare_attn fused branch
+            # (forward_with_allreduce_fusion with use_attn_tp_group=False,
+            # whose moe_tp group is the full TP group under this flag's
+            # startup constraints) — write the partial sum straight into that
+            # consumer's staging buffer so its copy_ is skipped via pointer
+            # equality. None keeps the plain-allocation fallback.
+            mlp_staging = (
+                get_fused_ar_staging_view(
+                    num_tokens=hidden_states.shape[0],
+                    hidden=self.hidden_size,
+                    use_attn_tp_group=False,
+                )
+                if fuse_mlp_allreduce
+                and apply_rmsnorm_fused_ar()
+                and hidden_states.shape[0] != 0
+                else None
+            )
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch=forward_batch,
+                output_tensor=mlp_staging,
+            )
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
 
