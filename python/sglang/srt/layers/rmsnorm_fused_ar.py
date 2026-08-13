@@ -8,8 +8,8 @@ this rank's shard. The shard state is tracked with a tensor attribute and
 completed (all-gathered) at every non-fused consumer (see
 ensure_full_residual).
 
-Enabled by --enable-rmsnorm-fused-ar. The flag is a hard commitment: any
-ineligible input or missing resource raises instead of falling back.
+Enabled by --enable-rmsnorm-fused-ar. Unsupported inputs return control to
+the shared all-reduce fusion dispatcher so it can try another backend.
 
 sglang-internal imports are kept lazy so this module stays importable in
 lightweight/unit-test contexts.
@@ -95,6 +95,22 @@ def rmsnorm_fused_ar_enabled() -> bool:
     from sglang.srt.runtime_context import get_exec
 
     return get_exec().comm.enable_rmsnorm_fused_ar
+
+
+def rmsnorm_fused_ar_available(use_attn_tp_group: bool = True) -> bool:
+    try:
+        import mega_ops
+    except ImportError:
+        return False
+    if not mega_ops.is_available():
+        return False
+    group = _select_group(use_attn_tp_group)
+    comm = group.torch_symm_mem_comm
+    if comm is None or comm.disabled:
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return comm.group.group_name in _RESOURCES
+    return True
 
 
 def _token_shard(num_tokens: int, rank: int, world_size: int) -> Tuple[int, int]:
@@ -183,27 +199,27 @@ def _get_resources(group: GroupCoordinator) -> _FusedArResources:
     return res
 
 
-def _check_eligible(x: torch.Tensor, res: _FusedArResources) -> None:
-    if x.dim() != 2:
-        raise RuntimeError(
-            f"--enable-rmsnorm-fused-ar: expected 2D input, got {x.dim()}D."
-        )
-    if x.dtype != torch.bfloat16:
-        raise RuntimeError(f"--enable-rmsnorm-fused-ar: bf16 only, got {x.dtype}.")
-    if x.shape[-1] % 8 != 0:
-        raise RuntimeError(
-            "--enable-rmsnorm-fused-ar: hidden_size must be a multiple of 8, "
-            f"got {x.shape[-1]}."
-        )
-    if not x.is_contiguous():
-        raise RuntimeError("--enable-rmsnorm-fused-ar: input must be contiguous.")
+def _is_eligible(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    res: _FusedArResources,
+) -> bool:
     payload = x.numel() * x.element_size()
-    if payload > res.max_size:
-        raise RuntimeError(
-            f"--enable-rmsnorm-fused-ar: payload {payload} bytes exceeds the "
-            f"symm buffer capacity {res.max_size}. Enlarge the torch symm-mem "
-            "buffer for the maximum prefill payload."
-        )
+    return (
+        x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and residual.dtype == x.dtype
+        and weight.dtype == x.dtype
+        and x.shape[-1] > 0
+        and x.shape[-1] % 8 == 0
+        and residual.shape == x.shape
+        and weight.numel() == x.shape[-1]
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and weight.is_contiguous()
+        and payload <= res.max_size
+    )
 
 
 def _prepare_residual(
@@ -240,7 +256,11 @@ def is_fused_ar_buffer_view(tensor: Optional[torch.Tensor]) -> bool:
 
 
 def get_fused_ar_staging_view(
-    *, num_tokens: int, hidden: int, use_attn_tp_group: bool = True
+    *,
+    num_tokens: int,
+    hidden: int,
+    dtype: Optional[torch.dtype] = None,
+    use_attn_tp_group: bool = True,
 ) -> Optional[torch.Tensor]:
     """Return a [num_tokens, hidden] view of the fused-AR symm buffer for a
     producer GEMM to write into, or None when the fused path is off/not ready.
@@ -249,7 +269,12 @@ def get_fused_ar_staging_view(
     and the plain path BEFORE the GEMM; returning None keeps that call site
     branch-free-safe during warmup (resources not built yet) and under
     capture of the very first forward."""
-    if not rmsnorm_fused_ar_enabled():
+    if (
+        not rmsnorm_fused_ar_enabled()
+        or (dtype is not None and dtype != torch.bfloat16)
+        or hidden <= 0
+        or hidden % 8 != 0
+    ):
         return None
     group = _select_group(use_attn_tp_group)
     comm = group.torch_symm_mem_comm
@@ -271,8 +296,9 @@ def rmsnorm_fused_ar_forward(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    post_residual_addition: Optional[torch.Tensor] = None,
     use_attn_tp_group: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Fused AR+add+RMSNorm. Returns (normalized_full, residual_sharded).
 
     Collective: every rank of the group must call this for the same layer
@@ -280,15 +306,22 @@ def rmsnorm_fused_ar_forward(
     import mega_ops
 
     group = _select_group(use_attn_tp_group)
-    res = _get_resources(group)
-    _check_eligible(x, res)
-    if not residual.is_contiguous():
-        raise RuntimeError("--enable-rmsnorm-fused-ar: residual must be contiguous.")
-    if residual.shape != x.shape:
-        raise RuntimeError(
-            "--enable-rmsnorm-fused-ar: residual shape "
-            f"{tuple(residual.shape)} != input shape {tuple(x.shape)}."
-        )
+    comm = group.torch_symm_mem_comm
+    if comm is None or comm.disabled:
+        return None
+    try:
+        res = _get_resources(group)
+    except RuntimeError as exc:
+        logger.debug("rmsnorm-fused-ar resources unavailable: %s", exc)
+        return None
+    if not _is_eligible(x, residual, weight, res):
+        return None
+    if post_residual_addition is not None and (
+        post_residual_addition.shape != residual.shape
+        or post_residual_addition.dtype != residual.dtype
+        or not post_residual_addition.is_contiguous()
+    ):
+        return None
 
     num_tokens, hidden = x.shape
     if num_tokens == 0:
@@ -301,6 +334,8 @@ def rmsnorm_fused_ar_forward(
 
     residual = _prepare_residual(residual, res, group)
     start, end = _token_shard(num_tokens, res.rank, res.world_size)
+    if post_residual_addition is not None and end > start:
+        residual[start:end].add_(post_residual_addition[start:end])
 
     buf = res.buffer[: x.numel()].view(num_tokens, hidden)
     if x.data_ptr() == buf.data_ptr():

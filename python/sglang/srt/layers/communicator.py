@@ -179,13 +179,26 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
-def apply_rmsnorm_fused_ar() -> bool:
-    """True when the multimem fused-AR path should take the fusion branches.
+def apply_rmsnorm_fused_ar(batch_size: int, use_attn_tp_group: bool = True) -> bool:
+    """Whether the multimem fused-AR path may consume this producer output."""
+    if use_attn_tp_group:
+        world_size = get_parallel().attn_tp_size
+    elif get_parallel().moe_ep_size > 1:
+        world_size = get_parallel().moe_ep_size
+    else:
+        world_size = get_parallel().moe_tp_size
 
-    Startup validation (_handle_rmsnorm_fused_ar) guarantees every config
-    reaching a fusion branch with this flag on is eligible — no per-shape
-    checks needed here; ineligible inputs raise inside the fused call."""
-    return get_exec().comm.enable_rmsnorm_fused_ar
+    from sglang.srt.layers.rmsnorm_fused_ar import rmsnorm_fused_ar_available
+
+    return (
+        get_exec().comm.enable_rmsnorm_fused_ar
+        and get_exec().comm.enable_torch_symm_mem
+        and (_is_sm90_supported or _is_sm100_supported)
+        and rmsnorm_fused_ar_available(use_attn_tp_group)
+        and not is_dp_attention_enabled()
+        and world_size in (2, 4, 6, 8)
+        and batch_size > 0
+    )
 
 
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
@@ -206,11 +219,8 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
 def _ensure_full_residual_for_fused_ar(
     residual: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """Complete a residual left sharded by the rmsnorm-fused-ar path before
-    any transform that would drop its shard marker (slicing, cloning,
-    gather-rebinding) and silently expose stale rows. No-op when the flag is
-    off (one config read) or the tensor is unmarked (one attribute check)."""
-    if residual is None or not get_exec().comm.enable_rmsnorm_fused_ar:
+    """Complete a shard-marked residual before a non-fused consumer reads it."""
+    if residual is None or getattr(residual, "_mega_residual_shard", None) is None:
         return residual
     from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
 
@@ -613,7 +623,9 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_rmsnorm_fused_ar()
+                    apply_rmsnorm_fused_ar(
+                        hidden_states.shape[0], use_attn_tp_group=False
+                    )
                     or apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
@@ -621,6 +633,7 @@ class LayerCommunicator:
                     if (
                         self.enable_fused_ar_quant
                         and _use_aiter
+                        and post_residual_addition is None
                         and hasattr(
                             self.input_layernorm,
                             "forward_with_allreduce_fusion_quant_per_group",
@@ -640,7 +653,10 @@ class LayerCommunicator:
                     else:
                         hidden_states, residual = (
                             self.input_layernorm.forward_with_allreduce_fusion(
-                                hidden_states, residual, use_attn_tp_group=False
+                                hidden_states,
+                                residual,
+                                post_residual_addition=post_residual_addition,
+                                use_attn_tp_group=False,
                             )
                         )
                 else:
@@ -873,7 +889,7 @@ class LayerCommunicator:
 
         return (
             (
-                apply_rmsnorm_fused_ar()
+                apply_rmsnorm_fused_ar(batch_size, use_attn_tp_group=False)
                 or apply_flashinfer_allreduce_fusion(batch_size)
                 or (
                     _use_aiter
@@ -1143,24 +1159,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
-        # rmsnorm-fused-ar: hoisted here (rank-uniform — every rank of the
-        # attn_tp group reaches this point together) rather than inside the
-        # `attn_tp_rank == 0`-only branch below, since `ensure_full_residual`
-        # runs a collective all_gather over that group; calling it from only
-        # one rank would hang. This one call dominates both the layernorm
-        # call and the `+=` read in the branches that follow.
-        # Skipped when our flag is on: the `context.attn_dp_size != 1` branch
-        # below (the only other consumer of `residual` before the fused
-        # branch) is unreachable in that case — --enable-dp-attention is
-        # hard-blocked at startup by _handle_rmsnorm_fused_ar, so
-        # attn_dp_size == 1 is guaranteed — and the `else:` branch's fused
-        # call (`apply_rmsnorm_fused_ar() or ...` below) consumes the
-        # still-sharded residual itself. Completing it here first would just
-        # be a wasted all_gather (un-shard then immediately re-shard) on
-        # every layer. `apply_rmsnorm_fused_ar()` is a plain config read
-        # (uniform across ranks), so this guard itself stays rank-uniform.
-        if not apply_rmsnorm_fused_ar():
-            residual = _ensure_full_residual_for_fused_ar(residual)
         if context.attn_dp_size != 1:
             use_layer_norm_before_gather = (
                 context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
@@ -1194,7 +1192,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             handled = False
             if (
-                apply_rmsnorm_fused_ar()
+                apply_rmsnorm_fused_ar(hidden_states.shape[0], use_attn_tp_group=True)
                 or apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):

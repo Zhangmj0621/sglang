@@ -197,9 +197,13 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
+            moe_expert_parallel_all_reduce,
+            moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
+        from sglang.srt.layers.communicator import apply_rmsnorm_fused_ar
         from sglang.srt.layers.flashinfer_comm_fusion import (
             flashinfer_allreduce_residual_rmsnorm,
         )
@@ -212,43 +216,30 @@ def _forward_with_allreduce_fusion(
             else:
                 world_size = get_parallel().moe_tp_size
 
-        if get_exec().comm.enable_rmsnorm_fused_ar:
-            if post_residual_addition is not None:
-                # The fused kernel folds the residual in place per shard;
-                # a full-tensor pre-addition would silently combine with a
-                # possibly-sharded residual. Hard-fail per the flag's
-                # crash-on-ineligible contract.
-                raise RuntimeError(
-                    "--enable-rmsnorm-fused-ar does not support "
-                    "post_residual_addition."
-                )
-            if world_size <= 1:
-                # The producer linear skips its all-reduce over the full TP
-                # group whenever this flag is on (see communicator.py), so a
-                # fused group of size 1 here cannot reduce the partial sum —
-                # falling through would silently norm unreduced data. Hard-
-                # fail per the flag's crash-on-ineligible contract instead.
-                raise RuntimeError(
-                    "--enable-rmsnorm-fused-ar: fused-AR norm reached with "
-                    f"world_size={world_size}; the producer linear skipped "
-                    "its all-reduce over the full TP group, so a fused "
-                    "group of size 1 cannot reduce it (check attn_tp_size "
-                    "== tp_size)."
-                )
-
-            from sglang.srt.layers.rmsnorm_fused_ar import (
-                rmsnorm_fused_ar_forward,
-            )
-
-            return rmsnorm_fused_ar_forward(
-                x=x,
-                residual=residual,
-                weight=weight,
-                eps=norm_module.variance_epsilon,
-                use_attn_tp_group=use_attn_tp_group,
-            )
-
         if world_size > 1:
+            rmsnorm_fused_ar_applied = apply_rmsnorm_fused_ar(
+                x.shape[0], use_attn_tp_group=use_attn_tp_group
+            )
+            if rmsnorm_fused_ar_applied:
+                from sglang.srt.layers.rmsnorm_fused_ar import (
+                    rmsnorm_fused_ar_forward,
+                )
+
+                fused_result = rmsnorm_fused_ar_forward(
+                    x=x,
+                    residual=residual,
+                    weight=weight,
+                    eps=norm_module.variance_epsilon,
+                    post_residual_addition=post_residual_addition,
+                    use_attn_tp_group=use_attn_tp_group,
+                )
+                if fused_result is not None:
+                    return fused_result
+
+            if getattr(residual, "_mega_residual_shard", None) is not None:
+                from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
+
+                residual = ensure_full_residual(residual)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
 
@@ -271,9 +262,34 @@ def _forward_with_allreduce_fusion(
                 if fused_result[0] is not None:
                     return fused_result
 
+            # The custom fused-AR producer may have skipped its all-reduce
+            # even when the runtime kernel declines this particular shape.
+            # Complete that reduction before using the generic norm path.
+            if rmsnorm_fused_ar_applied:
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                elif get_parallel().moe_ep_size > 1:
+                    x = moe_expert_parallel_all_reduce(x)
+                else:
+                    x = moe_tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
+
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
+
+            # FlashInfer is also allowed to decline a shape-specific backend
+            # request. Its callers skipped the producer all-reduce expecting
+            # this helper to complete it, so do not fall through to a plain
+            # norm with a partial sum.
+            if not _use_aiter:
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                elif get_parallel().moe_ep_size > 1:
+                    x = moe_expert_parallel_all_reduce(x)
+                else:
+                    x = moe_tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
     if (
@@ -281,8 +297,8 @@ def _forward_with_allreduce_fusion(
         and getattr(residual, "_mega_residual_shard", None) is not None
     ):
         # A residual left sharded by an earlier fused-AR call (this call's
-        # own flag-ON path never reaches here — it always raises or returns
-        # above) must be completed before any non-fused consumer reads it.
+        # own flag-ON path completes it above) must be completed before any
+        # non-fused consumer reads it.
         # The marker's presence implies the flag was on, so no config read
         # is needed on the common (unmarked) path.
         from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
@@ -892,7 +908,7 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
+        """Forward with allreduce fusion and backend fallbacks."""
         return _forward_with_allreduce_fusion(
             self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
         )

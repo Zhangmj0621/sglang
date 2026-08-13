@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import apply_rmsnorm_fused_ar
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -309,7 +310,9 @@ class Qwen2DecoderLayer(nn.Module):
         # When on, o_proj/down_proj skip their internal all-reduce and the
         # consumer norm below performs it fused with the residual-add. Off ⇒
         # every branch below is identical to the pre-fusion code.
-        use_fused_ar = self._fuse_ar_norm and hidden_states.shape[0] != 0
+        use_fused_ar = self._fuse_ar_norm and apply_rmsnorm_fused_ar(
+            hidden_states.shape[0]
+        )
 
         # Direct-write: let the producer GEMM write its partial sum straight
         # into the fused-AR symm buffer, eliminating the staging copy inside
@@ -319,7 +322,9 @@ class Qwen2DecoderLayer(nn.Module):
         # fallback — behavior identical to the pre-direct-write code.
         staging = (
             get_fused_ar_staging_view(
-                num_tokens=hidden_states.shape[0], hidden=self.hidden_size
+                num_tokens=hidden_states.shape[0],
+                hidden=self.hidden_size,
+                dtype=hidden_states.dtype,
             )
             if use_fused_ar
             else None
@@ -500,7 +505,9 @@ class Qwen2Model(nn.Module):
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
-                elif self._fuse_ar_norm:
+                elif self._fuse_ar_norm and apply_rmsnorm_fused_ar(
+                    hidden_states.shape[0]
+                ):
                     # Last layer's down_proj partial sum (AR skipped there);
                     # fuse that AR into the final norm.
                     hidden_states, _ = self.norm.forward_with_allreduce_fusion(
@@ -661,7 +668,11 @@ class Qwen2ForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            if self.model._fuse_ar_norm and forward_batch.residual is not None:
+            if (
+                self.model._fuse_ar_norm
+                and forward_batch.residual is not None
+                and apply_rmsnorm_fused_ar(forward_batch.hidden_states.shape[0])
+            ):
                 # Last layer's down_proj partial sum (AR skipped there);
                 # fuse that AR into the final norm, same as Qwen2Model.forward.
                 hidden_states, _ = self.model.norm.forward_with_allreduce_fusion(

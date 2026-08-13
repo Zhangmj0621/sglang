@@ -2003,8 +2003,8 @@ class ServerArgs:
         "Fuse TP all-reduce + residual-add + RMSNorm into a single multimem "
         "kernel (reduce-scatter + all-gather via NVLink Switch multicast). "
         "Requires SM90+, NVSwitch multicast, --enable-torch-symm-mem, TP "
-        "world size in {2,4,6,8}, and bf16 models. Ineligible inputs raise "
-        "instead of falling back.",
+        "world size in {2,4,6,8}, and bf16 models. Unsupported configurations "
+        "fall back to the regular all-reduce path.",
         NS("exec.comm"),
     ] = False
     flashinfer_allreduce_fusion_backend: A[
@@ -4316,14 +4316,14 @@ class ServerArgs:
             )
 
     def _handle_rmsnorm_fused_ar(self):
-        """Fail fast on any configuration the fused RS+RMSNorm+AG kernel
-        cannot serve. Flag on is a hard commitment: no silent fallback."""
+        """Disable the optional path when startup configuration cannot use it."""
         if not self.enable_rmsnorm_fused_ar:
             return
         from sglang.srt.utils import is_hip
 
+        reasons = []
         if is_hip():
-            raise ValueError("--enable-rmsnorm-fused-ar is not supported on ROCm.")
+            reasons.append("ROCm is unsupported")
         allowed_archs = {
             "Qwen2ForCausalLM",
             "Qwen3ForCausalLM",
@@ -4333,102 +4333,48 @@ class ServerArgs:
         }
         model_arch = self.get_model_config().hf_config.architectures[0]
         if model_arch not in allowed_archs:
-            raise ValueError(
-                f"--enable-rmsnorm-fused-ar does not support model architecture "
-                f"{model_arch!r}. Only decoder layers verified to skip their "
-                "own all-reduce under this flag (dense Qwen2, or MoE models "
-                "that set hidden_states._sglang_needs_allreduce_fusion) are "
-                f"eligible: {sorted(allowed_archs)}."
-            )
+            reasons.append(f"model architecture {model_arch!r} is unsupported")
         if self.enable_deterministic_inference:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar is incompatible with "
-                "--enable-deterministic-inference (which disables torch symm mem)."
-            )
+            reasons.append("deterministic inference disables symmetric memory")
         if not self.enable_torch_symm_mem:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar requires --enable-torch-symm-mem "
-                "(it reuses the torch symm-mem buffer and rendezvous)."
-            )
+            reasons.append("--enable-torch-symm-mem is disabled")
         if self.tp_size not in (2, 4, 6, 8):
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar requires TP world size in "
-                f"{{2, 4, 6, 8}}, got tp_size={self.tp_size}."
-            )
+            reasons.append(f"TP world size {self.tp_size} is unsupported")
         if self.ep_size > 1:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar is incompatible with expert "
-                "parallelism (ep_size > 1): allowlisted MoE models consume "
-                "the deferred-AR marker with use_attn_tp_group=False, which "
-                "routes the completing collective over the moe_ep/moe_tp "
-                f"group instead of the full TP group (ep_size={self.ep_size})."
-            )
+            reasons.append("expert parallelism is unsupported")
         if self.moe_dp_size > 1:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar is incompatible with MoE data "
-                "parallelism (moe_dp_size > 1): moe_tp_size is derived as "
-                "tp_size // moe_ep_size // moe_dp_size, so moe_dp_size > 1 "
-                "shrinks the moe_tp group below the full TP group the "
-                "producer actually skipped its all-reduce over "
-                f"(moe_dp_size={self.moe_dp_size})."
-            )
+            reasons.append("MoE data parallelism is unsupported")
         if self.enable_dp_attention:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar is incompatible with "
-                "--enable-dp-attention: the fused kernel must reduce over "
-                "the full TP group, but DP attention shrinks the attention-TP "
-                "group."
-            )
+            reasons.append("DP attention is unsupported")
         if self.attn_cp_size > 1:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar is incompatible with "
-                "--attention-context-parallel-size > 1: the fused kernel "
-                "must reduce over the full TP group, but attention context "
-                "parallelism shrinks the attention-TP group "
-                f"(attn_cp_size={self.attn_cp_size})."
-            )
+            reasons.append("attention context parallelism is unsupported")
         if self.pp_size > 1:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar requires pp_size == 1: the "
-                "sharded-residual state does not survive pipeline-parallel "
-                "transport."
-            )
+            reasons.append("pipeline parallelism is unsupported")
         if self.speculative_algorithm is not None:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar is incompatible with speculative "
-                "decoding: draft models reuse decoder layers outside the "
-                "fused-norm contract."
-            )
+            reasons.append("speculative decoding is unsupported")
         if self.enable_torch_compile:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar is incompatible with "
-                "--enable-torch-compile: torch.compile dispatches RMSNorm "
-                "through forward_native, which has no fused-AR completion "
-                "hook, so a sharded (unreduced) residual would be silently "
-                "read as complete."
-            )
+            reasons.append("torch.compile is unsupported")
         for _phase in Phase.ALL:
             if getattr(self.cuda_graph_config, _phase).backend == Backend.TC_PIECEWISE:
-                raise ValueError(
-                    "--enable-rmsnorm-fused-ar is incompatible with the "
-                    f"tc_piecewise CUDA graph backend ({_phase} phase): like "
-                    "--enable-torch-compile, it dispatches RMSNorm through "
-                    "forward_native, which has no fused-AR completion hook, "
-                    "so a sharded (unreduced) residual would be silently "
-                    "read as complete."
+                reasons.append(
+                    f"tc_piecewise CUDA graph backend ({_phase}) is unsupported"
                 )
         try:
             import mega_ops
-        except ImportError as e:
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar requires the mega_ops package "
-                "(pip install -e <MegaAttention-v2 repo root>)."
-            ) from e
-        if not mega_ops.is_available():
-            raise ValueError(
-                "--enable-rmsnorm-fused-ar: mega_ops is installed but "
-                "unavailable (needs CUDA and SM90+)."
+
+            if not mega_ops.is_available():
+                reasons.append("mega_ops is unavailable")
+        except ImportError:
+            reasons.append("mega_ops is not installed")
+
+        if reasons:
+            logger.warning(
+                "Disabling --enable-rmsnorm-fused-ar; falling back to the "
+                "regular all-reduce path: %s",
+                "; ".join(reasons),
             )
+            self.enable_rmsnorm_fused_ar = False
+            return
 
     def _apply_deepep_adjustments(self):
         """Config adjustments required by the DeepEP a2a backend."""

@@ -422,9 +422,12 @@ class Qwen3DecoderLayer(nn.Module):
                 get_fused_ar_staging_view(
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
+                    dtype=hidden_states.dtype,
                     use_attn_tp_group=True,
                 )
-                if apply_rmsnorm_fused_ar()
+                if apply_rmsnorm_fused_ar(
+                    hidden_states.shape[0], use_attn_tp_group=True
+                )
                 else None
             )
             hidden_states = self.self_attn(
@@ -476,10 +479,13 @@ class Qwen3DecoderLayer(nn.Module):
                 get_fused_ar_staging_view(
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
+                    dtype=hidden_states.dtype,
                     use_attn_tp_group=False,
                 )
                 if fuse_mlp_allreduce
-                and apply_rmsnorm_fused_ar()
+                and apply_rmsnorm_fused_ar(
+                    hidden_states.shape[0], use_attn_tp_group=False
+                )
                 and hidden_states.shape[0] != 0
                 else None
             )

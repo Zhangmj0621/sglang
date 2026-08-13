@@ -846,9 +846,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 get_fused_ar_staging_view(
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
+                    dtype=hidden_states.dtype,
                     use_attn_tp_group=True,
                 )
-                if apply_rmsnorm_fused_ar()
+                if apply_rmsnorm_fused_ar(
+                    hidden_states.shape[0], use_attn_tp_group=True
+                )
                 and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
                 else None
             )
