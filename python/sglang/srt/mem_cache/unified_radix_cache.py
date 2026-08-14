@@ -2142,6 +2142,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
 
+    def full_evictable_session_ref_size(self) -> int:
+        return self.tree_core.full_evictable_session_ref_size()
+
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size()
 
@@ -2167,15 +2170,18 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.all_mamba_values_flatten()
 
     def available_and_evictable_str(self) -> str:
-        # TODO(zhangmj): need more detailed log info for session reference.
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
             full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable = self.tree_core.component_evictable_size(BASE_COMPONENT_TYPE)
+        full_session_ref_evictable = self.tree_core.full_evictable_session_ref_size()
+        full_unused_evictable = full_evictable - full_session_ref_evictable
         lines = [
             f"Available full tokens: {full_available_size + full_evictable} "
-            f"(full_available_size={full_available_size} + full_evictable_size_={full_evictable})"
+            f"(full_available_size={full_available_size} + "
+            f"full_evictable_session_ref_size={full_session_ref_evictable} + "
+            f"full_evictable_unused_size={full_unused_evictable})"
         ]
         for ct in self.tree_components:
             if ct == BASE_COMPONENT_TYPE:
@@ -2187,9 +2193,16 @@ class UnifiedRadixCache(BasePrefixCache):
             else:
                 continue
 
+            evictable = self.tree_core.component_evictable_size(ct)
+            session_ref_evictable = self.tree_core.component_evictable_session_ref_size(
+                ct
+            )
+            unused_evictable = evictable - session_ref_evictable
             lines.append(
-                f"Available {ct}: {available_size + self.tree_core.component_evictable_size(ct)} "
-                f"(available_size={available_size} + component_evictable_size_={self.tree_core.component_evictable_size(ct)})"
+                f"Available {ct}: {available_size + evictable} "
+                f"(available_size={available_size} + "
+                f"evictable_session_ref_size={session_ref_evictable} + "
+                f"evictable_unused_size={unused_evictable})"
             )
         return "\n".join(lines) + "\n"
 

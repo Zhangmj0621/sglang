@@ -447,6 +447,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.root_node.component_data[ct].lock_ref = 1
 
         self.component_evictable_size_ = {ct: 0 for ct in self.component_types}
+        self.component_evictable_session_ref_size_ = (
+            {ct: 0 for ct in self.component_types}
+            if self.enable_session_radix_cache
+            else {}
+        )
         self.component_protected_size_ = {ct: 0 for ct in self.component_types}
 
         self.lru_lists = {
@@ -1113,7 +1118,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
-        self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        self._update_component_evictable_size(new_node, BASE_COMPONENT_TYPE, len(value))
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1132,7 +1137,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
-        self.component_evictable_size_[ct] += n
+        self._update_component_evictable_size(node, ct, n)
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
         self._update_duplicate_tracking(node)
@@ -1151,6 +1156,36 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.evictable_host_leaves.add(node)
         else:
             self.evictable_host_leaves.discard(node)
+
+    def _update_component_evictable_size(
+        self, node: UnifiedTreeNode, component_type: ComponentType, delta: int
+    ) -> None:
+        """Adjust the evictable counters by a signed delta (negative to remove)."""
+        self.component_evictable_size_[component_type] += delta
+        if (
+            self.enable_session_radix_cache
+            and node.component_data[component_type].session_ref > 0
+        ):
+            self.component_evictable_session_ref_size_[component_type] += delta
+
+    def update_component_session_ref(
+        self, node: UnifiedTreeNode, component_type: ComponentType, delta: int
+    ) -> None:
+        cd = node.component_data[component_type]
+        was_referenced = cd.session_ref > 0
+        cd.session_ref += delta
+        assert cd.session_ref >= 0
+        is_referenced = cd.session_ref > 0
+        if (
+            was_referenced != is_referenced
+            and cd.value is not None
+            and cd.lock_ref == 0
+        ):
+            count = len(cd.value)
+            if is_referenced:
+                self.component_evictable_session_ref_size_[component_type] += count
+            else:
+                self.component_evictable_session_ref_size_[component_type] -= count
 
     def _update_duplicate_tracking(self, node: UnifiedTreeNode) -> None:
         """Register where duplicates are born (acks, split, unevict);
@@ -2029,7 +2064,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
-        self.component_evictable_size_[component_type] += len(value)
+        self._update_component_evictable_size(node, component_type, len(value))
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -2240,6 +2275,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # ── PART 4: Size Accounting ──
         for ct in self.component_types:
             evictable = 0
+            session_ref_evictable = 0
             protected = 0
             for n in all_nodes:
                 if n is self.root_node:
@@ -2251,6 +2287,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         protected += toks
                     else:
                         evictable += toks
+                        if self.enable_session_radix_cache and cd.session_ref > 0:
+                            session_ref_evictable += toks
             if self.component_evictable_size_[ct] != evictable:
                 E(
                     f"[Size] {ct} evictable={self.component_evictable_size_[ct]} "
@@ -2260,6 +2298,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 E(
                     f"[Size] {ct} protected={self.component_protected_size_[ct]} "
                     f"!= recomputed={protected}"
+                )
+            if (
+                self.enable_session_radix_cache
+                and self.component_evictable_session_ref_size_[ct]
+                != session_ref_evictable
+            ):
+                E(
+                    f"[Size] {ct} session-ref evictable="
+                    f"{self.component_evictable_session_ref_size_[ct]} "
+                    f"!= recomputed={session_ref_evictable}"
                 )
 
         # ── PART 5: Ongoing Operations ──
@@ -2376,8 +2424,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Evictable token count for one component (0 if the component is absent)."""
         return self.component_evictable_size_.get(component_type, 0)
 
+    def component_evictable_session_ref_size(
+        self, component_type: ComponentType
+    ) -> int:
+        """Evictable tokens referenced by an open session (0 when session cache is off)."""
+        return self.component_evictable_session_ref_size_.get(component_type, 0)
+
     def full_evictable_size(self) -> int:
         return self.evictable_size()
+
+    def full_evictable_session_ref_size(self) -> int:
+        return self.component_evictable_session_ref_size(BASE_COMPONENT_TYPE)
 
     def full_protected_size(self) -> int:
         return self.protected_size()

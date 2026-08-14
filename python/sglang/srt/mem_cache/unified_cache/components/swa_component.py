@@ -96,7 +96,9 @@ class SWAComponent(TreeComponent):
             if delta < 0:
                 assert cd.session_ref > 0
             prev_ref = cd.session_ref
-            cd.session_ref += delta
+            self.tree_core.update_component_session_ref(
+                node, self.component_type, delta
+            )
             if (prev_ref == 0) != (cd.session_ref == 0):
                 self._refresh_session_partition(node)
             covered += len(node.key)
@@ -488,7 +490,7 @@ class SWAComponent(TreeComponent):
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             freed = len(cd.value)
-            self.tree_core.component_evictable_size_[ct] -= freed
+            self.tree_core._update_component_evictable_size(node, ct, -freed)
             cd.value = None
 
         # Host layer
@@ -618,7 +620,7 @@ class SWAComponent(TreeComponent):
                         lru.remove_node(cur)
                 else:
                     key_len = len(cur.key)
-                    self.tree_core.component_evictable_size_[ct] -= key_len
+                    self.tree_core._update_component_evictable_size(cur, ct, -key_len)
                     self.tree_core.component_protected_size_[ct] += key_len
             if lock_host:
                 comp.host_lock_ref = ref + 1
@@ -673,7 +675,7 @@ class SWAComponent(TreeComponent):
                             host_lru.insert_mru(cur)
                 else:
                     key_len = len(comp.value)
-                    self.tree_core.component_evictable_size_[ct] += key_len
+                    self.tree_core._update_component_evictable_size(cur, ct, key_len)
                     self.tree_core.component_protected_size_[ct] -= key_len
             if lock_host:
                 comp.host_lock_ref = ref - 1
@@ -718,7 +720,7 @@ class SWAComponent(TreeComponent):
             if cd.lock_ref == 0:
                 key_len = len(cur.key)
                 self.tree_core.component_protected_size_[ct] -= key_len
-                self.tree_core.component_evictable_size_[ct] += key_len
+                self.tree_core._update_component_evictable_size(cur, ct, key_len)
                 if self.tree_core._is_device_leaf(cur):
                     self.tree_core._evict_component_and_detach_lru(
                         cur,

@@ -179,6 +179,7 @@ class TestRadixCacheSessionRemoval(CustomTestCase):
         self.assertFalse(hasattr(cache, "enable_session_radix_cache"))
         self.assertFalse(hasattr(cache, "register_session_ref"))
         self.assertFalse(hasattr(cache, "open_radix_session"))
+        self.assertFalse(hasattr(cache, "full_evictable_session_ref_size"))
 
 
 class TestSessionUnifiedRadixCache(CustomTestCase):
@@ -192,9 +193,71 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         register(self.cache, [1, 2, 3, 4], "s1", generation)
         self.assertEqual(self.full.session_ref(leaf), 1)
+        self.assertEqual(self.cache.full_evictable_session_ref_size(), 4)
 
         self.cache.release_radix_session("s1")
         self.assertEqual(self.full.session_ref(leaf), 0)
+        self.assertEqual(self.cache.full_evictable_session_ref_size(), 0)
+
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=0", diagnostics)
+        self.assertIn("full_evictable_unused_size=4", diagnostics)
+
+    def test_locked_session_ref_is_not_evictable(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        register(self.cache, [1, 2, 3, 4], "s1")
+
+        lock_result = self.cache.inc_lock_ref(leaf.id)
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=0", diagnostics)
+        self.assertIn("full_evictable_unused_size=0", diagnostics)
+
+        self.cache.dec_lock_ref(leaf.id, lock_result.to_dec_params())
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=4", diagnostics)
+        self.assertIn("full_evictable_unused_size=0", diagnostics)
+
+    def test_overlapping_sessions_count_referenced_kv_once(self):
+        insert(self.cache, [1, 2, 3, 4])
+        register(self.cache, [1, 2, 3, 4], "s1")
+        register(self.cache, [1, 2, 3, 4], "s2")
+
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=4", diagnostics)
+        self.assertIn("full_evictable_unused_size=0", diagnostics)
+
+        self.cache.release_radix_session("s1")
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=4", diagnostics)
+        self.assertIn("full_evictable_unused_size=0", diagnostics)
+
+    def test_split_preserves_session_aware_evictable_sizes(self):
+        insert(self.cache, [1, 2, 3, 4])
+        register(self.cache, [1, 2, 3, 4], "s1")
+
+        insert(self.cache, [1, 2, 7])
+
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=4", diagnostics)
+        self.assertIn("full_evictable_unused_size=1", diagnostics)
+
+    def test_disabled_session_cache_reports_all_evictable_as_unused(self):
+        cache = UnifiedRadixCache(make_params(enable_session=False))
+        insert(cache, [1, 2, 3, 4])
+
+        self.assertEqual(cache.full_evictable_session_ref_size(), 0)
+        diagnostics = cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=0", diagnostics)
+        self.assertIn("full_evictable_unused_size=4", diagnostics)
+
+    def test_diagnostics_report_session_aware_breakdown(self):
+        insert(self.cache, [1, 2, 3, 4])
+        register(self.cache, [1, 2, 3, 4], "s1")
+
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_available_size=60", diagnostics)
+        self.assertIn("full_evictable_session_ref_size=4", diagnostics)
+        self.assertIn("full_evictable_unused_size=0", diagnostics)
 
     def test_reopen_rejects_stale_generation(self):
         leaf = insert(self.cache, [1, 2, 3, 4])
@@ -213,6 +276,9 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         self.cache.evict(EvictParams(num_tokens=3))
 
+        diagnostics = self.cache.available_and_evictable_str()
+        self.assertIn("full_evictable_session_ref_size=4", diagnostics)
+        self.assertIn("full_evictable_unused_size=0", diagnostics)
         self.assertEqual(match_len(self.cache, [7, 8, 9]), 0)
         self.assertEqual(match_len(self.cache, [1, 2, 3, 4]), 4)
         self.assertEqual(self.full.session_ref(referenced), 1)

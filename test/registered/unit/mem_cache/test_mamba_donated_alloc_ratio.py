@@ -53,8 +53,14 @@ class _RatioCache:
         self.allocator = _BoundedMambaAllocator(pool_size)
         self.req_to_token_pool = SimpleNamespace(mamba_allocator=self.allocator)
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
+        self.component_evictable_session_ref_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.prefix_nodes = []
+
+    def _update_component_evictable_size(self, node, component_type, delta):
+        self.component_evictable_size_[component_type] += delta
+        if node.component_data[component_type].session_ref > 0:
+            self.component_evictable_session_ref_size_[component_type] += delta
 
     def evict(self, params: EvictParams):
         # Reclaim up to mamba_num evictable (unlocked) prefix snapshots, mirroring

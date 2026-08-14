@@ -33,6 +33,7 @@ class _FakeTreeCore:
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.evictable_device_leaves = set()
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
+        self.component_evictable_session_ref_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.lru_lists = {
             ComponentType.MAMBA: UnifiedLRUList(
@@ -46,6 +47,11 @@ class _FakeTreeCore:
         }
         self.evicted = []
         self.cascaded = []
+
+    def _update_component_evictable_size(self, node, component_type, delta):
+        self.component_evictable_size_[component_type] += delta
+        if node.component_data[component_type].session_ref > 0:
+            self.component_evictable_session_ref_size_[component_type] += delta
 
     def _evict_component_and_detach_lru(self, node, component, *args, **kwargs):
         self.evicted.append(node)
