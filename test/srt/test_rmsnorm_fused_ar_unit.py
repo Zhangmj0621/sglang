@@ -9,7 +9,7 @@ validation.)
 import pytest
 import torch
 
-from sglang.srt.layers.rmsnorm_fused_ar import _SHARD_ATTR, _token_shard
+from sglang.srt.layers.rmsnorm_fused_ar import _token_shard
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 6, 8])
@@ -46,17 +46,17 @@ def test_token_shard_balance(world_size):
 def test_shard_marker_roundtrip():
     """The marker is a plain tensor attribute: settable, readable, deletable."""
     residual = torch.zeros(8, 16)
-    assert getattr(residual, _SHARD_ATTR, None) is None
-    setattr(residual, _SHARD_ATTR, (2, 4, None))
-    assert getattr(residual, _SHARD_ATTR, None) == (2, 4, None)
-    delattr(residual, _SHARD_ATTR)
-    assert getattr(residual, _SHARD_ATTR, None) is None
+    assert getattr(residual, "_mega_residual_shard", None) is None
+    setattr(residual, "_mega_residual_shard", (2, 4, None))
+    assert getattr(residual, "_mega_residual_shard", None) == (2, 4, None)
+    delattr(residual, "_mega_residual_shard")
+    assert getattr(residual, "_mega_residual_shard", None) is None
 
 
 def test_shard_marker_not_inherited_by_new_tensors():
     """Arithmetic produces fresh tensors without the marker — the reason the
     fused path forbids post_residual_addition after sharding."""
     residual = torch.zeros(8, 16)
-    setattr(residual, _SHARD_ATTR, (0, 4, None))
+    setattr(residual, "_mega_residual_shard", (0, 4, None))
     derived = residual + 1.0
-    assert getattr(derived, _SHARD_ATTR, None) is None
+    assert getattr(derived, "_mega_residual_shard", None) is None

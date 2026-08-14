@@ -832,8 +832,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if hidden_states.shape[0] != 0:
             # Direct-write (attention side): let o_proj write its partial sum
             # straight into the fused-AR symm buffer; prepare_mlp's fused
-            # branch (communicator._gather_hidden_states_and_residual with
-            # use_attn_tp_group=True) detects pointer equality and skips its
+            # branch (communicator._gather_hidden_states_and_residual)
+            # detects pointer equality and skips its
             # staging copy_. Only when mlp_mode is FULL is that branch the
             # consumer (under this flag's startup constraints — no a2a
             # backend, no moe-cp allgather, no dwdp — it always is; the mode
@@ -847,11 +847,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
                     dtype=hidden_states.dtype,
-                    use_attn_tp_group=True,
                 )
-                if apply_rmsnorm_fused_ar(
-                    hidden_states.shape[0], use_attn_tp_group=True
-                )
+                if apply_rmsnorm_fused_ar(hidden_states.shape[0])
                 and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
                 else None
             )

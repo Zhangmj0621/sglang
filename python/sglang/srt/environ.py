@@ -880,10 +880,7 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
 
     # Fused AR + residual-add + RMSNorm (--enable-rmsnorm-fused-ar)
-    # Thread blocks (≈SMs) the fused-AR multimem kernel occupies;
-    # communication-bound, so a small count saturates NVLink while leaving
-    # SMs free for overlapped compute. Hard-capped at 256 (barrier resource
-    # limit) by the kernel.
+    # Enable need SM100 or SM90 with multicast support.
     SGLANG_RMSNORM_FUSED_AR_MAX_CTAS = EnvInt(32)
 
     # sgl-kernel

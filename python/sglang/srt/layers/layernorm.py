@@ -217,9 +217,7 @@ def _forward_with_allreduce_fusion(
                 world_size = get_parallel().moe_tp_size
 
         if world_size > 1:
-            rmsnorm_fused_ar_applied = apply_rmsnorm_fused_ar(
-                x.shape[0], use_attn_tp_group=use_attn_tp_group
-            )
+            rmsnorm_fused_ar_applied = apply_rmsnorm_fused_ar(x.shape[0])
             if rmsnorm_fused_ar_applied:
                 from sglang.srt.layers.rmsnorm_fused_ar import (
                     rmsnorm_fused_ar_forward,
@@ -231,7 +229,6 @@ def _forward_with_allreduce_fusion(
                     weight=weight,
                     eps=norm_module.variance_epsilon,
                     post_residual_addition=post_residual_addition,
-                    use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result is not None:
                     return fused_result

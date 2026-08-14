@@ -1,19 +1,4 @@
-"""Single-kernel fused all-reduce + residual-add + RMSNorm via mega_ops.
-
-The mega_ops.rmsnorm_fused_ar kernel performs reduce-scatter (multimem
-ld_reduce), residual add, RMSNorm, and all-gather (multimem st) in one
-launch. Each rank computes only its own token shard; the normalized output
-is broadcast to every rank by the kernel, but the RESIDUAL is only fresh in
-this rank's shard. The shard state is tracked with a tensor attribute and
-completed (all-gathered) at every non-fused consumer (see
-ensure_full_residual).
-
-Enabled by --enable-rmsnorm-fused-ar. Unsupported inputs return control to
-the shared all-reduce fusion dispatcher so it can try another backend.
-
-sglang-internal imports are kept lazy so this module stays importable in
-lightweight/unit-test contexts.
-"""
+"""Single-kernel fused all-reduce + residual-add + RMSNorm via mega_ops."""
 
 from __future__ import annotations
 
@@ -24,30 +9,41 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.distributed import get_tp_group
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 logger = logging.getLogger(__name__)
 
-# Tensor attribute marking a residual whose data is fresh only in
-# [start, end) (this rank's token shard). Same tagging idiom as
-# `_sglang_needs_allreduce_fusion` in communicator.py.
-_SHARD_ATTR = "_mega_residual_shard"
-
 # The kernel's barrier supports at most this many blocks (kMaxBarrierBlocks).
 _MAX_BARRIER_BLOCKS = 256
 
-_RESOURCES: dict[str, _FusedArResources] = {}
+# Per-group kernel workspace (symm staging buffer + multicast/flag/state
+# pointers). Built lazily on the first eager forward.
+_rmsnorm_fused_ar_workspaces: dict[str, _RmsnormFusedArWorkspace] = {}
+_rmsnorm_fused_ar_unavailable: Optional[bool] = None
+
+
+def is_rmsnorm_fused_ar_unavailable() -> bool:
+    global _rmsnorm_fused_ar_unavailable
+    if _rmsnorm_fused_ar_unavailable is None:
+        try:
+            import mega_ops
+
+            usable = mega_ops.is_available()
+        except ImportError:
+            usable = False
+        if usable:
+            comm = get_tp_group().torch_symm_mem_comm
+            usable = comm is not None and not comm.disabled
+        _rmsnorm_fused_ar_unavailable = not usable
+    return _rmsnorm_fused_ar_unavailable
 
 
 @functools.lru_cache(maxsize=1)
 def _max_ctas() -> int:
-    """Grid size for the fused kernel, from SGLANG_RMSNORM_FUSED_AR_MAX_CTAS.
-
-    Read once (init-static: env vars are frozen for the process lifetime);
-    capped further by the shard's token count at call time. Values outside
-    [1, kMaxBarrierBlocks] raise per the flag's crash-on-ineligible contract.
-    """
+    """Grid size for the fused kernel, from SGLANG_RMSNORM_FUSED_AR_MAX_CTAS."""
     from sglang.srt.environ import envs
 
     max_ctas = envs.SGLANG_RMSNORM_FUSED_AR_MAX_CTAS.get()
@@ -62,16 +58,7 @@ def _max_ctas() -> int:
 
 @functools.lru_cache(maxsize=1)
 def _needs_outbound_copy() -> bool:
-    """Whether the fused output must be copied out of the symm buffer.
-
-    The buffer is overwritten by the next layer's producer GEMM, so a
-    consumer that holds the normalized output past the immediately
-    following GEMM needs a private copy. Today that is hidden-state
-    capture: both the boolean flag and any non-None mode capture hidden
-    states (see get_server_return_hidden_states_mode), and `last` keeps a
-    reference to the final layer's output. Read once — the fields are
-    server-level config, frozen for the process lifetime.
-    """
+    # if enable return hidden states, copy is necessity for gemm output to symm mem.
     from sglang.srt.runtime_context import get_exec
 
     features = get_exec().features
@@ -80,15 +67,15 @@ def _needs_outbound_copy() -> bool:
     )
 
 
-class _FusedArResources(msgspec.Struct):
-    buffer: torch.Tensor  # the group's TorchSymmMemCommunicator buffer
-    multicast_ptr: int
-    flags_ptrs_dev: int
-    state_ptr: int
+class _RmsnormFusedArWorkspace(msgspec.Struct):
+    buffer: torch.Tensor  # symm staging buffer; producer GEMMs write here
+    multicast_ptr: int  # buffer's multicast address (the kernel's ld/st target)
+    flags_ptrs_dev: int  # device array of every rank's barrier-flag pointer
+    state_ptr: int  # kernel-private state (barrier epoch counters)
     rank: int
     world_size: int
-    max_size: int  # symm buffer capacity in bytes
-    refs: tuple  # keeps flags/state/handles alive
+    max_size: int  # buffer capacity in bytes
+    refs: tuple  # owns flags/state tensors + handles so they outlive this struct
 
 
 def rmsnorm_fused_ar_enabled() -> bool:
@@ -97,46 +84,22 @@ def rmsnorm_fused_ar_enabled() -> bool:
     return get_exec().comm.enable_rmsnorm_fused_ar
 
 
-def rmsnorm_fused_ar_available(use_attn_tp_group: bool = True) -> bool:
-    try:
-        import mega_ops
-    except ImportError:
-        return False
-    if not mega_ops.is_available():
-        return False
-    group = _select_group(use_attn_tp_group)
-    comm = group.torch_symm_mem_comm
-    if comm is None or comm.disabled:
+def rmsnorm_fused_ar_ready() -> bool:
+    if is_rmsnorm_fused_ar_unavailable():
         return False
     if torch.cuda.is_current_stream_capturing():
-        return comm.group.group_name in _RESOURCES
+        key = get_tp_group().torch_symm_mem_comm.group.group_name
+        return key in _rmsnorm_fused_ar_workspaces
     return True
 
 
 def _token_shard(num_tokens: int, rank: int, world_size: int) -> Tuple[int, int]:
-    """Split num_tokens as evenly as possible; the remainder goes to the
-    lowest ranks. Pure function of shapes -> CUDA-graph replayable."""
     base, rem = divmod(num_tokens, world_size)
     start = rank * base + min(rank, rem)
     return start, start + base + (1 if rank < rem else 0)
 
 
-def _select_group(use_attn_tp_group: bool) -> GroupCoordinator:
-    from sglang.srt.distributed import (
-        get_attn_tp_group,
-        get_moe_ep_group,
-        get_moe_tp_group,
-    )
-    from sglang.srt.runtime_context import get_parallel
-
-    if use_attn_tp_group:
-        return get_attn_tp_group()
-    if get_parallel().moe_ep_size > 1:
-        return get_moe_ep_group()
-    return get_moe_tp_group()
-
-
-def _get_resources(group: GroupCoordinator) -> _FusedArResources:
+def _get_workspace(group: GroupCoordinator) -> _RmsnormFusedArWorkspace:
     comm = group.torch_symm_mem_comm
     if comm is None or comm.disabled:
         raise RuntimeError(
@@ -146,13 +109,13 @@ def _get_resources(group: GroupCoordinator) -> _FusedArResources:
             "construct one)."
         )
     key = comm.group.group_name
-    res = _RESOURCES.get(key)
-    if res is not None:
-        return res
+    workspace = _rmsnorm_fused_ar_workspaces.get(key)
+    if workspace is not None:
+        return workspace
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            "--enable-rmsnorm-fused-ar: resources for group "
-            f"'{key}' were not built before CUDA-graph capture. An eager "
+            "--enable-rmsnorm-fused-ar: the workspace for group "
+            f"'{key}' was not built before CUDA-graph capture. An eager "
             "warmup forward must run first (do not skip server warmup)."
         )
 
@@ -163,8 +126,22 @@ def _get_resources(group: GroupCoordinator) -> _FusedArResources:
         raise RuntimeError(
             "--enable-rmsnorm-fused-ar: mega_ops unavailable at runtime."
         )
-    device = comm.buffer.device
-    hdl = torch_symm_mem.rendezvous(comm.buffer, key)  # idempotent
+    from sglang.srt.layers.communicator import RMSNORM_FUSED_AR_MAX_BATCH_SIZE
+    from sglang.srt.runtime_context import process_model_config
+
+    device = comm.device
+    # Dedicated staging buffer, sized from the admission cap so any admitted
+    # batch fits (admission == allocation; see apply_rmsnorm_fused_ar).
+    # Deliberately NOT comm.buffer: the generic symm-mem all-reduce fast path
+    # stages fallback all-reduces into comm.buffer[0:n], which would race the
+    # zero-copy windows where a producer GEMM's output or the kernel's
+    # normalized output stays resident in the staging buffer.
+    staging = torch_symm_mem.empty(
+        RMSNORM_FUSED_AR_MAX_BATCH_SIZE * process_model_config().hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    hdl = torch_symm_mem.rendezvous(staging, key)
     if hdl.multicast_ptr == 0:
         raise RuntimeError(
             "--enable-rmsnorm-fused-ar: multicast is not supported on this "
@@ -180,30 +157,30 @@ def _get_resources(group: GroupCoordinator) -> _FusedArResources:
     # inkling AR resource build).
     hflags.barrier()
     state = torch.zeros(mega_ops.STATE_SIZE, device=device, dtype=torch.uint32)
-    res = _FusedArResources(
-        buffer=comm.buffer,
+    workspace = _RmsnormFusedArWorkspace(
+        buffer=staging,
         multicast_ptr=hdl.multicast_ptr,
         flags_ptrs_dev=hflags.buffer_ptrs_dev,
         state_ptr=state.data_ptr(),
         rank=hdl.rank,
         world_size=comm.world_size,
-        max_size=comm.max_size,
+        max_size=staging.numel() * staging.element_size(),
         refs=(flags, state, hdl, hflags),
     )
-    _RESOURCES[key] = res
+    _rmsnorm_fused_ar_workspaces[key] = workspace
     logger.info(
-        "rmsnorm-fused-ar resources ready for group '%s' (world=%d)",
+        "rmsnorm-fused-ar workspace ready for group '%s' (world=%d)",
         key,
         comm.world_size,
     )
-    return res
+    return workspace
 
 
 def _is_eligible(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    res: _FusedArResources,
+    workspace: _RmsnormFusedArWorkspace,
 ) -> bool:
     payload = x.numel() * x.element_size()
     return (
@@ -218,27 +195,8 @@ def _is_eligible(
         and x.is_contiguous()
         and residual.is_contiguous()
         and weight.is_contiguous()
-        and payload <= res.max_size
+        and payload <= workspace.max_size
     )
-
-
-def _prepare_residual(
-    residual: torch.Tensor, res: _FusedArResources, group: GroupCoordinator
-) -> torch.Tensor:
-    """Return a residual whose shard state matches this call's group.
-
-    Same group ⇒ same (num_tokens, rank, world) ⇒ same window, pass through.
-    Different group ⇒ complete on the MARKED group first (group identity is
-    identical on every rank of the group, so this decision is rank-uniform;
-    comparing shard windows would NOT be — windows from different world
-    sizes diverge per rank and would desync the collective)."""
-    marker = getattr(residual, _SHARD_ATTR, None)
-    if marker is None:
-        return residual
-    _start, _end, marked_group = marker
-    if marked_group is group:
-        return residual
-    return ensure_full_residual(residual)
 
 
 def is_fused_ar_buffer_view(tensor: Optional[torch.Tensor]) -> bool:
@@ -249,10 +207,12 @@ def is_fused_ar_buffer_view(tensor: Optional[torch.Tensor]) -> bool:
     the ForwardBatch between calls) must clone it first: the next call's
     producer GEMM direct-writes the same buffer.
     """
-    if tensor is None or not _RESOURCES:
+    if tensor is None or not _rmsnorm_fused_ar_workspaces:
         return False
     ptr = tensor.data_ptr()
-    return any(res.buffer.data_ptr() == ptr for res in _RESOURCES.values())
+    return any(
+        w.buffer.data_ptr() == ptr for w in _rmsnorm_fused_ar_workspaces.values()
+    )
 
 
 def get_fused_ar_staging_view(
@@ -260,34 +220,24 @@ def get_fused_ar_staging_view(
     num_tokens: int,
     hidden: int,
     dtype: Optional[torch.dtype] = None,
-    use_attn_tp_group: bool = True,
 ) -> Optional[torch.Tensor]:
-    """Return a [num_tokens, hidden] view of the fused-AR symm buffer for a
-    producer GEMM to write into, or None when the fused path is off/not ready.
-
-    None (instead of raise) because the caller decides between direct-write
-    and the plain path BEFORE the GEMM; returning None keeps that call site
-    branch-free-safe during warmup (resources not built yet) and under
-    capture of the very first forward."""
     if (
         not rmsnorm_fused_ar_enabled()
         or (dtype is not None and dtype != torch.bfloat16)
         or hidden <= 0
         or hidden % 8 != 0
+        or is_rmsnorm_fused_ar_unavailable()
     ):
         return None
-    group = _select_group(use_attn_tp_group)
-    comm = group.torch_symm_mem_comm
-    if comm is None or comm.disabled:
-        return None
-    key = comm.group.group_name
-    res = _RESOURCES.get(key)
-    if res is None:
+    workspace = _rmsnorm_fused_ar_workspaces.get(
+        get_tp_group().torch_symm_mem_comm.group.group_name
+    )
+    if workspace is None:
         return None  # first eager call will build; that call still does copy_
     n = num_tokens * hidden
-    if n * 2 > res.max_size:
+    if n * 2 > workspace.max_size:
         return None
-    return res.buffer[:n].view(num_tokens, hidden)
+    return workspace.buffer[:n].view(num_tokens, hidden)
 
 
 def rmsnorm_fused_ar_forward(
@@ -297,24 +247,20 @@ def rmsnorm_fused_ar_forward(
     weight: torch.Tensor,
     eps: float,
     post_residual_addition: Optional[torch.Tensor] = None,
-    use_attn_tp_group: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Fused AR+add+RMSNorm. Returns (normalized_full, residual_sharded).
+    """Fused AR+add+RMSNorm. Returns (normalized_full, residual_sharded)."""
+    if is_rmsnorm_fused_ar_unavailable():
+        return None
 
-    Collective: every rank of the group must call this for the same layer
-    (guaranteed by SPMD model execution)."""
     import mega_ops
 
-    group = _select_group(use_attn_tp_group)
-    comm = group.torch_symm_mem_comm
-    if comm is None or comm.disabled:
-        return None
+    group = get_tp_group()
     try:
-        res = _get_resources(group)
+        workspace = _get_workspace(group)
     except RuntimeError as exc:
-        logger.debug("rmsnorm-fused-ar resources unavailable: %s", exc)
+        logger.debug("rmsnorm-fused-ar workspace unavailable: %s", exc)
         return None
-    if not _is_eligible(x, residual, weight, res):
+    if not _is_eligible(x, residual, weight, workspace):
         return None
     if post_residual_addition is not None and (
         post_residual_addition.shape != residual.shape
@@ -325,19 +271,15 @@ def rmsnorm_fused_ar_forward(
 
     num_tokens, hidden = x.shape
     if num_tokens == 0:
-        # Uniform across the group (same batch), so every rank skips the
-        # kernel together — no barrier desync. A marker cannot exist on an
-        # empty residual's producing chain, but clear defensively.
-        if getattr(residual, _SHARD_ATTR, None) is not None:
-            delattr(residual, _SHARD_ATTR)
+        if getattr(residual, "_mega_residual_shard", None) is not None:
+            delattr(residual, "_mega_residual_shard")
         return x, residual
 
-    residual = _prepare_residual(residual, res, group)
-    start, end = _token_shard(num_tokens, res.rank, res.world_size)
+    start, end = _token_shard(num_tokens, workspace.rank, workspace.world_size)
     if post_residual_addition is not None and end > start:
         residual[start:end].add_(post_residual_addition[start:end])
 
-    buf = res.buffer[: x.numel()].view(num_tokens, hidden)
+    buf = workspace.buffer[: x.numel()].view(num_tokens, hidden)
     if x.data_ptr() == buf.data_ptr():
         # Producer GEMM already wrote into the staging buffer (see
         # get_fused_ar_staging_view); pointer equality suffices because the
@@ -349,24 +291,22 @@ def rmsnorm_fused_ar_forward(
         input=buf[start:end],
         residual=residual[start:end],
         weight=weight,
-        mcptr=res.multicast_ptr + start * hidden * x.element_size(),
-        flags_ptrs=res.flags_ptrs_dev,
-        state_ptr=res.state_ptr,
-        rank=res.rank,
-        world_size=res.world_size,
+        mcptr=workspace.multicast_ptr + start * hidden * x.element_size(),
+        flags_ptrs=workspace.flags_ptrs_dev,
+        state_ptr=workspace.state_ptr,
+        rank=workspace.rank,
+        world_size=workspace.world_size,
         max_ctas=min(_max_ctas(), max(end - start, 1)),
         eps=eps,
     )
     if x.data_ptr() == buf.data_ptr() and not _needs_outbound_copy():
-        # Zero-copy: the normalized result the kernel just wrote stays
-        # resident in the symm buffer. Safe because the only consumer (the
-        # next GEMM) reads it before the next producer direct-write
-        # overwrites it — same-stream program order.
         out = buf
     else:
         out = torch.empty_like(x)
         out.copy_(buf)  # kernel's multimem.st already all-gathered the result
-    setattr(residual, _SHARD_ATTR, (start, end, group))
+    # Mark the residual as fresh only in [start, end) -- this rank's shard.
+    # Need to be gathered after the last layer output
+    setattr(residual, "_mega_residual_shard", (start, end, group))
     return out, residual
 
 
@@ -379,7 +319,7 @@ def ensure_full_residual(
     shapes, dense copies, and one all_gather_into_tensor."""
     if residual is None:
         return None
-    marker = getattr(residual, _SHARD_ATTR, None)
+    marker = getattr(residual, "_mega_residual_shard", None)
     if marker is None:
         return residual
 
@@ -401,5 +341,5 @@ def ensure_full_residual(
             residual[r_start:r_end].copy_(
                 padded_out[r * per : r * per + (r_end - r_start)]
             )
-    delattr(residual, _SHARD_ATTR)
+    delattr(residual, "_mega_residual_shard")
     return residual

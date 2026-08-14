@@ -413,8 +413,8 @@ class Qwen3DecoderLayer(nn.Module):
         if hidden_states.shape[0] != 0:
             # Direct-write (attention side): let o_proj write its partial sum
             # straight into the fused-AR symm buffer; prepare_mlp's fused
-            # branch (communicator._gather_hidden_states_and_residual with
-            # use_attn_tp_group=True) detects pointer equality and skips its
+            # branch (communicator._gather_hidden_states_and_residual)
+            # detects pointer equality and skips its
             # staging copy_. None (flag off / resources not built yet /
             # payload too large) keeps o_proj allocating its own output —
             # byte-identical to the pre-direct-write code.
@@ -423,11 +423,8 @@ class Qwen3DecoderLayer(nn.Module):
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
                     dtype=hidden_states.dtype,
-                    use_attn_tp_group=True,
                 )
-                if apply_rmsnorm_fused_ar(
-                    hidden_states.shape[0], use_attn_tp_group=True
-                )
+                if apply_rmsnorm_fused_ar(hidden_states.shape[0])
                 else None
             )
             hidden_states = self.self_attn(
@@ -470,9 +467,8 @@ class Qwen3DecoderLayer(nn.Module):
             # Direct-write (MLP side): with fuse_mlp_allreduce on, down_proj
             # skips its all-reduce and the marked output is consumed by the
             # NEXT layer's prepare_attn fused branch
-            # (forward_with_allreduce_fusion with use_attn_tp_group=False,
-            # whose moe_tp group is the full TP group under this flag's
-            # startup constraints) — write the partial sum straight into that
+            # (forward_with_allreduce_fusion, reducing over the single group
+            # the fused path uses) — write the partial sum straight into that
             # consumer's staging buffer so its copy_ is skipped via pointer
             # equality. None keeps the plain-allocation fallback.
             mlp_staging = (
@@ -480,12 +476,9 @@ class Qwen3DecoderLayer(nn.Module):
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
                     dtype=hidden_states.dtype,
-                    use_attn_tp_group=False,
                 )
                 if fuse_mlp_allreduce
-                and apply_rmsnorm_fused_ar(
-                    hidden_states.shape[0], use_attn_tp_group=False
-                )
+                and apply_rmsnorm_fused_ar(hidden_states.shape[0])
                 and hidden_states.shape[0] != 0
                 else None
             )

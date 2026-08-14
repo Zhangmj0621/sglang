@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.layers.rmsnorm_fused_ar import rmsnorm_fused_ar_ready
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
@@ -179,25 +180,18 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
-def apply_rmsnorm_fused_ar(batch_size: int, use_attn_tp_group: bool = True) -> bool:
-    """Whether the multimem fused-AR path may consume this producer output."""
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-    elif get_parallel().moe_ep_size > 1:
-        world_size = get_parallel().moe_ep_size
-    else:
-        world_size = get_parallel().moe_tp_size
+RMSNORM_FUSED_AR_MAX_BATCH_SIZE = 16384
 
-    from sglang.srt.layers.rmsnorm_fused_ar import rmsnorm_fused_ar_available
 
+def apply_rmsnorm_fused_ar(batch_size: int) -> bool:
     return (
         get_exec().comm.enable_rmsnorm_fused_ar
         and get_exec().comm.enable_torch_symm_mem
         and (_is_sm90_supported or _is_sm100_supported)
-        and rmsnorm_fused_ar_available(use_attn_tp_group)
+        and rmsnorm_fused_ar_ready()
         and not is_dp_attention_enabled()
-        and world_size in (2, 4, 6, 8)
         and batch_size > 0
+        and batch_size <= RMSNORM_FUSED_AR_MAX_BATCH_SIZE
     )
 
 
@@ -219,7 +213,6 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
 def _ensure_full_residual_for_fused_ar(
     residual: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """Complete a shard-marked residual before a non-fused consumer reads it."""
     if residual is None or getattr(residual, "_mega_residual_shard", None) is None:
         return residual
     from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
@@ -552,14 +545,7 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            # rmsnorm-fused-ar: complete residual before any aux-capture read
-            # below — both the `hidden_states=residual` alias call right here
-            # (into `_scattered_to_tp_attn_full`'s gather) and the clone
-            # further down. A fused-AR residual is always full-shaped, so it
-            # can never legally hit that call's SCATTERED->TP_ATTN_FULL gather
-            # path (DFLASH/DSPARK aux capture is not startup-blocked, unlike
-            # eagle3) — this call is defense in depth and a no-op when
-            # residual is unmarked or the flag is off.
+            # Gather the residual here since each rank only has partial one
             residual = _ensure_full_residual_for_fused_ar(residual)
             gathered_last_layer_output = self._communicate_simple_fn(
                 hidden_states=residual,
@@ -623,9 +609,7 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_rmsnorm_fused_ar(
-                        hidden_states.shape[0], use_attn_tp_group=False
-                    )
+                    apply_rmsnorm_fused_ar(hidden_states.shape[0])
                     or apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
@@ -633,7 +617,6 @@ class LayerCommunicator:
                     if (
                         self.enable_fused_ar_quant
                         and _use_aiter
-                        and post_residual_addition is None
                         and hasattr(
                             self.input_layernorm,
                             "forward_with_allreduce_fusion_quant_per_group",
@@ -889,7 +872,7 @@ class LayerCommunicator:
 
         return (
             (
-                apply_rmsnorm_fused_ar(batch_size, use_attn_tp_group=False)
+                apply_rmsnorm_fused_ar(batch_size)
                 or apply_flashinfer_allreduce_fusion(batch_size)
                 or (
                     _use_aiter
@@ -1192,7 +1175,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             handled = False
             if (
-                apply_rmsnorm_fused_ar(hidden_states.shape[0], use_attn_tp_group=True)
+                apply_rmsnorm_fused_ar(hidden_states.shape[0])
                 or apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
