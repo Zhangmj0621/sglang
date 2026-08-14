@@ -105,6 +105,19 @@ class TestLoadsResponse(CustomTestCase):
         self.assertEqual(response["loads"][0]["num_running_reqs"], 3)
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
 
+    def test_session_ref_evictable_tokens_is_a_core_field(self):
+        """Guards the /v1/loads external contract: the session-aware evictable
+        breakdown must survive as a flat core scalar. A rename, a move into a
+        section sub-struct, or a broken _CORE_KEYS derivation would silently
+        drop it from the response (and from the future router load transfer)."""
+        manager = _FakeHttpTokenizerManager(
+            [LoadSnapshot(dp_rank=0, num_evictable_session_ref_tokens=7)]
+        )
+
+        response = asyncio.run(get_loads(tokenizer_manager=manager))
+
+        self.assertEqual(response["loads"][0]["num_evictable_session_ref_tokens"], 7)
+
 
 class TestLoadsAcceleratorField(CustomTestCase):
     def test_accelerator_metadata_reported_in_json(self):

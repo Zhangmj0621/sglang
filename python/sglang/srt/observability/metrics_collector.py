@@ -91,12 +91,16 @@ class SchedulerStats:
     #
     # kv_available_tokens:  free (unallocated) slots in the pool.
     # kv_evictable_tokens:  slots holding radix-cached KV data that can be evicted for new requests.
+    # kv_evictable_session_ref_tokens:  subset of kv_evictable_tokens referenced by an open
+    #                       radix session (--enable-session-radix-cache only, else 0).
+    #                       Unused evictable = kv_evictable_tokens - kv_evictable_session_ref_tokens.
     # kv_used_tokens:       actively used slots (locked by running requests). Equals full_num_used.
     # num_used_tokens:      max(full_num_used, swa_num_used) for hybrid-SWA models, else full_num_used.
     #                       Does NOT include the mamba pool.
     num_used_tokens: int = 0
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
+    kv_evictable_session_ref_tokens: int = 0
     kv_used_tokens: int = 0
 
     swa_available_tokens: int = 0
@@ -243,6 +247,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_lora: bool = False,
         enable_hierarchical_cache: bool = False,
         enable_streaming_session: bool = False,
+        enable_session_radix_cache: bool = False,
         server_args: Optional[ServerArgs] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -260,6 +265,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
+        self.enable_session_radix_cache = enable_session_radix_cache
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
 
@@ -352,6 +358,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        if self.enable_session_radix_cache:
+            self.kv_evictable_session_ref_tokens = Gauge(
+                name="sglang:kv_evictable_session_ref_tokens",
+                documentation="Evictable KV token slots referenced by an open radix session (subset of kv_evictable_tokens).",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
         self.kv_used_tokens = Gauge(
             name="sglang:kv_used_tokens",
             documentation="Number of actively used token slots in the KV cache pool.",
@@ -1114,6 +1127,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 enable_lora=enable_lora,
                 enable_hierarchical_cache=enable_hierarchical_cache,
                 enable_streaming_session=server_args.enable_streaming_session,
+                enable_session_radix_cache=server_args.enable_session_radix_cache,
                 server_args=server_args,
             )
         return SchedulerMetricsCollectorContext(
@@ -1334,6 +1348,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
         self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
+        if self.enable_session_radix_cache:
+            self._log_gauge(
+                self.kv_evictable_session_ref_tokens,
+                stats.kv_evictable_session_ref_tokens,
+            )
         self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
         self._log_gauge(self.swa_available_tokens, stats.swa_available_tokens)
         self._log_gauge(self.swa_evictable_tokens, stats.swa_evictable_tokens)

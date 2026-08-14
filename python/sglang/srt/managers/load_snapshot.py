@@ -194,6 +194,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
+    # Evictable radix-cached KV referenced by an open session (subset of the
+    # evictable pool; --enable-session-radix-cache only, else 0).
+    num_evictable_session_ref_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0

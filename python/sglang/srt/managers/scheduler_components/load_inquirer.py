@@ -121,9 +121,8 @@ class SchedulerLoadInquirer:
             )
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-        num_used_tokens, kv_token_usage = (
-            self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
-        )
+        pool_stats = self.pool_stats_observer.get_pool_stats()
+        num_used_tokens, kv_token_usage = pool_stats.get_kv_token_stats()
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
@@ -214,6 +213,7 @@ class SchedulerLoadInquirer:
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
+            num_evictable_session_ref_tokens=pool_stats.full_evictable_session_ref_size,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

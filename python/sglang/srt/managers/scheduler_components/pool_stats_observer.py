@@ -27,6 +27,9 @@ class PoolStats:
     full_token_usage: float
     full_available_size: int
     full_evictable_size: int
+    # Subset of full_evictable_size referenced by an open radix session
+    # (--enable-session-radix-cache only, else 0).
+    full_evictable_session_ref_size: int = 0
 
     is_hybrid_swa: bool = False
     is_hybrid_ssm: bool = False
@@ -135,6 +138,7 @@ class PoolStats:
             stats.mamba_used_tokens = self.mamba_num_used
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
+        stats.kv_evictable_session_ref_tokens = self.full_evictable_session_ref_size
         stats.kv_used_tokens = self.full_num_used
 
 
@@ -213,6 +217,14 @@ class SchedulerPoolStatsObserver:
 
         return pool_stats
 
+    def _full_evictable_session_ref_size(self) -> int:
+        """Session-ref evictable size lives on UnifiedRadixCache only; 0 elsewhere."""
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            return self.tree_cache.full_evictable_session_ref_size()
+        return 0
+
     def _get_token_info(self) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
@@ -223,6 +235,7 @@ class SchedulerPoolStatsObserver:
             full_token_usage=token_usage,
             full_available_size=available_size,
             full_evictable_size=evictable_size,
+            full_evictable_session_ref_size=self._full_evictable_session_ref_size(),
         )
 
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
@@ -276,6 +289,7 @@ class SchedulerPoolStatsObserver:
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,
             full_evictable_size=full_evictable_size,
+            full_evictable_session_ref_size=self._full_evictable_session_ref_size(),
             mamba_num_used=mamba_num_used,
             mamba_usage=mamba_usage,
             mamba_available_size=mamba_available_size,
@@ -314,6 +328,7 @@ class SchedulerPoolStatsObserver:
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,
             full_evictable_size=full_evictable_size,
+            full_evictable_session_ref_size=self._full_evictable_session_ref_size(),
             swa_num_used=swa_num_used,
             swa_token_usage=swa_token_usage,
             swa_available_size=swa_available_size,
