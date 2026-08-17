@@ -545,8 +545,6 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            # Gather the residual here since each rank only has partial one
-            residual = _ensure_full_residual_for_fused_ar(residual)
             gathered_last_layer_output = self._communicate_simple_fn(
                 hidden_states=residual,
                 forward_batch=forward_batch,

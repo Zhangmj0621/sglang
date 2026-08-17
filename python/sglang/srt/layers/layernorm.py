@@ -259,28 +259,13 @@ def _forward_with_allreduce_fusion(
                 if fused_result[0] is not None:
                     return fused_result
 
-            # The custom fused-AR producer may have skipped its all-reduce
-            # even when the runtime kernel declines this particular shape.
-            # Complete that reduction before using the generic norm path.
-            if rmsnorm_fused_ar_applied:
-                if use_attn_tp_group:
-                    x = attention_tensor_model_parallel_all_reduce(x)
-                elif get_parallel().moe_ep_size > 1:
-                    x = moe_expert_parallel_all_reduce(x)
-                else:
-                    x = moe_tensor_model_parallel_all_reduce(x)
-                return norm_module.forward(x, residual, None)
-
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
-            # FlashInfer is also allowed to decline a shape-specific backend
-            # request. Its callers skipped the producer all-reduce expecting
-            # this helper to complete it, so do not fall through to a plain
-            # norm with a partial sum.
-            if not _use_aiter:
+            # A Fallback for RMSNorm fused AR path.
+            if not _use_aiter and rmsnorm_fused_ar_applied:
                 if use_attn_tp_group:
                     x = attention_tensor_model_parallel_all_reduce(x)
                 elif get_parallel().moe_ep_size > 1:
@@ -289,18 +274,6 @@ def _forward_with_allreduce_fusion(
                     x = moe_tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
-    if (
-        residual is not None
-        and getattr(residual, "_mega_residual_shard", None) is not None
-    ):
-        # A residual left sharded by an earlier fused-AR call (this call's
-        # own flag-ON path completes it above) must be completed before any
-        # non-fused consumer reads it.
-        # The marker's presence implies the flag was on, so no config read
-        # is needed on the common (unmarked) path.
-        from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
-
-        residual = ensure_full_residual(residual)
     return norm_module.forward(x, residual, post_residual_addition)
 
 
@@ -538,12 +511,7 @@ class RMSNorm(BaseFusedOp):
             residual is not None
             and getattr(residual, "_mega_residual_shard", None) is not None
         ):
-            # A residual left sharded by the fused-AR path must be completed
-            # before any non-fused consumer reads it — this covers the final
-            # model.norm(hidden_states, residual). The marker can only exist
-            # when --enable-rmsnorm-fused-ar produced it, so checking the
-            # tensor attribute first (free, publish-independent) avoids an
-            # unconditional get_exec() read on the flag-off common path.
+            # AG the shard residual before last layer's Norm
             from sglang.srt.layers.rmsnorm_fused_ar import ensure_full_residual
 
             residual = ensure_full_residual(residual)

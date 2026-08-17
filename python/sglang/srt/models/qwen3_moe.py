@@ -830,18 +830,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         if hidden_states.shape[0] != 0:
-            # Direct-write (attention side): let o_proj write its partial sum
-            # straight into the fused-AR symm buffer; prepare_mlp's fused
-            # branch (communicator._gather_hidden_states_and_residual)
-            # detects pointer equality and skips its
-            # staging copy_. Only when mlp_mode is FULL is that branch the
-            # consumer (under this flag's startup constraints — no a2a
-            # backend, no moe-cp allgather, no dwdp — it always is; the mode
-            # check keeps the write provably tied to its reader). None (flag
-            # off / resources not built yet / payload too large) keeps o_proj
-            # allocating its own output — byte-identical to the
-            # pre-direct-write code. The MoE side is untouched: the experts'
-            # output comes from MoE kernels that allocate their own tensors.
             attn_staging = (
                 get_fused_ar_staging_view(
                     num_tokens=hidden_states.shape[0],

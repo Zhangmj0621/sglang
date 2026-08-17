@@ -130,12 +130,7 @@ def _get_workspace(group: GroupCoordinator) -> _RmsnormFusedArWorkspace:
     from sglang.srt.runtime_context import process_model_config
 
     device = comm.device
-    # Dedicated staging buffer, sized from the admission cap so any admitted
-    # batch fits (admission == allocation; see apply_rmsnorm_fused_ar).
-    # Deliberately NOT comm.buffer: the generic symm-mem all-reduce fast path
-    # stages fallback all-reduces into comm.buffer[0:n], which would race the
-    # zero-copy windows where a producer GEMM's output or the kernel's
-    # normalized output stays resident in the staging buffer.
+    # Create dedicated staging buffer
     staging = torch_symm_mem.empty(
         RMSNORM_FUSED_AR_MAX_BATCH_SIZE * process_model_config().hidden_size,
         device=device,
@@ -152,9 +147,6 @@ def _get_workspace(group: GroupCoordinator) -> _RmsnormFusedArWorkspace:
     )
     flags.zero_()
     hflags = torch_symm_mem.rendezvous(flags, key)
-    # Device-side barrier so no peer's first fused kernel can write an epoch
-    # into our flags while our zero_ is still pending (same rationale as the
-    # inkling AR resource build).
     hflags.barrier()
     state = torch.zeros(mega_ops.STATE_SIZE, device=device, dtype=torch.uint32)
     workspace = _RmsnormFusedArWorkspace(
@@ -200,13 +192,6 @@ def _is_eligible(
 
 
 def is_fused_ar_buffer_view(tensor: Optional[torch.Tensor]) -> bool:
-    """True when `tensor` is a zero-copy view of a fused-AR symm buffer.
-
-    Callers that park a fused-AR output across a boundary the buffer's
-    lifetime does not cover (e.g. split-prefill stashing hidden_states on
-    the ForwardBatch between calls) must clone it first: the next call's
-    producer GEMM direct-writes the same buffer.
-    """
     if tensor is None or not _rmsnorm_fused_ar_workspaces:
         return False
     ptr = tensor.data_ptr()
@@ -233,7 +218,7 @@ def get_fused_ar_staging_view(
         get_tp_group().torch_symm_mem_comm.group.group_name
     )
     if workspace is None:
-        return None  # first eager call will build; that call still does copy_
+        return None
     n = num_tokens * hidden
     if n * 2 > workspace.max_size:
         return None
@@ -281,12 +266,9 @@ def rmsnorm_fused_ar_forward(
 
     buf = workspace.buffer[: x.numel()].view(num_tokens, hidden)
     if x.data_ptr() == buf.data_ptr():
-        # Producer GEMM already wrote into the staging buffer (see
-        # get_fused_ar_staging_view); pointer equality suffices because the
-        # direct-write path passes back the very same view.
         pass
     else:
-        buf.copy_(x)  # staging copy: this rank's partial sums, all tokens
+        buf.copy_(x)
     mega_ops.rmsnorm_fused_ar(
         input=buf[start:end],
         residual=residual[start:end],
@@ -303,9 +285,9 @@ def rmsnorm_fused_ar_forward(
         out = buf
     else:
         out = torch.empty_like(x)
-        out.copy_(buf)  # kernel's multimem.st already all-gathered the result
+        out.copy_(buf)
     # Mark the residual as fresh only in [start, end) -- this rank's shard.
-    # Need to be gathered after the last layer output
+    # Need to be gathered before the last layer attention
     setattr(residual, "_mega_residual_shard", (start, end, group))
     return out, residual
 
@@ -313,10 +295,6 @@ def rmsnorm_fused_ar_forward(
 def ensure_full_residual(
     residual: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """All-gather a sharded residual back to full and clear the marker.
-
-    No-op (one attribute check) for unmarked tensors. Capture-safe: static
-    shapes, dense copies, and one all_gather_into_tensor."""
     if residual is None:
         return None
     marker = getattr(residual, "_mega_residual_shard", None)
@@ -328,7 +306,7 @@ def ensure_full_residual(
     start, end, group = marker
     num_tokens, hidden = residual.shape
     world = group.world_size
-    per = (num_tokens + world - 1) // world  # padded per-rank slot
+    per = (num_tokens + world - 1) // world
 
     padded_in = residual.new_zeros(per, hidden)
     if end > start:

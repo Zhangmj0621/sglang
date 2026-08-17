@@ -307,19 +307,10 @@ class Qwen2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # When on, o_proj/down_proj skip their internal all-reduce and the
-        # consumer norm below performs it fused with the residual-add. Off ⇒
-        # every branch below is identical to the pre-fusion code.
         use_fused_ar = self._fuse_ar_norm and apply_rmsnorm_fused_ar(
             hidden_states.shape[0]
         )
 
-        # Direct-write: let the producer GEMM write its partial sum straight
-        # into the fused-AR symm buffer, eliminating the staging copy inside
-        # the fused norm (it detects pointer equality and skips copy_). None
-        # (flag off / resources not built yet / payload too large) means the
-        # GEMM allocates its own output and the fused norm's copy_ is the
-        # fallback — behavior identical to the pre-direct-write code.
         staging = (
             get_fused_ar_staging_view(
                 num_tokens=hidden_states.shape[0],
@@ -332,16 +323,11 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Self Attention
         if residual is None:
-            # First layer of the model (embedding output is already
-            # replicated across TP ranks, so no all-reduce is needed here
-            # regardless of the flag).
             residual = hidden_states
             hidden_states = self.input_layernorm(
                 hidden_states, quant_linear=self.self_attn.qkv_proj
             )
         elif use_fused_ar:
-            # `hidden_states` here is the previous layer's down_proj partial
-            # sum (AR skipped there); fuse that AR into this norm.
             hidden_states, residual = (
                 self.input_layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
@@ -370,9 +356,6 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual, quant_linear=self.mlp.gate_up_proj
             )
-        # Same view as the attention side: the fused norm above has already
-        # consumed the buffer (its output was copied out), so down_proj may
-        # overwrite it — same-stream ordering keeps this race-free.
         hidden_states = self.mlp(
             hidden_states, skip_all_reduce=use_fused_ar, output_tensor=staging
         )
@@ -508,8 +491,6 @@ class Qwen2Model(nn.Module):
                 elif self._fuse_ar_norm and apply_rmsnorm_fused_ar(
                     hidden_states.shape[0]
                 ):
-                    # Last layer's down_proj partial sum (AR skipped there);
-                    # fuse that AR into the final norm.
                     hidden_states, _ = self.norm.forward_with_allreduce_fusion(
                         hidden_states, residual
                     )
@@ -673,8 +654,6 @@ class Qwen2ForCausalLM(nn.Module):
                 and forward_batch.residual is not None
                 and apply_rmsnorm_fused_ar(forward_batch.hidden_states.shape[0])
             ):
-                # Last layer's down_proj partial sum (AR skipped there);
-                # fuse that AR into the final norm, same as Qwen2Model.forward.
                 hidden_states, _ = self.model.norm.forward_with_allreduce_fusion(
                     forward_batch.hidden_states, forward_batch.residual
                 )
@@ -688,11 +667,6 @@ class Qwen2ForCausalLM(nn.Module):
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
             )
         else:
-            # rmsnorm-fused-ar zero-copy returns a view of the symmetric
-            # buffer, which the next call's producer GEMM overwrites. This
-            # path parks hidden_states on forward_batch across calls, so it
-            # needs a private copy. clone() is a no-op cost-wise relative to
-            # the copy the fused path would otherwise have done every layer.
             if is_fused_ar_buffer_view(forward_batch.hidden_states):
                 forward_batch.hidden_states = forward_batch.hidden_states.clone()
             result = None

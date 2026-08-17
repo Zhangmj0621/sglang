@@ -2000,11 +2000,15 @@ class ServerArgs:
     ] = False
     enable_rmsnorm_fused_ar: A[
         bool,
-        "Fuse TP all-reduce + residual-add + RMSNorm into a single multimem "
-        "kernel (reduce-scatter + all-gather via NVLink Switch multicast). "
-        "Requires SM90+, NVSwitch multicast, --enable-torch-symm-mem, TP "
-        "world size in {2,4,6,8}, and bf16 models. Unsupported configurations "
-        "fall back to the regular all-reduce path.",
+        Arg(
+            help=(
+                "Fuse TP all-reduce + residual-add + RMSNorm into a single multimem "
+                "kernel (reduce-scatter + all-gather via NVLink Switch multicast). "
+                "Requires SM90+, NVSwitch multicast, --enable-torch-symm-mem, TP "
+                "world size in {2,4,6,8}, and bf16 models. Unsupported configurations "
+                "fall back to the regular all-reduce path.",
+            ),
+        ),
         NS("exec.comm"),
     ] = False
     flashinfer_allreduce_fusion_backend: A[
