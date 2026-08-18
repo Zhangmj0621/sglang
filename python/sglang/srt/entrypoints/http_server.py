@@ -133,6 +133,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     ProfileReq,
+    ReleaseDecodeSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -957,6 +958,23 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
         content = ret.message or "Flush cache failed.\n"
     return Response(
         content=content,
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/release_decode_session")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def release_decode_session(
+    obj: Annotated[ReleaseDecodeSessionReqInput, Body()], request: Request
+):
+    """Release the KV mappings (Used for NVLINK memory in PD disaggregation)."""
+    ret = await _global_state.tokenizer_manager.release_decode_session(obj.host)
+    return ORJSONResponse(
+        content={
+            "success": ret.success,
+            "released_sessions": ret.released_sessions,
+            "message": ret.message,
+        },
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 

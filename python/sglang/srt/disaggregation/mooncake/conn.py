@@ -2236,6 +2236,38 @@ class MooncakeKVManager(CommonKVManager):
         ):
             self._run_one_probe_pass()
 
+    def release_decode_sessions_by_host(self, host: str) -> Tuple[List[str], List[str]]:
+        """Release the NVLink/MNNVL mappings imported from one decode host to fix memory
+        leak on the crashed decode workers"""
+        released: List[str] = []
+        failed: List[str] = []
+        for session_id in list(self.decode_kv_args_table.keys()):
+            try:
+                if NetworkAddress.parse(session_id).host != host:
+                    continue
+            except ValueError:
+                logger.warning("Skipping unparsable session id %s", session_id)
+                continue
+
+            if self.engine.release_remote_mappings(session_id) < 0:
+                failed.append(session_id)
+                continue
+
+            self.decode_kv_args_table.pop(session_id, None)
+            with self.session_lock:
+                self.failed_sessions.discard(session_id)
+                self.session_failures.pop(session_id, None)
+            released.append(session_id)
+
+        logger.info(
+            "Released imported mappings for host %s: %d session(s) released, "
+            "%d failed",
+            host,
+            len(released),
+            len(failed),
+        )
+        return released, failed
+
 
 class MooncakeKVSender(CommonKVSender):
 

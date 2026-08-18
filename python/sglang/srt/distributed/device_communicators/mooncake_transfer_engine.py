@@ -270,6 +270,22 @@ class MooncakeTransferEngine:
     def send_probe(self, peer_session_id: str) -> int:
         return self.engine.send_probe(peer_session_id)
 
+    def release_remote_mappings(self, peer_session_id: str) -> int:
+        try:
+            return self.engine.release_remote_mappings(peer_session_id)
+        except AttributeError:
+            logger.error(
+                "Mooncake's release_remote_mappings requires a newer version of "
+                "mooncake-transfer-engine. Please upgrade Mooncake to reclaim "
+                "memory imported from a dead peer."
+            )
+            return -1
+        except Exception as e:
+            logger.error(
+                "Failed to release remote mappings of %s: %s", peer_session_id, e
+            )
+            return -1
+
     def get_engine(self):
         return self.engine.get_engine()
 

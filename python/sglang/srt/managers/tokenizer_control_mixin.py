@@ -51,6 +51,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReleaseDecodeSessionReqInput,
+    ReleaseDecodeSessionReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -107,6 +109,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("release_decode_session", ReleaseDecodeSessionReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -303,6 +306,22 @@ class TokenizerControlMixin:
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
+
+    async def release_decode_session(
+        self: TokenizerManager, host: str
+    ) -> ReleaseDecodeSessionReqOutput:
+        """Release the KV mappings (VMM)."""
+        self.auto_create_handle_loop()
+        results = await self.release_decode_session_communicator(
+            ReleaseDecodeSessionReqInput(host=host)
+        )
+        released = [s for r in results for s in r.released_sessions]
+        messages = list(dict.fromkeys(r.message for r in results if r.message))
+        return ReleaseDecodeSessionReqOutput(
+            success=all(r.success for r in results),
+            released_sessions=released,
+            message="; ".join(messages),
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

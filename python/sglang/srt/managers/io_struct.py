@@ -1634,6 +1634,16 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class ReleaseDecodeSessionReqInput(BaseReq, kw_only=True):
+    host: str
+
+
+class ReleaseDecodeSessionReqOutput(BaseReq, kw_only=True):
+    success: bool
+    released_sessions: List[str] = msgspec.field(default_factory=list)
+    message: str = ""
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

@@ -148,6 +148,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    ReleaseDecodeSessionReqInput,
+    ReleaseDecodeSessionReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1528,6 +1530,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (ReleaseDecodeSessionReqInput, self.release_decode_session),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -4270,6 +4273,39 @@ class Scheduler(
             )
             success = False
         return success
+
+    def release_decode_session(
+        self, recv_req: ReleaseDecodeSessionReqInput
+    ) -> ReleaseDecodeSessionReqOutput:
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return ReleaseDecodeSessionReqOutput(
+                success=False,
+                message=(
+                    "release_decode_session applies to a prefill worker, but "
+                    f"this one runs in {self.disaggregation_mode} mode."
+                ),
+            )
+
+        kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if not isinstance(kv_manager, MooncakeKVManager):
+            return ReleaseDecodeSessionReqOutput(
+                success=False,
+                message=(
+                    "release_decode_session requires the mooncake transfer "
+                    f"backend, but this worker uses {type(kv_manager).__name__}."
+                ),
+            )
+
+        released, failed = kv_manager.release_decode_sessions_by_host(recv_req.host)
+        return ReleaseDecodeSessionReqOutput(
+            success=not failed,
+            released_sessions=released,
+            message=(
+                f"Failed to release sessions: {', '.join(failed)}" if failed else ""
+            ),
+        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         # Resolved config (pristine server_args + post-publish overrides) so a
