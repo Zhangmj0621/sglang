@@ -11,8 +11,10 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    apply_gemm_ar_rmsnorm_fused,
     apply_rmsnorm_fused_ar,
 )
+from sglang.srt.layers.gemm_ar_rmsnorm_fused import is_normed, mark_normed
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -279,6 +281,8 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         output_tensor: Optional[torch.Tensor] = None,
+        *,
+        fused_norm=None,
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
@@ -312,7 +316,9 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = self.o_proj(attn_output, output_tensor=output_tensor)
+        output, _ = self.o_proj(
+            attn_output, output_tensor=output_tensor, fused_norm=fused_norm
+        )
         return output
 
 
@@ -394,6 +400,38 @@ class Qwen3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
+        # Filled in by Qwen3Model.__init__ once every layer exists, and only
+        # when the fusion flag is on (see there): the MLP-side fusion needs
+        # the NEXT layer's input_layernorm, since that is the norm that would
+        # otherwise run on this layer's down_proj output. Stays None on the
+        # last layer (and at a PP segment boundary), which is exactly where
+        # the MLP side must not fuse.
+        #
+        # Stored as a 1-tuple, NOT a bare Module: `nn.Module.__setattr__`
+        # intercepts any value that IS an nn.Module and registers it as a
+        # submodule. That would alias the next layer's `input_layernorm.weight`
+        # under this layer's `next_input_layernorm.weight` name too, and
+        # `named_parameters()` dedups by tensor identity, returning only the
+        # FIRST name it reaches in `_modules` insertion order -- this layer's
+        # alias, not the next layer's own `input_layernorm.weight`. The next
+        # layer's real parameter name would then be silently absent from
+        # `load_weights`'s `dict(named_parameters())`, so it would keep its
+        # random init forever while looking like a successful load. Wrapping
+        # in a tuple keeps it out of `_modules` entirely. Do not "simplify"
+        # this back into a plain Module attribute -- see the
+        # `next_input_layernorm` property below for the read side.
+        self._next_input_layernorm = None
+
+    @property
+    def next_input_layernorm(self):
+        """Unwraps `_next_input_layernorm`'s 1-tuple, or None if unset.
+
+        Returns a plain RMSNorm module (or None), exactly what a normal
+        attribute would give a reader -- specifically `_maybe_fused_norm`'s
+        `norm_module is None` check below. See `_next_input_layernorm` in
+        `__init__` above for why the tuple wrapping exists.
+        """
+        return self._next_input_layernorm[0] if self._next_input_layernorm else None
 
     def forward(
         self,
@@ -411,13 +449,20 @@ class Qwen3DecoderLayer(nn.Module):
             post_residual_addition=post_residual_addition,
         )
         if hidden_states.shape[0] != 0:
+            attn_fused_norm = self._maybe_fused_norm(
+                num_tokens=hidden_states.shape[0],
+                k_local=self.self_attn.o_proj.input_size_per_partition,
+                norm_module=self.post_attention_layernorm,
+                residual=residual,
+            )
             attn_staging = (
                 get_fused_ar_staging_view(
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
                     dtype=hidden_states.dtype,
                 )
-                if apply_rmsnorm_fused_ar(hidden_states.shape[0])
+                if attn_fused_norm is None
+                and apply_rmsnorm_fused_ar(hidden_states.shape[0])
                 else None
             )
             hidden_states = self.self_attn(
@@ -425,6 +470,7 @@ class Qwen3DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 output_tensor=attn_staging,
+                fused_norm=attn_fused_norm,
             )
 
         # Fully Connected
@@ -457,13 +503,24 @@ class Qwen3DecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
+            mlp_fused_norm = (
+                self._maybe_fused_norm(
+                    num_tokens=hidden_states.shape[0],
+                    k_local=self.mlp.down_proj.input_size_per_partition,
+                    norm_module=self.next_input_layernorm,
+                    residual=residual,
+                )
+                if fuse_mlp_allreduce
+                else None
+            )
             mlp_staging = (
                 get_fused_ar_staging_view(
                     num_tokens=hidden_states.shape[0],
                     hidden=self.hidden_size,
                     dtype=hidden_states.dtype,
                 )
-                if fuse_mlp_allreduce
+                if mlp_fused_norm is None
+                and fuse_mlp_allreduce
                 and apply_rmsnorm_fused_ar(hidden_states.shape[0])
                 and hidden_states.shape[0] != 0
                 else None
@@ -472,17 +529,65 @@ class Qwen3DecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch=forward_batch,
                 output_tensor=mlp_staging,
+                fused_norm=mlp_fused_norm,
             )
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
 
-        if fuse_mlp_allreduce:
+        if is_normed(hidden_states):
+            # down_proj fused the next layer's input_layernorm: hidden_states is
+            # already all-reduced and normed, residual already marked. Neither
+            # the fusion handoff flag nor postprocess_layer applies.
+            pass
+        elif fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
         return hidden_states, residual
+
+    def _maybe_fused_norm(self, *, num_tokens, k_local, norm_module, residual):
+        """A FusedNormSpec when the GEMM-fused path can take this call, else None.
+
+        norm_module is None at the last layer's MLP side (no next layer to fuse
+        into), and residual is None on the very first prepare_attn, before any
+        residual exists -- both mean no fusion.
+
+        k_local is the linear's own input_size_per_partition, i.e. the width of
+        the activation the GEMM will actually see: for o_proj that is
+        total_num_heads * head_dim / attn_tp_size, which is exactly
+        num_heads * head_dim, the width of attn_output.
+        """
+        from sglang.srt.layers.gemm_ar_rmsnorm_fused import is_gemm_ar_eligible
+        from sglang.srt.layers.linear import FusedNormSpec
+
+        if norm_module is None or residual is None:
+            return None
+        if not apply_gemm_ar_rmsnorm_fused(num_tokens):
+            return None
+        # o_proj is built with attn_tp_size while down_proj uses tp_size. The
+        # kernel's collective spans the symm-mem group, i.e. the full TP group,
+        # so the two must coincide -- which they do because this flag disables
+        # dp-attention at startup. Assert rather than assume: a divergence would
+        # make the M-alignment gate check the wrong world size.
+        parallel = get_parallel()
+        assert parallel.attn_tp_size == parallel.tp_size, (
+            f"--enable-gemm-ar-rmsnorm-fused: attn_tp_size "
+            f"{parallel.attn_tp_size} != tp_size {parallel.tp_size}"
+        )
+        if not is_gemm_ar_eligible(
+            m=num_tokens,
+            n=self.hidden_size,
+            k=k_local,
+            world_size=parallel.tp_size,
+        ):
+            return None
+        return FusedNormSpec(
+            norm_weight=norm_module.weight,
+            eps=norm_module.variance_epsilon,
+            residual=residual,
+        )
 
 
 class Qwen3Model(Qwen2Model):
@@ -501,6 +606,18 @@ class Qwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
         self._fuse_ar_norm = False
+        # self.layers is a full-length ModuleList whose out-of-range slots are
+        # PPMissingLayer (utils/common.py: make_layers), so walk only the range
+        # this rank actually owns -- and stop one short, since the last layer
+        # has no next norm to fuse. Gated on the flag itself, not left
+        # unconditional: this loop pokes a private attribute on another
+        # layer's module from the outside, and a disabled flag should not
+        # touch the module graph at all.
+        if get_exec().comm.enable_gemm_ar_rmsnorm_fused:
+            for i in range(self.start_layer, self.end_layer - 1):
+                self.layers[i]._next_input_layernorm = (
+                    self.layers[i + 1].input_layernorm,
+                )
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -636,7 +753,25 @@ class Qwen3ForCausalLM(nn.Module):
             )
         else:
             if is_fused_ar_buffer_view(forward_batch.hidden_states):
+                # The fused GEMM+AR+norm path may have marked this tensor
+                # `is_normed` (mark_normed / is_normed in
+                # layers/gemm_ar_rmsnorm_fused.py): "already all-reduced and
+                # normed" is a property of the VALUE, not of the storage, but
+                # `clone()` only copies storage -- it does not carry Python
+                # attributes -- so the marker would otherwise be silently
+                # dropped here, and the next split's prepare_attn would
+                # re-normalize already-normalized data (a double norm). Read
+                # the marker before the reassignment below replaces
+                # `forward_batch.hidden_states`, then re-apply it to the clone
+                # only if the source actually carried it: marking
+                # unconditionally would cause a missed norm on inputs that
+                # were never fused in the first place. (`forward_batch.residual`
+                # is never cloned, so its own `_mega_residual_shard` marker
+                # needs no equivalent fix here.)
+                was_normed = is_normed(forward_batch.hidden_states)
                 forward_batch.hidden_states = forward_batch.hidden_states.clone()
+                if was_normed:
+                    mark_normed(forward_batch.hidden_states)
             result = None
 
         return result

@@ -102,6 +102,8 @@ class Qwen2MLP(nn.Module):
         forward_batch: ForwardBatch = None,
         skip_all_reduce: bool = False,
         output_tensor: Optional[torch.Tensor] = None,
+        *,
+        fused_norm=None,
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
@@ -113,6 +115,7 @@ class Qwen2MLP(nn.Module):
             forward_batch=forward_batch,
             skip_all_reduce=skip_all_reduce,
             output_tensor=output_tensor,
+            fused_norm=fused_norm,
         )
         return x
 
