@@ -54,6 +54,7 @@ from sglang.srt.layers.dp_attention import (
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.gemm_ar_rmsnorm_fused import is_normed
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
@@ -192,6 +193,41 @@ def apply_rmsnorm_fused_ar(batch_size: int) -> bool:
         and not is_dp_attention_enabled()
         and batch_size > 0
         and batch_size <= RMSNORM_FUSED_AR_MAX_BATCH_SIZE
+    )
+
+
+# Largest M the GEMM-fused path is sized for. This is what the shared symm data
+# buffer is allocated from (mega_symm_workspace.workspace_data_numel), so
+# raising it costs max_m * hidden * 2 bytes.
+GEMM_AR_RMSNORM_FUSED_MAX_M = 16384
+
+
+def apply_gemm_ar_rmsnorm_fused(batch_size: int) -> bool:
+    """Whether the GEMM-fused collective is usable for this batch.
+
+    Only the flag-level and world-level conditions live here; the (M, N, K)
+    alignment gates are in gemm_ar_rmsnorm_fused.is_gemm_ar_eligible, because
+    the caller that knows M also knows K.
+    """
+    from sglang.srt.layers.gemm_ar_rmsnorm_fused import (
+        gemm_ar_rmsnorm_fused_ready,
+    )
+
+    return (
+        get_exec().comm.enable_gemm_ar_rmsnorm_fused
+        and get_exec().comm.enable_torch_symm_mem
+        # SM90 only: the kernel is Hopper-specific (its host side asserts
+        # major == 9), unlike rmsnorm-fused-ar which also runs on sm100.
+        and _is_sm90_supported
+        and gemm_ar_rmsnorm_fused_ready()
+        and not is_dp_attention_enabled()
+        # Under input_scattered, _gather_hidden_states_and_residual takes the
+        # scattered-residual branch (_tp_all_reduce_with_scattered_residual)
+        # instead of the plain AR + norm one the bypass assumes -- skipping
+        # prepare_attn/prepare_mlp here would silently drop that branch.
+        and not get_attn_tp_context().input_scattered
+        and batch_size > 0
+        and batch_size <= GEMM_AR_RMSNORM_FUSED_MAX_M
     )
 
 
@@ -503,6 +539,63 @@ class LayerCommunicator:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        if get_exec().comm.enable_gemm_ar_rmsnorm_fused:
+            self._assert_fused_bypass_is_safe()
+
+    def _assert_fused_bypass_is_safe(self):
+        """Fail loudly if this layer's communicate-fns do more than AR + norm.
+
+        The GEMM-fused path skips prepare_attn / prepare_mlp entirely, which is
+        only sound when those stages have no other side effects. Both the fn
+        selection and qkv_latent_func are frozen at construction, so this is
+        checkable here -- and checking it here beats discovering a silently
+        dropped step at runtime.
+        """
+        if self.qkv_latent_func is not None:
+            raise RuntimeError(
+                "--enable-gemm-ar-rmsnorm-fused: this layer has a "
+                "qkv_latent_func, which prepare_attn would run after the "
+                "norm; the fused path bypasses prepare_attn and would drop it."
+            )
+        if self._communicate_simple_fn is not CommunicateSimpleFn._trivial:
+            raise RuntimeError(
+                "--enable-gemm-ar-rmsnorm-fused: this layer's "
+                f"_communicate_simple_fn is {self._communicate_simple_fn}, not "
+                "_trivial; prepare_attn would perform a scatter/gather the "
+                "fused path bypasses."
+            )
+        norm_fn = getattr(
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+            "func",
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+        )
+        if norm_fn is not (
+            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
+        ):
+            raise RuntimeError(
+                "--enable-gemm-ar-rmsnorm-fused: this layer's norm stage is "
+                f"{norm_fn}, not _gather_hidden_states_and_residual; the fused "
+                "path assumes only that function's plain AR + norm branch "
+                "(the attn_dp_size == 1 case) runs. Its other branches are "
+                "excluded elsewhere, not by this assertion: the "
+                "scattered-residual branch (input_scattered) is excluded by "
+                "this gate's own input_scattered conjunct in "
+                "apply_gemm_ar_rmsnorm_fused, and the attn_dp_size != 1 branch "
+                "is excluded by the startup handler refusing "
+                "--enable-dp-attention. Within that plain branch, the one "
+                "remaining exception, an NPU weight-cache prefetch, is refused "
+                "by the check below."
+            )
+        if _is_npu:
+            raise RuntimeError(
+                "--enable-gemm-ar-rmsnorm-fused: this is an NPU build, where "
+                "_gather_hidden_states_and_residual also runs a weight-cache "
+                "prefetch (prepare_weight_cache) fed by the self._context.cache "
+                "assignment that prepare_mlp's bypass skips -- so the norm "
+                "stage is not pure AR + norm here. This feature is SM90-only "
+                "by design (the kernel asserts major == 9), so NPU is refused "
+                "rather than half-supported."
+            )
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -593,6 +686,13 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if is_normed(hidden_states):
+            # The previous layer's down_proj fused this layer's input_layernorm
+            # into its GEMM: hidden_states is already all-reduced AND normed,
+            # and residual already carries its shard marker. This stage's only
+            # jobs are exactly those two, so it is a no-op here -- running it
+            # would double-norm.
+            return hidden_states, residual
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -794,6 +894,10 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if is_normed(hidden_states):
+            # o_proj fused this layer's post_attention_layernorm into its GEMM.
+            # Same reasoning as prepare_attn's guard.
+            return hidden_states, residual
         if cache is not None:
             self._context.cache = cache
 
@@ -880,6 +984,10 @@ class LayerCommunicator:
                     and get_moe_a2a_backend().is_none()
                     and get_exec().comm.enable_aiter_allreduce_fusion
                 )
+                # The GEMM-fused path also needs this handoff: it fuses the NEXT
+                # layer's input_layernorm into this layer's down_proj, so it must
+                # count as a reason to fuse the MLP-side all-reduce too.
+                or apply_gemm_ar_rmsnorm_fused(batch_size)
             )
             and (not self.is_last_layer)
             and (self._context.tp_size > 1)

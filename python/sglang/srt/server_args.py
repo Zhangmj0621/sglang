@@ -2011,6 +2011,22 @@ class ServerArgs:
         ),
         NS("exec.comm"),
     ] = False
+    enable_gemm_ar_rmsnorm_fused: A[
+        bool,
+        Arg(
+            help=(
+                "Fuse the row-parallel GEMM (o_proj / MLP down_proj) together "
+                "with TP reduce-scatter + residual-add + RMSNorm + all-gather "
+                "into a single multimem kernel. Strictly stronger fusion than "
+                "--enable-rmsnorm-fused-ar, but the kernel's tiling requires "
+                "the token count to be a multiple of 128 * TP, so it is a "
+                "prefill-only path; anything unaligned falls back. Requires "
+                "SM90, NVSwitch multicast, --enable-torch-symm-mem, TP world "
+                "size in {2,4,6,8}, and a bf16 Qwen3 dense model.",
+            ),
+        ),
+        NS("exec.comm"),
+    ] = False
     flashinfer_allreduce_fusion_backend: A[
         Optional[Literal["auto", "trtllm", "mnnvl"]],
         Arg(
@@ -3587,6 +3603,7 @@ class ServerArgs:
         # Must run after _handle_deterministic_inference, which may disable
         # torch symm mem.
         self._handle_rmsnorm_fused_ar()
+        self._handle_gemm_ar_rmsnorm_fused()
         self._handle_attention_backend_compatibility()
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
@@ -4379,6 +4396,72 @@ class ServerArgs:
             )
             self.enable_rmsnorm_fused_ar = False
             return
+
+    def _handle_gemm_ar_rmsnorm_fused(self):
+        """Disable the optional path when startup configuration cannot use it."""
+        if not self.enable_gemm_ar_rmsnorm_fused:
+            return
+        from sglang.srt.utils import is_hip
+
+        reasons = []
+        if is_hip():
+            reasons.append("ROCm is unsupported")
+        # Narrower than rmsnorm-fused-ar's list: the fused GEMM kernel is
+        # SM90-only and only the Qwen3 dense wiring exists so far.
+        allowed_archs = {"Qwen3ForCausalLM"}
+        model_config = self.get_model_config()
+        model_arch = model_config.hf_config.architectures[0]
+        if model_arch not in allowed_archs:
+            reasons.append(f"model architecture {model_arch!r} is unsupported")
+        # ModelConfig.hidden_size resolves through hf_text_config, which is the
+        # same value mega_symm_workspace sizes the buffer from -- read it the
+        # same way here so the gate and the allocation cannot disagree.
+        hidden_size = model_config.hidden_size
+        if hidden_size % 128:
+            reasons.append(
+                f"hidden_size {hidden_size} is not a multiple of 128 (the "
+                "kernel needs N to divide into whole n-tiles)"
+            )
+        if self.enable_deterministic_inference:
+            reasons.append("deterministic inference disables symmetric memory")
+        if not self.enable_torch_symm_mem:
+            reasons.append("--enable-torch-symm-mem is disabled")
+        if self.tp_size not in (2, 4, 6, 8):
+            reasons.append(f"TP world size {self.tp_size} is unsupported")
+        if self.ep_size > 1:
+            reasons.append("expert parallelism is unsupported")
+        if self.moe_dp_size > 1:
+            reasons.append("MoE data parallelism is unsupported")
+        if self.enable_dp_attention:
+            reasons.append("DP attention is unsupported")
+        if self.attn_cp_size > 1:
+            reasons.append("attention context parallelism is unsupported")
+        if self.pp_size > 1:
+            reasons.append("pipeline parallelism is unsupported")
+        if self.speculative_algorithm is not None:
+            reasons.append("speculative decoding is unsupported")
+        if self.enable_torch_compile:
+            reasons.append("torch.compile is unsupported")
+        for _phase in Phase.ALL:
+            if getattr(self.cuda_graph_config, _phase).backend == Backend.TC_PIECEWISE:
+                reasons.append(
+                    f"tc_piecewise CUDA graph backend ({_phase}) is unsupported"
+                )
+        try:
+            import mega_ops
+
+            if not mega_ops.is_available():
+                reasons.append("mega_ops is unavailable")
+        except ImportError:
+            reasons.append("mega_ops is not installed")
+
+        if reasons:
+            logger.warning(
+                "Disabling --enable-gemm-ar-rmsnorm-fused; falling back to the "
+                "regular all-reduce path: %s",
+                "; ".join(reasons),
+            )
+            self.enable_gemm_ar_rmsnorm_fused = False
 
     def _apply_deepep_adjustments(self):
         """Config adjustments required by the DeepEP a2a backend."""

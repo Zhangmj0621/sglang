@@ -8,6 +8,7 @@ import itertools
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -1389,6 +1390,24 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
+class FusedNormSpec(msgspec.Struct):
+    """The norm a row-parallel linear may fuse its all-reduce into.
+
+    Passing this to RowParallelLinear.forward asks for the GEMM + ReduceScatter
+    + residual-add + RMSNorm + AllGather fused kernel. Everything about whether
+    the KERNEL can service the call (shape alignment, dtype, bias,
+    quantization) is a REQUEST, not a command: an unfusable case falls back to
+    the normal path, so a caller never has to pre-validate those. The one
+    thing a caller does have to avoid: `fused_norm` and `output_tensor` both
+    specify where the output goes, so passing both to the same `forward` call
+    raises `ValueError` rather than silently preferring one.
+    """
+
+    norm_weight: torch.Tensor
+    eps: float
+    residual: torch.Tensor
+
+
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 
@@ -1578,7 +1597,22 @@ class RowParallelLinear(LinearBase):
         skip_all_reduce=False,
         forward_batch=None,
         output_tensor=None,
+        *,
+        fused_norm: Optional[FusedNormSpec] = None,
     ):
+        if fused_norm is not None and output_tensor is not None:
+            raise ValueError(
+                "RowParallelLinear.forward: fused_norm and output_tensor both "
+                "specify where the output goes; pass at most one"
+            )
+        if fused_norm is not None:
+            fused = self._try_fused_norm_forward(
+                input_=input_,
+                fused_norm=fused_norm,
+                skip_all_reduce=skip_all_reduce,
+            )
+            if fused is not None:
+                return fused
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1643,6 +1677,92 @@ class RowParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias
+
+    def _try_fused_norm_forward(
+        self,
+        *,
+        input_: torch.Tensor,
+        fused_norm: FusedNormSpec,
+        skip_all_reduce: bool,
+    ):
+        """The fused GEMM+RS+norm+AG path, or None to fall back.
+
+        Every precondition that is a property of THIS LAYER lives here (bias,
+        quant method, input_is_parallel, tp_size); shape and dtype gates live in
+        the fused module. Returns (normed_full, None) -- the bias slot is None
+        because a fused layer must be bias-free, which is checked below.
+        """
+        from sglang.srt.layers.gemm_ar_rmsnorm_fused import (
+            gemm_ar_rmsnorm_fused_enabled,
+            gemm_ar_rmsnorm_fused_ready,
+            try_forward,
+            warn_fallback,
+        )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        if not (gemm_ar_rmsnorm_fused_enabled() and gemm_ar_rmsnorm_fused_ready()):
+            return None
+        # The kernel's epilogue is source-free with no bias term, and its
+        # weight must be the plain [N, K_local] tensor -- a quantized layer
+        # keeps its weight in a packed/scaled form the kernel cannot read.
+        # These are layer properties, so each warns once for this prefix rather
+        # than once per shape: the answer never changes for a given layer.
+        if self.bias is not None or self.skip_bias_add:
+            warn_fallback(
+                "layer has a bias the fused epilogue cannot apply",
+                f"{self.prefix or type(self).__name__}: bias="
+                f"{self.bias is not None}, skip_bias_add={self.skip_bias_add}",
+            )
+            return None
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            warn_fallback(
+                "layer is quantized; the kernel needs a plain [N, K] weight",
+                f"{self.prefix or type(self).__name__}: quant_method="
+                f"{type(self.quant_method).__name__}",
+            )
+            return None
+        if not self.input_is_parallel or self.tp_size <= 1:
+            warn_fallback(
+                "layer is not row-parallel across more than one rank",
+                f"{self.prefix or type(self).__name__}: input_is_parallel="
+                f"{self.input_is_parallel}, tp_size={self.tp_size}",
+            )
+            return None
+        if self.use_dp_attention_reduce or self.use_decode_attn_tp:
+            warn_fallback(
+                "layer uses a different all-reduce path",
+                f"{self.prefix or type(self).__name__}: use_dp_attention_reduce="
+                f"{self.use_dp_attention_reduce}, use_decode_attn_tp="
+                f"{self.use_decode_attn_tp}",
+            )
+            return None
+        # skip_all_reduce is a genuine per-call override: the CALLER is
+        # telling this forward it will handle the collective itself, so it
+        # correctly disqualifies fusion. should_skip_mlp_all_reduce() is
+        # deliberately NOT checked here, even though it looks like the same
+        # kind of "someone else owns this" signal: it reports the
+        # fuse_mlp_allreduce / mlp_reduce_scatter ForwardFlags the DECODER
+        # publishes as the precondition for REQUESTING this very fusion
+        # (qwen3.py only constructs fused_norm inside `with
+        # get_forward().scoped(fuse_mlp_allreduce=...)`, once that flag is
+        # already True) -- so it names this kernel, not a competing one, and
+        # rejecting on it would make the MLP-side fusion permanently
+        # unreachable. The real double-reduce guard is the marker-based skip
+        # in prepare_attn/prepare_mlp plus the decoder suppressing both the
+        # handoff flag and postprocess_layer once is_normed() is true.
+        if skip_all_reduce:
+            return None
+        result = try_forward(
+            x=input_,
+            weight=self.weight,
+            norm_weight=fused_norm.norm_weight,
+            residual=fused_norm.residual,
+            eps=fused_norm.eps,
+        )
+        if result is None:
+            return None
+        normed, _residual = result
+        return normed, None
 
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"

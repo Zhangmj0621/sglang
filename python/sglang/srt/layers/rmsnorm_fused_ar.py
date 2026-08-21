@@ -6,10 +6,15 @@ import functools
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.mega_symm_workspace import (
+    MegaSymmWorkspace,
+    get_workspace,
+    is_workspace_buffer,
+    peek_workspace,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -19,9 +24,6 @@ logger = logging.getLogger(__name__)
 # The kernel's barrier supports at most this many blocks (kMaxBarrierBlocks).
 _MAX_BARRIER_BLOCKS = 256
 
-# Per-group kernel workspace (symm staging buffer + multicast/flag/state
-# pointers). Built lazily on the first eager forward.
-_rmsnorm_fused_ar_workspaces: dict[str, _RmsnormFusedArWorkspace] = {}
 _rmsnorm_fused_ar_unavailable: Optional[bool] = None
 
 
@@ -67,17 +69,6 @@ def _needs_outbound_copy() -> bool:
     )
 
 
-class _RmsnormFusedArWorkspace(msgspec.Struct):
-    buffer: torch.Tensor  # symm staging buffer; producer GEMMs write here
-    multicast_ptr: int  # buffer's multicast address (the kernel's ld/st target)
-    flags_ptrs_dev: int  # device array of every rank's barrier-flag pointer
-    state_ptr: int  # kernel-private state (barrier epoch counters)
-    rank: int
-    world_size: int
-    max_size: int  # buffer capacity in bytes
-    refs: tuple  # owns flags/state tensors + handles so they outlive this struct
-
-
 def rmsnorm_fused_ar_enabled() -> bool:
     from sglang.srt.runtime_context import get_exec
 
@@ -89,7 +80,7 @@ def rmsnorm_fused_ar_ready() -> bool:
         return False
     if torch.cuda.is_current_stream_capturing():
         key = get_tp_group().torch_symm_mem_comm.group.group_name
-        return key in _rmsnorm_fused_ar_workspaces
+        return peek_workspace(group_name=key) is not None
     return True
 
 
@@ -99,80 +90,24 @@ def _token_shard(num_tokens: int, rank: int, world_size: int) -> Tuple[int, int]
     return start, start + base + (1 if rank < rem else 0)
 
 
-def _get_workspace(group: GroupCoordinator) -> _RmsnormFusedArWorkspace:
-    comm = group.torch_symm_mem_comm
-    if comm is None or comm.disabled:
-        raise RuntimeError(
-            "--enable-rmsnorm-fused-ar: group has no usable torch symm-mem "
-            "communicator (need --enable-torch-symm-mem and a supported "
-            "device/world-size; for MoE domains the moe group must also "
-            "construct one)."
-        )
-    key = comm.group.group_name
-    workspace = _rmsnorm_fused_ar_workspaces.get(key)
-    if workspace is not None:
-        return workspace
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "--enable-rmsnorm-fused-ar: the workspace for group "
-            f"'{key}' was not built before CUDA-graph capture. An eager "
-            "warmup forward must run first (do not skip server warmup)."
-        )
+def _get_workspace(group: GroupCoordinator) -> MegaSymmWorkspace:
+    """The shared symm workspace, with this flag's name in any error.
 
-    import mega_ops
-    import torch.distributed._symmetric_memory as torch_symm_mem
-
-    if not mega_ops.is_available():
-        raise RuntimeError(
-            "--enable-rmsnorm-fused-ar: mega_ops unavailable at runtime."
-        )
-    from sglang.srt.layers.communicator import RMSNORM_FUSED_AR_MAX_BATCH_SIZE
-    from sglang.srt.runtime_context import process_model_config
-
-    device = comm.device
-    # Create dedicated staging buffer
-    staging = torch_symm_mem.empty(
-        RMSNORM_FUSED_AR_MAX_BATCH_SIZE * process_model_config().hidden_size,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    hdl = torch_symm_mem.rendezvous(staging, key)
-    if hdl.multicast_ptr == 0:
-        raise RuntimeError(
-            "--enable-rmsnorm-fused-ar: multicast is not supported on this "
-            "topology (multicast_ptr == 0)."
-        )
-    flags = torch_symm_mem.empty(
-        mega_ops.flags_numel(comm.world_size), device=device, dtype=torch.uint32
-    )
-    flags.zero_()
-    hflags = torch_symm_mem.rendezvous(flags, key)
-    hflags.barrier()
-    state = torch.zeros(mega_ops.STATE_SIZE, device=device, dtype=torch.uint32)
-    workspace = _RmsnormFusedArWorkspace(
-        buffer=staging,
-        multicast_ptr=hdl.multicast_ptr,
-        flags_ptrs_dev=hflags.buffer_ptrs_dev,
-        state_ptr=state.data_ptr(),
-        rank=hdl.rank,
-        world_size=comm.world_size,
-        max_size=staging.numel() * staging.element_size(),
-        refs=(flags, state, hdl, hflags),
-    )
-    _rmsnorm_fused_ar_workspaces[key] = workspace
-    logger.info(
-        "rmsnorm-fused-ar workspace ready for group '%s' (world=%d)",
-        key,
-        comm.world_size,
-    )
-    return workspace
+    Allocation lives in mega_symm_workspace so that --enable-rmsnorm-fused-ar
+    and --enable-gemm-ar-rmsnorm-fused can share one data buffer while staying
+    independently switchable.
+    """
+    try:
+        return get_workspace(group=group)
+    except RuntimeError as exc:
+        raise RuntimeError(f"--enable-rmsnorm-fused-ar: {exc}") from exc
 
 
 def _is_eligible(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    workspace: _RmsnormFusedArWorkspace,
+    workspace: MegaSymmWorkspace,
 ) -> bool:
     payload = x.numel() * x.element_size()
     return (
@@ -192,12 +127,7 @@ def _is_eligible(
 
 
 def is_fused_ar_buffer_view(tensor: Optional[torch.Tensor]) -> bool:
-    if tensor is None or not _rmsnorm_fused_ar_workspaces:
-        return False
-    ptr = tensor.data_ptr()
-    return any(
-        w.buffer.data_ptr() == ptr for w in _rmsnorm_fused_ar_workspaces.values()
-    )
+    return is_workspace_buffer(tensor)
 
 
 def get_fused_ar_staging_view(
@@ -214,8 +144,8 @@ def get_fused_ar_staging_view(
         or is_rmsnorm_fused_ar_unavailable()
     ):
         return None
-    workspace = _rmsnorm_fused_ar_workspaces.get(
-        get_tp_group().torch_symm_mem_comm.group.group_name
+    workspace = peek_workspace(
+        group_name=get_tp_group().torch_symm_mem_comm.group.group_name
     )
     if workspace is None:
         return None
