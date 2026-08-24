@@ -196,19 +196,11 @@ def apply_rmsnorm_fused_ar(batch_size: int) -> bool:
     )
 
 
-# Largest M the GEMM-fused path is sized for. This is what the shared symm data
-# buffer is allocated from (mega_symm_workspace.workspace_data_numel), so
-# raising it costs max_m * hidden * 2 bytes.
+# Largest M the GEMM-fused path is sized for, align with chunked prefill size.
 GEMM_AR_RMSNORM_FUSED_MAX_M = 16384
 
 
 def apply_gemm_ar_rmsnorm_fused(batch_size: int) -> bool:
-    """Whether the GEMM-fused collective is usable for this batch.
-
-    Only the flag-level and world-level conditions live here; the (M, N, K)
-    alignment gates are in gemm_ar_rmsnorm_fused.is_gemm_ar_eligible, because
-    the caller that knows M also knows K.
-    """
     from sglang.srt.layers.gemm_ar_rmsnorm_fused import (
         gemm_ar_rmsnorm_fused_ready,
     )
@@ -216,15 +208,10 @@ def apply_gemm_ar_rmsnorm_fused(batch_size: int) -> bool:
     return (
         get_exec().comm.enable_gemm_ar_rmsnorm_fused
         and get_exec().comm.enable_torch_symm_mem
-        # SM90 only: the kernel is Hopper-specific (its host side asserts
-        # major == 9), unlike rmsnorm-fused-ar which also runs on sm100.
+        # SM90 only, since assert in kernel side
         and _is_sm90_supported
         and gemm_ar_rmsnorm_fused_ready()
         and not is_dp_attention_enabled()
-        # Under input_scattered, _gather_hidden_states_and_residual takes the
-        # scattered-residual branch (_tp_all_reduce_with_scattered_residual)
-        # instead of the plain AR + norm one the bypass assumes -- skipping
-        # prepare_attn/prepare_mlp here would silently drop that branch.
         and not get_attn_tp_context().input_scattered
         and batch_size > 0
         and batch_size <= GEMM_AR_RMSNORM_FUSED_MAX_M
@@ -543,15 +530,8 @@ class LayerCommunicator:
             self._assert_fused_bypass_is_safe()
 
     def _assert_fused_bypass_is_safe(self):
-        """Fail loudly if this layer's communicate-fns do more than AR + norm.
-
-        The GEMM-fused path skips prepare_attn / prepare_mlp entirely, which is
-        only sound when those stages have no other side effects. Both the fn
-        selection and qkv_latent_func are frozen at construction, so this is
-        checkable here -- and checking it here beats discovering a silently
-        dropped step at runtime.
-        """
         if self.qkv_latent_func is not None:
+            # TODO(zhangmj): need to support mla model in the future.
             raise RuntimeError(
                 "--enable-gemm-ar-rmsnorm-fused: this layer has a "
                 "qkv_latent_func, which prepare_attn would run after the "
@@ -896,7 +876,7 @@ class LayerCommunicator:
     ):
         if is_normed(hidden_states):
             # o_proj fused this layer's post_attention_layernorm into its GEMM.
-            # Same reasoning as prepare_attn's guard.
+            # Do nothing here.
             return hidden_states, residual
         if cache is not None:
             self._context.cache = cache
@@ -976,6 +956,7 @@ class LayerCommunicator:
             (
                 apply_rmsnorm_fused_ar(batch_size)
                 or apply_flashinfer_allreduce_fusion(batch_size)
+                or apply_gemm_ar_rmsnorm_fused(batch_size)
                 or (
                     _use_aiter
                     and batch_size > 0
@@ -984,10 +965,6 @@ class LayerCommunicator:
                     and get_moe_a2a_backend().is_none()
                     and get_exec().comm.enable_aiter_allreduce_fusion
                 )
-                # The GEMM-fused path also needs this handoff: it fuses the NEXT
-                # layer's input_layernorm into this layer's down_proj, so it must
-                # count as a reason to fuse the MLP-side all-reduce too.
-                or apply_gemm_ar_rmsnorm_fused(batch_size)
             )
             and (not self.is_last_layer)
             and (self._context.tp_size > 1)

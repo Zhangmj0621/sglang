@@ -1391,18 +1391,6 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class FusedNormSpec(msgspec.Struct):
-    """The norm a row-parallel linear may fuse its all-reduce into.
-
-    Passing this to RowParallelLinear.forward asks for the GEMM + ReduceScatter
-    + residual-add + RMSNorm + AllGather fused kernel. Everything about whether
-    the KERNEL can service the call (shape alignment, dtype, bias,
-    quantization) is a REQUEST, not a command: an unfusable case falls back to
-    the normal path, so a caller never has to pre-validate those. The one
-    thing a caller does have to avoid: `fused_norm` and `output_tensor` both
-    specify where the output goes, so passing both to the same `forward` call
-    raises `ValueError` rather than silently preferring one.
-    """
-
     norm_weight: torch.Tensor
     eps: float
     residual: torch.Tensor
@@ -1685,13 +1673,7 @@ class RowParallelLinear(LinearBase):
         fused_norm: FusedNormSpec,
         skip_all_reduce: bool,
     ):
-        """The fused GEMM+RS+norm+AG path, or None to fall back.
-
-        Every precondition that is a property of THIS LAYER lives here (bias,
-        quant method, input_is_parallel, tp_size); shape and dtype gates live in
-        the fused module. Returns (normed_full, None) -- the bias slot is None
-        because a fused layer must be bias-free, which is checked below.
-        """
+        """The fused GEMM+RS+norm+AG path, or None to fall back."""
         from sglang.srt.layers.gemm_ar_rmsnorm_fused import (
             gemm_ar_rmsnorm_fused_enabled,
             gemm_ar_rmsnorm_fused_ready,
@@ -1736,20 +1718,7 @@ class RowParallelLinear(LinearBase):
                 f"{self.use_decode_attn_tp}",
             )
             return None
-        # skip_all_reduce is a genuine per-call override: the CALLER is
-        # telling this forward it will handle the collective itself, so it
-        # correctly disqualifies fusion. should_skip_mlp_all_reduce() is
-        # deliberately NOT checked here, even though it looks like the same
-        # kind of "someone else owns this" signal: it reports the
-        # fuse_mlp_allreduce / mlp_reduce_scatter ForwardFlags the DECODER
-        # publishes as the precondition for REQUESTING this very fusion
-        # (qwen3.py only constructs fused_norm inside `with
-        # get_forward().scoped(fuse_mlp_allreduce=...)`, once that flag is
-        # already True) -- so it names this kernel, not a competing one, and
-        # rejecting on it would make the MLP-side fusion permanently
-        # unreachable. The real double-reduce guard is the marker-based skip
-        # in prepare_attn/prepare_mlp plus the decoder suppressing both the
-        # handoff flag and postprocess_layer once is_normed() is true.
+
         if skip_all_reduce:
             return None
         result = try_forward(

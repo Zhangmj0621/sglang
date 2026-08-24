@@ -400,37 +400,13 @@ class Qwen3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
-        # Filled in by Qwen3Model.__init__ once every layer exists, and only
-        # when the fusion flag is on (see there): the MLP-side fusion needs
-        # the NEXT layer's input_layernorm, since that is the norm that would
-        # otherwise run on this layer's down_proj output. Stays None on the
-        # last layer (and at a PP segment boundary), which is exactly where
-        # the MLP side must not fuse.
-        #
-        # Stored as a 1-tuple, NOT a bare Module: `nn.Module.__setattr__`
-        # intercepts any value that IS an nn.Module and registers it as a
-        # submodule. That would alias the next layer's `input_layernorm.weight`
-        # under this layer's `next_input_layernorm.weight` name too, and
-        # `named_parameters()` dedups by tensor identity, returning only the
-        # FIRST name it reaches in `_modules` insertion order -- this layer's
-        # alias, not the next layer's own `input_layernorm.weight`. The next
-        # layer's real parameter name would then be silently absent from
-        # `load_weights`'s `dict(named_parameters())`, so it would keep its
-        # random init forever while looking like a successful load. Wrapping
-        # in a tuple keeps it out of `_modules` entirely. Do not "simplify"
-        # this back into a plain Module attribute -- see the
-        # `next_input_layernorm` property below for the read side.
+        # 1-tuple on purpose: assigning an nn.Module directly would register it
+        # as a submodule and alias the next layer's input_layernorm.weight out
+        # of named_parameters(), silently skipping its weight load.
         self._next_input_layernorm = None
 
     @property
     def next_input_layernorm(self):
-        """Unwraps `_next_input_layernorm`'s 1-tuple, or None if unset.
-
-        Returns a plain RMSNorm module (or None), exactly what a normal
-        attribute would give a reader -- specifically `_maybe_fused_norm`'s
-        `norm_module is None` check below. See `_next_input_layernorm` in
-        `__init__` above for why the tuple wrapping exists.
-        """
         return self._next_input_layernorm[0] if self._next_input_layernorm else None
 
     def forward(

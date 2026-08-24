@@ -150,6 +150,7 @@ def get_fused_ar_staging_view(
     if workspace is None:
         return None
     n = num_tokens * hidden
+    # only support bf16 at the moment.
     if n * 2 > workspace.max_size:
         return None
     return workspace.buffer[:n].view(num_tokens, hidden)

@@ -41,13 +41,6 @@ class MegaSymmWorkspace(msgspec.Struct):
 
 
 def workspace_data_numel() -> int:
-    """Element count of the shared data buffer.
-
-    The max of what either feature can ask for, so one allocation serves both:
-    rmsnorm-fused-ar admits up to RMSNORM_FUSED_AR_MAX_BATCH_SIZE tokens, and
-    the GEMM-fused path is sized for GEMM_AR_RMSNORM_FUSED_MAX_M rows. Both are
-    token counts over the same hidden size.
-    """
     from sglang.srt.layers.communicator import (
         GEMM_AR_RMSNORM_FUSED_MAX_M,
         RMSNORM_FUSED_AR_MAX_BATCH_SIZE,
@@ -59,12 +52,6 @@ def workspace_data_numel() -> int:
 
 
 def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
-    """The group's workspace, created on first call.
-
-    Raises RuntimeError rather than returning None: every caller has already
-    decided it wants the fused path, so a missing prerequisite is a
-    configuration error worth reporting, not a silent fallback.
-    """
     comm = group.torch_symm_mem_comm
     if comm is None or comm.disabled:
         raise RuntimeError(
@@ -92,8 +79,8 @@ def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
     buffer = torch_symm_mem.empty(
         workspace_data_numel(), device=device, dtype=torch.bfloat16
     )
-    hdl = torch_symm_mem.rendezvous(buffer, key)
-    if hdl.multicast_ptr == 0:
+    handle = torch_symm_mem.rendezvous(buffer, key)
+    if handle.multicast_ptr == 0:
         raise RuntimeError(
             "mega fused-AR: multicast is not supported on this topology "
             "(multicast_ptr == 0)."
@@ -109,25 +96,25 @@ def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
     gemm_op = _build_gemm_op(
         group_name=key,
         buffer=buffer,
-        buffer_handle=hdl,
+        buffer_handle=handle,
         flags=flags,
         flags_handle=hflags,
         state=state,
-        rank=hdl.rank,
+        rank=handle.rank,
         world_size=comm.world_size,
         device=device,
     )
 
     workspace = MegaSymmWorkspace(
         buffer=buffer,
-        multicast_ptr=hdl.multicast_ptr,
+        multicast_ptr=handle.multicast_ptr,
         flags_ptrs_dev=hflags.buffer_ptrs_dev,
         state_ptr=state.data_ptr(),
-        rank=hdl.rank,
+        rank=handle.rank,
         world_size=comm.world_size,
         max_size=buffer.numel() * buffer.element_size(),
         gemm_op=gemm_op,
-        refs=(flags, state, hdl, hflags),
+        refs=(flags, state, handle, hflags),
     )
     _workspaces[key] = workspace
     logger.info(
@@ -153,15 +140,7 @@ def _build_gemm_op(
     world_size: int,
     device,
 ) -> Optional[Any]:
-    """The GemmRSNormAG instance, or None when that flag is off.
-
-    One instance serves BOTH o_proj and down_proj: their N is the same
-    (hidden_size) and K does not participate in instance sizing (the launcher
-    only checks K % kTileK), so the weight is a per-forward argument. The
-    instance's own buffers (tile_flags / sq_partial / counters) are sized from
-    (max_m, n) and stay private to it -- only the data buffer and the barrier
-    are shared with the standalone fused-AR path.
-    """
+    """The GemmRSNormAG instance, or None when that flag is off."""
     from sglang.srt.layers.communicator import GEMM_AR_RMSNORM_FUSED_MAX_M
     from sglang.srt.runtime_context import get_exec, process_model_config
 
@@ -208,14 +187,6 @@ def _build_gemm_op(
         )
         return None
 
-    # GemmRSNormAG asserts max_m % (tile_m * world_size) == 0. The admission cap
-    # is a round token count, not necessarily a multiple of that quantum --
-    # 16384 is not, at world_size 6 -- so floor it here rather than letting the
-    # assert kill the server at first forward. The quantum comes from the
-    # selected tile_m, not a literal, so it tracks whatever config was chosen.
-    # The shared buffer is sized independently by workspace_data_numel(), so
-    # flooring costs no memory; it only means the fused path admits slightly
-    # fewer tokens at such world sizes.
     quantum = tile_m * world_size
     usable_max_m = GEMM_AR_RMSNORM_FUSED_MAX_M // quantum * quantum
     if usable_max_m == 0:
@@ -230,12 +201,6 @@ def _build_gemm_op(
         )
         return None
 
-    # Reject a triple with no compiled kernel HERE, before construction, rather
-    # than letting GemmRSNormAG's own assert escape: an AssertionError out of
-    # this function propagates through get_workspace and try_forward (which only
-    # catches RuntimeError) all the way into the model forward, killing the
-    # request. A configuration mismatch must degrade to the ordinary all-reduce
-    # path, not to a crash.
     if (tile_m, tile_n, cluster_m) not in mega_ops.SUPPORTED_CONFIGS:
         logger.warning(
             "gemm-ar-rmsnorm-fused disabled: mega_ops.select_config chose "
@@ -252,11 +217,8 @@ def _build_gemm_op(
         return None
 
     # The kernel takes eps as an instance field, so every layer routed through
-    # this instance must share one value. For Qwen3 dense every RMSNorm is built
-    # with config.rms_norm_eps (qwen3.py:354, :378), so they do. try_forward
-    # re-checks per call and falls back on mismatch -- so getting this wrong is
-    # a silent permanent fallback, not a wrong result. Log it to make that
-    # visible.
+    # this instance must share one value.
+    # TODO(zhangmj): need to check if eps is the same for all layers.
     eps = model_config.hf_config.rms_norm_eps
     logger.info(
         "gemm-ar-rmsnorm-fused instance: tile=(%d, %d) cluster_m=%d max_m=%d "
@@ -270,11 +232,6 @@ def _build_gemm_op(
         hidden,
         eps,
     )
-    # Construction still validates things this function cannot pre-check (world
-    # size, dtype support, the injected buffers' capacity floors, the multicast
-    # handle). Any of those failing means the fused path is unusable, which is a
-    # fallback condition -- so convert it to one here rather than letting an
-    # AssertionError or ValueError reach the model forward.
     try:
         return mega_ops.GemmRSNormAG(
             group_name,
@@ -311,30 +268,10 @@ def _build_gemm_op(
 
 
 def peek_workspace(*, group_name: str) -> Optional[MegaSymmWorkspace]:
-    """The cached workspace, or None. Never creates -- for callers on a path
-    that must not allocate (CUDA-graph capture readiness checks, buffer-view
-    identity tests)."""
     return _workspaces.get(group_name)
 
 
 def is_workspace_buffer(tensor: Optional[torch.Tensor]) -> bool:
-    """True when ``tensor`` is pointer-identical to a workspace's data buffer
-    at offset 0. This is an exact identity check, NOT a containment test: a
-    view into the same storage at a nonzero offset has a different
-    ``data_ptr()`` and answers False here even though the memory is shared.
-
-    It is sufficient today because every producer views the buffer from index
-    0 (``workspace.buffer[:n]`` or the buffer itself), which leaves
-    ``data_ptr()`` unchanged. A future sub-view starting at a nonzero offset
-    would stop being covered by this guard -- silently, not by raising -- so
-    treat this as offset-0-only unless it is extended into a real range check
-    against the buffer's extent.
-
-    Callers use this to decide whether a hidden-states tensor IS a workspace's
-    data buffer, and must therefore be cloned to survive across calls: the
-    NEXT fused call will overwrite that buffer in place (split-prefill keeps
-    hidden states on the ForwardBatch).
-    """
     if tensor is None or not _workspaces:
         return False
     ptr = tensor.data_ptr()
