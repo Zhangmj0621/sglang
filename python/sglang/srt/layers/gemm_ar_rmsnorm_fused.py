@@ -80,7 +80,7 @@ def is_gemm_ar_eligible(*, m: int, n: int, k: int, world_size: int) -> bool:
             f"m={m} > GEMM_AR_RMSNORM_FUSED_MAX_M={GEMM_AR_RMSNORM_FUSED_MAX_M}",
         )
         return False
-    op = _peek_op()
+    op = _peek_op(create_if_missing=True)
     if op is None:
         return False
 
@@ -114,13 +114,21 @@ def is_gemm_ar_eligible(*, m: int, n: int, k: int, world_size: int) -> bool:
     return True
 
 
-def _peek_op():
-    """The cached GemmRSNormAG, or None when no workspace exists yet."""
+def _peek_op(*, create_if_missing: bool = False):
+    """The GemmRSNormAG for this TP group, or None."""
     comm = get_tp_group().torch_symm_mem_comm
     if comm is None or comm.disabled:
         return None
     workspace = peek_workspace(group_name=comm.group.group_name)
-    return workspace.gemm_op if workspace is not None else None
+    if workspace is None:
+        if not create_if_missing:
+            return None
+        try:
+            workspace = get_workspace(group=get_tp_group())
+        except RuntimeError as exc:
+            logger.debug("gemm-ar-rmsnorm-fused workspace unavailable: %s", exc)
+            return None
+    return workspace.gemm_op
 
 
 def mark_normed(tensor: torch.Tensor) -> None:
