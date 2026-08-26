@@ -8,7 +8,12 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.mega_symm_workspace import get_workspace, peek_workspace
+from sglang.srt.layers.mega_symm_workspace import (
+    get_workspace,
+    get_workspace_group_name,
+    is_mega_symm_mem_available,
+    peek_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +52,7 @@ def _is_unavailable() -> bool:
             usable = mega_ops.is_available()
         except ImportError:
             usable = False
-        if usable:
-            comm = get_tp_group().torch_symm_mem_comm
-            usable = comm is not None and not comm.disabled
+        usable = usable and is_mega_symm_mem_available()
         _unavailable = not usable
     return _unavailable
 
@@ -116,15 +119,13 @@ def is_gemm_ar_eligible(*, m: int, n: int, k: int, world_size: int) -> bool:
 
 def _peek_op(*, create_if_missing: bool = False):
     """The GemmRSNormAG for this TP group, or None."""
-    comm = get_tp_group().torch_symm_mem_comm
-    if comm is None or comm.disabled:
-        return None
-    workspace = peek_workspace(group_name=comm.group.group_name)
+    group = get_tp_group()
+    workspace = peek_workspace(group_name=get_workspace_group_name(group))
     if workspace is None:
         if not create_if_missing:
             return None
         try:
-            workspace = get_workspace(group=get_tp_group())
+            workspace = get_workspace(group=group)
         except RuntimeError as exc:
             logger.debug("gemm-ar-rmsnorm-fused workspace unavailable: %s", exc)
             return None

@@ -187,7 +187,6 @@ RMSNORM_FUSED_AR_MAX_BATCH_SIZE = 16384
 def apply_rmsnorm_fused_ar(batch_size: int) -> bool:
     return (
         get_exec().comm.enable_rmsnorm_fused_ar
-        and get_exec().comm.enable_torch_symm_mem
         and (_is_sm90_supported or _is_sm100_supported)
         and rmsnorm_fused_ar_ready()
         and not is_dp_attention_enabled()
@@ -207,7 +206,6 @@ def apply_gemm_ar_rmsnorm_fused(batch_size: int) -> bool:
 
     return (
         get_exec().comm.enable_gemm_ar_rmsnorm_fused
-        and get_exec().comm.enable_torch_symm_mem
         # SM90 only, since assert in kernel side
         and _is_sm90_supported
         and gemm_ar_rmsnorm_fused_ready()

@@ -2004,9 +2004,9 @@ class ServerArgs:
             help=(
                 "Fuse TP all-reduce + residual-add + RMSNorm into a single multimem "
                 "kernel (reduce-scatter + all-gather via NVLink Switch multicast). "
-                "Requires SM90+, NVSwitch multicast, --enable-torch-symm-mem, TP "
-                "world size in {2,4,6,8}, and bf16 models. Unsupported configurations "
-                "fall back to the regular all-reduce path.",
+                "Requires SM90+, NVSwitch multicast, TP world size in {2,4,6,8}, "
+                "and bf16 models. Unsupported configurations fall back to the "
+                "regular all-reduce path.",
             ),
         ),
         NS("exec.comm"),
@@ -2021,8 +2021,8 @@ class ServerArgs:
                 "--enable-rmsnorm-fused-ar, but the kernel's tiling requires "
                 "the token count to be a multiple of 128 * TP, so it is a "
                 "prefill-only path; anything unaligned falls back. Requires "
-                "SM90, NVSwitch multicast, --enable-torch-symm-mem, TP world "
-                "size in {2,4,6,8}, and a bf16 Qwen3 dense model.",
+                "SM90, NVSwitch multicast, TP world size in {2,4,6,8}, and a "
+                "bf16 Qwen3 dense model.",
             ),
         ),
         NS("exec.comm"),
@@ -4357,8 +4357,6 @@ class ServerArgs:
             reasons.append(f"model architecture {model_arch!r} is unsupported")
         if self.enable_deterministic_inference:
             reasons.append("deterministic inference disables symmetric memory")
-        if not self.enable_torch_symm_mem:
-            reasons.append("--enable-torch-symm-mem is disabled")
         if self.tp_size not in (2, 4, 6, 8):
             reasons.append(f"TP world size {self.tp_size} is unsupported")
         if self.ep_size > 1:
@@ -4424,8 +4422,6 @@ class ServerArgs:
             )
         if self.enable_deterministic_inference:
             reasons.append("deterministic inference disables symmetric memory")
-        if not self.enable_torch_symm_mem:
-            reasons.append("--enable-torch-symm-mem is disabled")
         if self.tp_size not in (2, 4, 6, 8):
             reasons.append(f"TP world size {self.tp_size} is unsupported")
         if self.ep_size > 1:

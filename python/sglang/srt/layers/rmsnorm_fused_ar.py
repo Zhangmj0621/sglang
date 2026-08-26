@@ -12,6 +12,8 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.mega_symm_workspace import (
     MegaSymmWorkspace,
     get_workspace,
+    get_workspace_group_name,
+    is_mega_symm_mem_available,
     is_workspace_buffer,
     peek_workspace,
 )
@@ -36,9 +38,7 @@ def is_rmsnorm_fused_ar_unavailable() -> bool:
             usable = mega_ops.is_available()
         except ImportError:
             usable = False
-        if usable:
-            comm = get_tp_group().torch_symm_mem_comm
-            usable = comm is not None and not comm.disabled
+        usable = usable and is_mega_symm_mem_available()
         _rmsnorm_fused_ar_unavailable = not usable
     return _rmsnorm_fused_ar_unavailable
 
@@ -79,7 +79,7 @@ def rmsnorm_fused_ar_ready() -> bool:
     if is_rmsnorm_fused_ar_unavailable():
         return False
     if torch.cuda.is_current_stream_capturing():
-        key = get_tp_group().torch_symm_mem_comm.group.group_name
+        key = get_workspace_group_name(get_tp_group())
         return peek_workspace(group_name=key) is not None
     return True
 
@@ -144,9 +144,7 @@ def get_fused_ar_staging_view(
         or is_rmsnorm_fused_ar_unavailable()
     ):
         return None
-    workspace = peek_workspace(
-        group_name=get_tp_group().torch_symm_mem_comm.group.group_name
-    )
+    workspace = peek_workspace(group_name=get_workspace_group_name(get_tp_group()))
     if workspace is None:
         return None
     n = num_tokens * hidden

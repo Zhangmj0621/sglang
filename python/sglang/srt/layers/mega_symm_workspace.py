@@ -7,6 +7,10 @@ epilogue) both need a multicast-bound symmetric buffer and one set of
 can be enabled alone -- so neither feature module can own the allocation: this
 module does, and creates it on whichever feature asks first.
 
+This workspace is independent of SGLang's generic ``TorchSymmMemCommunicator``:
+enabling either fused feature must not change the backend used by ordinary
+all-reduce calls.
+
 The barrier layout is identical for both kernels (``comm_barrier.cuh``:
 ``kLeaderStateWords=8``, ``kMaxBarrierBlocks=256``), so one set is shared.
 """
@@ -40,6 +44,20 @@ class MegaSymmWorkspace(msgspec.Struct):
     refs: tuple  # owns flags/state/handles so they outlive this struct
 
 
+def is_mega_symm_mem_available() -> bool:
+    """Whether Mega can allocate its private PyTorch symmetric-memory buffers."""
+    try:
+        import torch.distributed._symmetric_memory  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def get_workspace_group_name(group: GroupCoordinator) -> str:
+    """Return the rendezvous key for Mega's private TP workspace."""
+    return group.cpu_group.group_name
+
+
 def workspace_data_numel() -> int:
     from sglang.srt.layers.communicator import (
         GEMM_AR_RMSNORM_FUSED_MAX_M,
@@ -52,13 +70,14 @@ def workspace_data_numel() -> int:
 
 
 def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
-    comm = group.torch_symm_mem_comm
-    if comm is None or comm.disabled:
+    if not is_mega_symm_mem_available():
         raise RuntimeError(
-            "mega fused-AR: group has no usable torch symm-mem communicator "
-            "(need --enable-torch-symm-mem and a supported device/world-size)."
+            "mega fused-AR: torch.distributed._symmetric_memory is unavailable."
         )
-    key = comm.group.group_name
+    if group.world_size <= 1:
+        raise RuntimeError("mega fused-AR: TP world size must be greater than one.")
+
+    key = get_workspace_group_name(group)
     workspace = _workspaces.get(key)
     if workspace is not None:
         return workspace
@@ -75,7 +94,8 @@ def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
     if not mega_ops.is_available():
         raise RuntimeError("mega fused-AR: mega_ops unavailable at runtime.")
 
-    device = comm.device
+    device = group.device
+    world_size = group.world_size
     buffer = torch_symm_mem.empty(
         workspace_data_numel(), device=device, dtype=torch.bfloat16
     )
@@ -86,7 +106,7 @@ def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
             "(multicast_ptr == 0)."
         )
     flags = torch_symm_mem.empty(
-        mega_ops.flags_numel(comm.world_size), device=device, dtype=torch.uint32
+        mega_ops.flags_numel(world_size), device=device, dtype=torch.uint32
     )
     flags.zero_()
     hflags = torch_symm_mem.rendezvous(flags, key)
@@ -101,7 +121,7 @@ def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
         flags_handle=hflags,
         state=state,
         rank=handle.rank,
-        world_size=comm.world_size,
+        world_size=world_size,
         device=device,
     )
 
@@ -111,7 +131,7 @@ def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
         flags_ptrs_dev=hflags.buffer_ptrs_dev,
         state_ptr=state.data_ptr(),
         rank=handle.rank,
-        world_size=comm.world_size,
+        world_size=world_size,
         max_size=buffer.numel() * buffer.element_size(),
         gemm_op=gemm_op,
         refs=(flags, state, handle, hflags),
@@ -121,7 +141,7 @@ def get_workspace(*, group: GroupCoordinator) -> MegaSymmWorkspace:
         "mega fused-AR workspace ready for group '%s' (world=%d, %.1f MiB, "
         "gemm_op=%s)",
         key,
-        comm.world_size,
+        world_size,
         workspace.max_size / (1 << 20),
         gemm_op is not None,
     )
