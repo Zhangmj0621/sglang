@@ -72,7 +72,20 @@ def gemm_ar_rmsnorm_fused_ready() -> bool:
     return True
 
 
+_ELIGIBLE_CACHE = {}
+
+
 def is_gemm_ar_eligible(*, m: int, n: int, k: int, world_size: int) -> bool:
+    key = (m, n, k, world_size)
+    cached = _ELIGIBLE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    verdict = _is_gemm_ar_eligible_uncached(m=m, n=n, k=k, world_size=world_size)
+    _ELIGIBLE_CACHE[key] = verdict
+    return verdict
+
+
+def _is_gemm_ar_eligible_uncached(*, m: int, n: int, k: int, world_size: int) -> bool:
     from sglang.srt.layers.communicator import GEMM_AR_RMSNORM_FUSED_MAX_M
 
     if m <= 0:
@@ -194,10 +207,12 @@ def try_forward(
         return None
 
     start, end = _token_shard(m, workspace.rank, workspace.world_size)
-    call_tile_m, _call_tile_n, _call_cluster_m = op.config_for(m)
-    kernel_start = (
-        workspace.rank * (m // (call_tile_m * workspace.world_size)) * call_tile_m
-    )
+    # The kernel reduces even shards of m // world_size rows per rank (its host
+    # gate rejects m % world_size != 0, via config_for above), while
+    # _token_shard spreads a remainder over the leading ranks. The two agree
+    # exactly when m divides evenly -- assert that, so a gate regression shows
+    # up here instead of as a wrong-rows reduce.
+    kernel_start = workspace.rank * (m // workspace.world_size)
     assert (start, end) == (kernel_start, kernel_start + m // workspace.world_size), (
         f"shard window ({start}, {end}) disagrees with the kernel's "
         f"({kernel_start}, {kernel_start + m // workspace.world_size}) for "
