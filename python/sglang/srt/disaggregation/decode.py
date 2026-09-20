@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -83,6 +84,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -380,6 +382,127 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _has_independent_swa_pool(self) -> bool:
+        allocator = self.token_to_kv_pool_allocator
+        return hasattr(allocator, "full_available_size") and hasattr(
+            allocator, "swa_available_size"
+        )
+
+    def _session_priority_enabled(self) -> bool:
+        return (
+            getattr(
+                getattr(self, "tree_cache", None),
+                "enable_session_radix_cache",
+                False,
+            )
+            is True
+        )
+
+    def _session_allow_high(self, req: Req) -> bool:
+        return self._session_priority_enabled() and self.tree_cache.is_high_priority(
+            req.priority
+        )
+
+    def _session_request_scope(self, req: Req):
+        if not self._session_priority_enabled():
+            return nullcontext()
+        return self.tree_cache.scoped_evict(
+            allow_low=True, allow_high=self._session_allow_high(req)
+        )
+
+    def _session_evictable_size(
+        self,
+        component_type: ComponentType,
+        req: Optional[Req],
+        fallback,
+    ) -> int:
+        if self._session_priority_enabled() and req is not None:
+            return self.tree_cache.session_evictable_size(
+                component_type, allow_high=self._session_allow_high(req)
+            )
+        return fallback()
+
+    def _session_mamba_slots_needed(self, req: Req) -> int:
+        if not self._session_priority_enabled() or not self.tree_cache.supports_mamba():
+            return 0
+
+        pool = self.req_to_token_pool
+        needed = int(req.mamba_pool_idx is None)
+        if pool.enable_mamba_extra_buffer and req.mamba_ping_pong_track_buffer is None:
+            needed += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        return needed
+
+    def _session_mamba_slots_available(self, req: Req) -> int:
+        if not self._session_priority_enabled() or not self.tree_cache.supports_mamba():
+            return 0
+        return (
+            self.req_to_token_pool.mamba_allocator.schedulable_available_size()
+            + self.tree_cache.session_evictable_size(
+                ComponentType.MAMBA,
+                allow_high=self._session_allow_high(req),
+            )
+        )
+
+    def _mamba_gap_budget_for_req(self, req: Req) -> int:
+        cost = getattr(
+            self.token_to_kv_pool_allocator, "mamba_slot_full_token_cost", None
+        )
+        if cost is None or not self._session_priority_enabled():
+            return 0
+        return cost() * self._session_mamba_slots_needed(req)
+
+    def _ensure_session_mamba_capacity(self, req: Req) -> bool:
+        needed = self._session_mamba_slots_needed(req)
+        if needed == 0:
+            return True
+
+        allocator = self.req_to_token_pool.mamba_allocator
+        shortfall = needed - allocator.schedulable_available_size()
+        if shortfall > 0:
+            self.tree_cache.evict_for_session(
+                EvictParams(mamba_num=shortfall),
+                allow_low=True,
+                allow_high=self._session_allow_high(req),
+            )
+        return allocator.schedulable_available_size() >= needed
+
+    def _ensure_session_kv_capacity(
+        self,
+        req: Req,
+        *,
+        full_required: int,
+        swa_required: int = 0,
+    ) -> None:
+        if (
+            not self._session_priority_enabled()
+            or not self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+        ):
+            return
+
+        allocator = self.token_to_kv_pool_allocator
+        if self._has_independent_swa_pool():
+            full_available = allocator.full_available_size()
+            swa_available = allocator.swa_available_size()
+        else:
+            full_available = allocator.available_size()
+            swa_available = swa_required
+
+        full_shortfall = max(0, full_required - full_available)
+        swa_shortfall = max(0, swa_required - swa_available)
+        if full_shortfall or swa_shortfall:
+            self.tree_cache.evict_for_session(
+                EvictParams(
+                    num_tokens=full_shortfall,
+                    swa_num_tokens=swa_shortfall,
+                ),
+                allow_low=True,
+                allow_high=self._session_allow_high(req),
+            )
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -554,15 +677,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
-        result = match_prefix_for_req(
-            self.tree_cache,
-            req,
-            req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
-            include_req=True,
-        )
-        # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(result.last_device_node)
+        with self._session_request_scope(req):
+            result = match_prefix_for_req(
+                self.tree_cache,
+                req,
+                req.origin_input_ids,
+                cow_mamba=self.tree_cache.supports_mamba(),
+                include_req=True,
+            )
+            # Always lock to match aggregated scheduling behavior
+            self.tree_cache.inc_lock_ref(result.last_device_node)
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -656,6 +780,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {self.max_total_num_tokens}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            if (
+                getattr(
+                    getattr(self.scheduler, "tree_cache", None),
+                    "enable_session_radix_cache",
+                    False,
+                )
+                is True
+            ):
+                self.scheduler._end_session_request(req)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         if self._uses_swa_tail_prealloc():
@@ -668,6 +801,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 logger.error(message)
                 prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                if (
+                    getattr(
+                        getattr(self.scheduler, "tree_cache", None),
+                        "enable_session_radix_cache",
+                        False,
+                    )
+                    is True
+                ):
+                    self.scheduler._end_session_request(req)
                 self.scheduler.output_streamer.stream_output([req], req.return_logprob)
                 return True
         return False
@@ -696,7 +838,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         resumed_reqs = []
         indices_to_remove = set()
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
-        if uses_swa_tail_prealloc:
+        session_priority_enabled = self._session_priority_enabled()
+        if session_priority_enabled and self.scheduler.enable_priority_scheduling:
+            priority_sign = (
+                1 if self.scheduler.schedule_low_priority_values_first else -1
+            )
+            self.retracted_queue.sort(key=lambda req: req.priority * priority_sign)
+        uses_swa_budget = uses_swa_tail_prealloc or (
+            session_priority_enabled and self._has_independent_swa_pool()
+        )
+        if session_priority_enabled:
+            full_allocatable_tokens = 0
+            swa_allocatable_tokens = 0
+        elif uses_swa_budget:
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(count_retracted=False)
             )
@@ -712,19 +866,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            full_required, swa_required = self._prealloc_required_tokens(req)
-            if full_required > full_allocatable_tokens:
+            if session_priority_enabled:
+                if uses_swa_budget:
+                    full_allocatable_tokens, swa_allocatable_tokens = (
+                        self._swa_aware_allocatable_token_budgets(
+                            count_retracted=False,
+                            req=req,
+                        )
+                    )
+                else:
+                    full_allocatable_tokens = self._allocatable_token_budgets(
+                        count_retracted=False,
+                        req=req,
+                    )
+
+            mamba_slots_needed = self._session_mamba_slots_needed(req)
+            if (
+                mamba_slots_needed
+                and mamba_slots_needed > self._session_mamba_slots_available(req)
+            ):
                 break
-            if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
+
+            full_required, swa_required = self._prealloc_required_tokens(req)
+            full_required_with_mamba = full_required + self._mamba_gap_budget_for_req(
+                req
+            )
+            if full_required_with_mamba > full_allocatable_tokens:
+                break
+            if uses_swa_budget and swa_required > swa_allocatable_tokens:
                 break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
-            full_allocatable_tokens -= full_required
-            if uses_swa_tail_prealloc:
-                swa_allocatable_tokens -= swa_required
+            if not session_priority_enabled:
+                full_allocatable_tokens -= full_required
+                if uses_swa_budget:
+                    swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
@@ -921,25 +1100,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        session_priority_enabled = self._session_priority_enabled()
+        uses_swa_budget = uses_swa_tail_prealloc or (
+            session_priority_enabled and self._has_independent_swa_pool()
+        )
         swa_allocatable_tokens = 0
-        if uses_swa_tail_prealloc:
+        if uses_swa_budget:
             retractable_swa_tokens = sum(
                 self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
             )
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(
-                    retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=retractable_swa_tokens,
-                    count_retracted=True,
+            if session_priority_enabled:
+                full_allocatable_tokens = 0
+            else:
+                full_allocatable_tokens, swa_allocatable_tokens = (
+                    self._swa_aware_allocatable_token_budgets(
+                        retractable_tokens=retractable_tokens,
+                        retractable_swa_tokens=retractable_swa_tokens,
+                        count_retracted=True,
+                    )
                 )
-            )
         else:
             retractable_swa_tokens = 0
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                retractable_tokens=retractable_tokens, count_retracted=True
-            )
+            if session_priority_enabled:
+                full_allocatable_tokens = 0
+            else:
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens, count_retracted=True
+                )
         reserved_restore_tokens = self._hicache_pending_restore_tokens()
-        full_allocatable_tokens -= reserved_restore_tokens
+        if not session_priority_enabled:
+            full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         if self.scheduler.enable_priority_scheduling:
@@ -953,6 +1143,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                if (
+                    getattr(
+                        getattr(self.scheduler, "tree_cache", None),
+                        "enable_session_radix_cache",
+                        False,
+                    )
+                    is True
+                ):
+                    self.scheduler._end_session_request(decode_req.req)
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -1030,47 +1229,86 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
-                # Matching may lock previously-evictable radix pages, so refresh
-                # the admission budget against the post-lock pool state before we
-                # decide whether this request still fits.
-                full_allocatable_tokens = self._allocatable_token_budgets(
-                    retractable_tokens=retractable_tokens,
-                    count_retracted=True,
-                    extra_reserved_reqs=len(preallocated_reqs),
-                    hicache_reserved_tokens=reserved_restore_tokens,
-                )
             else:
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
                 required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
 
+            # Prefix matching can lock previously evictable component pages.
+            # In session mode the post-lock budget is request-scoped: LP requests
+            # see only unused/LP cache, while HP requests may reclaim HP cache too.
+            if session_priority_enabled:
+                if uses_swa_budget:
+                    full_allocatable_tokens, swa_allocatable_tokens = (
+                        self._swa_aware_allocatable_token_budgets(
+                            retractable_tokens=retractable_tokens,
+                            retractable_swa_tokens=retractable_swa_tokens,
+                            count_retracted=True,
+                            extra_reserved_reqs=len(preallocated_reqs),
+                            hicache_reserved_tokens=reserved_restore_tokens,
+                            req=decode_req.req,
+                        )
+                    )
+                else:
+                    full_allocatable_tokens = self._allocatable_token_budgets(
+                        retractable_tokens=retractable_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
+                        hicache_reserved_tokens=reserved_restore_tokens,
+                        req=decode_req.req,
+                    )
+            elif use_decode_radix_cache:
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs),
+                    hicache_reserved_tokens=reserved_restore_tokens,
+                )
+
+            mamba_slots_needed = self._session_mamba_slots_needed(decode_req.req)
+            if (
+                mamba_slots_needed
+                and mamba_slots_needed
+                > self._session_mamba_slots_available(decode_req.req)
+            ):
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                break
+
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
+            mamba_gap_reserve = self._mamba_gap_budget_for_req(decode_req.req)
 
             if (
-                max(
+                mamba_gap_reserve
+                + max(
                     required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+                    (
+                        origin_input_len
+                        - prefix_len
+                        + min(
+                            decode_req.req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKEN,
+                        )
+                        - retractable_tokens
+                    ),
                 )
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
-            if required_tokens_for_request > full_allocatable_tokens:
+            if (
+                required_tokens_for_request + mamba_gap_reserve
+                > full_allocatable_tokens
+            ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
 
-            if uses_swa_tail_prealloc:
+            if uses_swa_budget:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
                 max_new_tokens = min(
@@ -1113,16 +1351,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
                 reserved_restore_tokens += prefix_match.restore_token_count
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                retractable_tokens=retractable_tokens,
-                count_retracted=True,
-                extra_reserved_reqs=len(preallocated_reqs) + 1,
-                hicache_reserved_tokens=reserved_restore_tokens,
-            )
-            if uses_swa_tail_prealloc:
-                # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
-                swa_allocatable_tokens -= swa_required
+            if not session_priority_enabled:
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs) + 1,
+                    hicache_reserved_tokens=reserved_restore_tokens,
+                )
+                if uses_swa_budget:
+                    # Baseline SWA budgeting has no cache-eviction credit, so a
+                    # simple decrement preserves its existing queue semantics.
+                    swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
@@ -1350,14 +1589,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         retractable_tokens: Optional[int] = None,
         retractable_swa_tokens: Optional[int] = None,
         count_retracted: bool = True,
+        extra_reserved_reqs: int = 0,
+        hicache_reserved_tokens: int = 0,
+        req: Optional[Req] = None,
     ) -> Tuple[int, int]:
-        n_active = self._active_req_count()
+        n_active = self._active_req_count(extra_reserved_reqs)
         reserved_tokens = self._active_reserved_tokens(n_active)
 
         full_allocatable_tokens = self._allocatable_token_budgets(
             retractable_tokens=retractable_tokens,
             count_retracted=count_retracted,
             reserved_tokens=reserved_tokens,
+            hicache_reserved_tokens=hicache_reserved_tokens,
+            req=req,
         )
 
         return full_allocatable_tokens, self._swa_tail_allocatable_token_budget(
@@ -1366,6 +1610,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             count_retracted=count_retracted,
             n_active=n_active,
             reserved_tokens=reserved_tokens,
+            req=req,
         )
 
     def _allocatable_token_budgets(
@@ -1375,6 +1620,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         extra_reserved_reqs: int = 0,
         reserved_tokens: Optional[int] = None,
         hicache_reserved_tokens: int = 0,
+        req: Optional[Req] = None,
     ) -> int:
         need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
         if reserved_tokens is None:
@@ -1392,16 +1638,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
                 available_size = logical_allocator.available_size()
-        elif self._uses_swa_tail_prealloc():
+        elif self._uses_swa_tail_prealloc() or (
+            self._session_priority_enabled()
+            and req is not None
+            and self._has_independent_swa_pool()
+        ):
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
-                available_size += self.tree_cache.evictable_size()
+                available_size += self._session_evictable_size(
+                    ComponentType.FULL,
+                    req,
+                    self.tree_cache.evictable_size,
+                )
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
-                available_size += self.tree_cache.evictable_size()
+                available_size += self._session_evictable_size(
+                    ComponentType.FULL,
+                    req,
+                    self.tree_cache.evictable_size,
+                )
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
         )
@@ -1431,6 +1689,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         count_retracted: bool = True,
         n_active: Optional[int] = None,
         reserved_tokens: Optional[int] = None,
+        req: Optional[Req] = None,
     ) -> int:
         need_swa_space_for_single_req = self._need_space_for_single_req(
             retractable_tokens
@@ -1462,9 +1721,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         swa_used = swa_total - self.token_to_kv_pool_allocator.swa_available_size()
         swa_growth_potential = max(0, n_active * window_size - swa_used)
         swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
-        swa_allocatable_tokens = (
-            self.token_to_kv_pool_allocator.swa_available_size()
-            - max(swa_reserved_tokens, need_swa_space_for_single_req)
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        if (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and self._session_priority_enabled()
+            and req is not None
+        ):
+            swa_available_size += self.tree_cache.session_evictable_size(
+                ComponentType.SWA,
+                allow_high=self._session_allow_high(req),
+            )
+        swa_allocatable_tokens = swa_available_size - max(
+            swa_reserved_tokens, need_swa_space_for_single_req
         )
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
@@ -1506,6 +1774,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
     ) -> torch.Tensor:
+        with self._session_request_scope(req):
+            return self._pre_alloc_impl(
+                req,
+                prefix_indices=prefix_indices,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+            )
+
+    def _pre_alloc_impl(
+        self,
+        req: Req,
+        prefix_indices: Optional[torch.Tensor] = None,
+        prefix_len: Optional[int] = None,
+        total_prefix_len: Optional[int] = None,
+    ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
         ``prefix_len`` is the L1 device-resident prefix length (already
@@ -1518,6 +1801,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefix_len = 0
         if total_prefix_len is None:
             total_prefix_len = prefix_len
+
+        if not self._ensure_session_mamba_capacity(req):
+            raise RuntimeError(
+                "Mamba cache is full after request-scoped eviction. "
+                f"needed={self._session_mamba_slots_needed(req)}, req={req.rid}"
+            )
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
@@ -1541,8 +1830,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             fill_len=fill_len, prefix_len=prefix_len
         )
 
-        # Evict cached entries if the pool doesn't have enough free pages.
-        if (
+        # Session cache components are independent eviction domains. Recover
+        # each physical pool with the current request's tier before allocating.
+        if self._session_priority_enabled():
+            swa_required_tokens = 0
+            if self._has_independent_swa_pool():
+                if self._uses_swa_tail_prealloc() and prefix_len == 0:
+                    swa_required_tokens = self._required_alloc_tokens(
+                        fill_len=self._swa_tail_len(fill_len),
+                        prefix_len=0,
+                    )
+                else:
+                    swa_required_tokens = required_alloc_tokens
+            self._ensure_session_kv_capacity(
+                req,
+                full_required=required_alloc_tokens,
+                swa_required=swa_required_tokens,
+            )
+        # Preserve the baseline decode-radix eviction behavior outside session
+        # priority mode.
+        elif (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
             and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
         ):
@@ -2036,6 +2343,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                if (
+                    getattr(
+                        getattr(self.scheduler, "tree_cache", None),
+                        "enable_session_radix_cache",
+                        False,
+                    )
+                    is True
+                ):
+                    self.scheduler._end_session_request(decode_req.req)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 indices_to_remove.add(i)
@@ -2062,6 +2378,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         )
                     self._clean_hicache_prefetch_resources(decode_req)
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    if (
+                        getattr(
+                            getattr(self.scheduler, "tree_cache", None),
+                            "enable_session_radix_cache",
+                            False,
+                        )
+                        is True
+                    ):
+                        self.scheduler._end_session_request(decode_req.req)
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:

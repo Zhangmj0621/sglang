@@ -61,7 +61,7 @@ class FullComponent(TreeComponent):
         while node is not None and node is not self.tree_core.root_node:
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
-            cd.session_ref -= 1
+            self._change_session_ref(node, session_id, -1)
             node = node.parent
 
     def _advance_session_coverage(
@@ -77,7 +77,7 @@ class FullComponent(TreeComponent):
             and node is not stop
             and node is not self.tree_core.root_node
         ):
-            node.component_data[self.component_type].session_ref += 1
+            self._change_session_ref(node, session_id, 1)
             node = node.parent
 
     def _recede_session_coverage(
@@ -95,8 +95,37 @@ class FullComponent(TreeComponent):
         ):
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
-            cd.session_ref -= 1
+            self._change_session_ref(node, session_id, -1)
             node = node.parent
+
+    def _session_coverage_nodes(self, session_id, leaf):
+        node = leaf
+        while node is not None and node is not self.tree_core.root_node:
+            yield node
+            node = node.parent
+
+    def _session_ref_changed(self, node, old_tier):
+        super()._session_ref_changed(node, old_tier)
+        # Re-key only affected leaves during an in-flight pressure event.
+        if (
+            self.is_evict_device_ongoing
+            and node in self.tree_core.evictable_device_leaves
+        ):
+            self._rekey_session_leaf(
+                self._evict_device_heap, self.tree_core.evictable_device_leaves, node
+            )
+        heap = getattr(self, "_session_host_heap", None)
+        if heap is not None and node in self.tree_core.evictable_host_leaves:
+            self._rekey_session_leaf(heap, self.tree_core.evictable_host_leaves, node)
+
+    def _rekey_session_leaf(self, heap, leaves, node):
+        heapq.heappush(heap, (self.session_ref_eviction_strategy(node), node))
+        # Shared sessions can change a leaf's key many times in one pressure
+        # event. Bound stale entries by live candidates; rebuild only after
+        # enough rekeys to amortize the linear heapify cost.
+        if len(heap) > 3 * len(leaves) + 32:
+            heap[:] = [(self.session_ref_eviction_strategy(n), n) for n in leaves]
+            heapq.heapify(heap)
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -141,6 +170,9 @@ class FullComponent(TreeComponent):
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
         new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
+        new_parent.component_data[ct].session_high_ref = child.component_data[
+            ct
+        ].session_high_ref
         child_cd = child.component_data[ct]
         assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
@@ -168,7 +200,7 @@ class FullComponent(TreeComponent):
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
-            self.tree_core.component_evictable_size_[self.component_type] -= freed
+            self.tree_core.adjust_evictable_size(node, self.component_type, -(freed))
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
             # cd.value = None
@@ -184,8 +216,14 @@ class FullComponent(TreeComponent):
         return 0 if is_leaf else 2
 
     def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
-        ref = self.session_ref(node)
-        return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
+        cd = node.component_data[self.component_type]
+        tier = self.session_tier(node)
+        policy = (
+            -node.last_access_time
+            if tier == 2
+            else self.tree_core.eviction_strategy.get_priority(node)
+        )
+        return tier, cd.session_high_ref, cd.session_ref - cd.session_high_ref, policy
 
     def _evict_device_start(self, request_cnt: int) -> None:
         self._ensure_eviction_strategy()
@@ -216,8 +254,14 @@ class FullComponent(TreeComponent):
             )
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
-            _, x = heapq.heappop(self._evict_device_heap)
+            key, x = heapq.heappop(self._evict_device_heap)
             if x not in self.tree_core.evictable_device_leaves:
+                continue
+            if self.tree_core.enable_session_radix_cache and (
+                key != self.session_ref_eviction_strategy(x)
+                or not self.can_evict_session_component(x)
+                or (not x.backuped and not self._can_evict_leaf_atomically(x))
+            ):
                 continue
             self._evict_device_last_node = x
             return x.id
@@ -242,19 +286,41 @@ class FullComponent(TreeComponent):
         ]
         heapq.heapify(heap)
         ct = self.component_type
-        while tracker[ct] < num_tokens and heap:
-            _, x = heapq.heappop(heap)
-            if x not in self.tree_core.evictable_host_leaves:
-                continue
-            self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
-            if (
-                x.parent is not None
-                and x.parent in self.tree_core.evictable_host_leaves
-            ):
-                heapq.heappush(
-                    heap,
-                    (self.session_ref_eviction_strategy(x.parent), x.parent),
-                )
+        enabled = self.tree_core.enable_session_radix_cache
+        self._session_host_heap = heap
+        candidates = None
+        try:
+            while tracker[ct] < num_tokens and heap:
+                key, x = heapq.heappop(heap)
+                if x not in self.tree_core.evictable_host_leaves:
+                    continue
+                if enabled:
+                    if key != self.session_ref_eviction_strategy(x):
+                        continue
+                    if self.session_tier(x) == 2 and self.tree_core.session_allow_high:
+                        if candidates is None:
+                            candidates = iter(
+                                self.cache.session_refs.idle_hp_candidates()
+                            )
+                        victim = next(candidates, None)
+                        if victim is not None:
+                            heapq.heappush(heap, (key, x))
+                            self.cache.session_refs.demote_session(victim)
+                            continue
+                    if not self.can_evict_session_component(x, EvictLayer.ALL):
+                        continue
+                    if not self._can_evict_leaf_atomically(x):
+                        continue
+                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+                if (
+                    x.parent is not None
+                    and x.parent in self.tree_core.evictable_host_leaves
+                ):
+                    heapq.heappush(
+                        heap, (self.session_ref_eviction_strategy(x.parent), x.parent)
+                    )
+        finally:
+            self._session_host_heap = None
 
     def acquire_component_lock(
         self,
@@ -274,6 +340,9 @@ class FullComponent(TreeComponent):
             self.tree_core._update_evictable_leaf_sets(node)
             return result
 
+        session_enabled = self.tree_core.enable_session_radix_cache
+        lower = self.tree_core._session_lower_components[ct] if session_enabled else ()
+        high_delta = 0
         root = self.tree_core.root_node
         cur = node
 
@@ -292,11 +361,25 @@ class FullComponent(TreeComponent):
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] -= key_len
+                if session_enabled:
+                    cd.session_evictable_tokens -= key_len
+                    if cd.session_high_ref or (
+                        lower
+                        and any(
+                            cur.component_data[other].session_high_ref
+                            for other in lower
+                        )
+                    ):
+                        cd.session_high_evictable_tokens -= key_len
+                        high_delta += key_len
                 self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
             cd.lock_ref += 1
             self.tree_core.evictable_device_leaves.discard(cur)
             cur = cur.parent
+        # Batch the extra global counter update across the locked path.
+        if high_delta:
+            self.tree_core.session_high_evictable_size[ct] -= high_delta
         result.delta = delta
         return result
 
@@ -318,6 +401,9 @@ class FullComponent(TreeComponent):
             self.tree_core._update_evictable_leaf_sets(node)
             return
 
+        session_enabled = self.tree_core.enable_session_radix_cache
+        lower = self.tree_core._session_lower_components[ct] if session_enabled else ()
+        high_delta = 0
         root = self.tree_core.root_node
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         cur = node
@@ -332,11 +418,24 @@ class FullComponent(TreeComponent):
             if cd.lock_ref == 1:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] += key_len
+                if session_enabled:
+                    cd.session_evictable_tokens += key_len
+                    if cd.session_high_ref or (
+                        lower
+                        and any(
+                            cur.component_data[other].session_high_ref
+                            for other in lower
+                        )
+                    ):
+                        cd.session_high_evictable_tokens += key_len
+                        high_delta += key_len
                 self.tree_core.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
             if cd.lock_ref == 0:
                 self.tree_core._update_evictable_leaf_sets(cur)
             cur = cur.parent
+        if high_delta:
+            self.tree_core.session_high_evictable_size[ct] += high_delta
 
     # ---- HiCache Hooks ----
 
@@ -419,7 +518,7 @@ class FullComponent(TreeComponent):
                 cd.value = device_indices[offset : offset + n_len].clone()
                 offset += n_len
                 # Full uses leaf sets, not LRU
-                self.tree_core.component_evictable_size_[ct] += n_len
+                self.tree_core.adjust_evictable_size(n, ct, n_len)
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)

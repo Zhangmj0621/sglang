@@ -837,6 +837,11 @@ class ServerArgs:
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
         NS("schedule"),
     ] = False
+    high_priority_threshold: A[
+        int,
+        "Minimum request priority treated as high priority by the Unified session radix cache.",
+        NS("schedule"),
+    ] = 1
     disable_priority_preemption: A[
         bool, "Disable priority scheduling preemption.", NS("schedule")
     ] = False
@@ -1432,7 +1437,7 @@ class ServerArgs:
     ] = False
     enable_session_radix_cache: A[
         bool,
-        "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
+        "Track per-session references on UnifiedRadixCache KV: evict unreferenced entries before low- and high-priority references; closing a session only dereferences its KV.",
         NS("memory"),
     ] = False
 
@@ -8800,6 +8805,15 @@ class ServerArgs:
         )
 
         # Check scheduling policy
+        if (
+            self.enable_session_radix_cache
+            and self.enable_priority_scheduling
+            and self.schedule_low_priority_values_first
+        ):
+            raise ValueError(
+                "--enable-session-radix-cache requires higher priority values first; "
+                "it cannot be combined with --schedule-low-priority-values-first."
+            )
         if self.enable_priority_scheduling:
             assert self.schedule_policy in [
                 "fcfs",

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from operator import length_hint
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -831,6 +832,10 @@ class UnifiedMambaSlotAllocator:
         # Byte-coordinated count (>= N => alloc(N) succeeds); credits the peer's
         # drainable holes since alloc flushes the peer before extending.
         return self._multi_ended_allocator.schedulable_available_size()
+
+    def group_available_size(self) -> int:
+        """Slots reserved by ``alloc_group_begin`` but not consumed yet."""
+        return length_hint(self._alloc_iter, 0) if self._alloc_iter is not None else 0
 
     @property
     def free_slots(self) -> torch.Tensor:

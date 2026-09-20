@@ -52,6 +52,9 @@ class ComponentData:
     host_value: Optional[torch.Tensor] = None
     host_lock_ref: int = 0
     session_ref: int = 0
+    session_high_ref: int = 0
+    session_evictable_tokens: int = 0
+    session_high_evictable_tokens: int = 0
     session_ids: Optional[set[str]] = None
 
 
@@ -69,6 +72,7 @@ class PrepareLoadBackResult:
 
     # Freshly allocated device mamba slot, recovered on failure.
     allocated_mamba_slot: Optional[torch.Tensor] = None
+    alloc_failed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,17 +132,152 @@ class TreeComponent(ABC):
     def session_ref(self, node: UnifiedTreeNode) -> int:
         return node.component_data[self.component_type].session_ref
 
+    def session_tier(self, node: UnifiedTreeNode) -> int:
+        cd = node.component_data[self.component_type]
+        return 2 if cd.session_high_ref else int(cd.session_ref > 0)
+
+    def session_nodes(self, session_id: str):
+        """Yield each coverage contribution, including shared frontier ancestors."""
+        for leaf in self._session_leaves.get(session_id, ()):
+            yield from self._session_coverage_nodes(session_id, leaf)
+
+    def _session_coverage_nodes(self, session_id: str, leaf: UnifiedTreeNode):
+        yield leaf
+
+    def _change_session_ref(self, node, session_id, delta):
+        cd = node.component_data[self.component_type]
+        old_tier = self.session_tier(node)
+        cd.session_ref += delta
+        if self.cache.session_refs.session_is_high(session_id):
+            cd.session_high_ref += delta
+        assert 0 <= cd.session_high_ref <= cd.session_ref
+        self._session_ref_changed(node, old_tier)
+
+    def change_session_priority(self, session_id, was_high, is_high):
+        if was_high == is_high:
+            return
+        delta = 1 if is_high else -1
+        for node in self.session_nodes(session_id):
+            cd = node.component_data[self.component_type]
+            old_tier = self.session_tier(node)
+            cd.session_high_ref += delta
+            assert 0 <= cd.session_high_ref <= cd.session_ref
+            self._session_ref_changed(node, old_tier)
+
+    def _session_ref_changed(self, node, old_tier):
+        self.tree_core.refresh_session_evictable(node)
+        if self.session_tier(node) != old_tier:
+            self._refresh_session_partition(node)
+
+    def _evict_session_device_next_node(self, tracker, device_frees, host_frees):
+        ct = self.component_type
+        lru = self.tree_core.lru_lists[ct]
+        while tracker[ct] < self._evict_device_request_cnt:
+            node = lru.cursor_next()
+            if node is None:
+                return None
+            if not self.can_evict_session_component(node):
+                continue
+            if (
+                node in self.tree_core.evictable_device_leaves
+                and self._can_evict_leaf_atomically(node)
+            ):
+                # Do not prefetch the next entry: write-back can change tiers
+                # before the caller asks for another node.
+                return node.id
+            self.tree_core._evict_component_and_detach_lru(
+                node,
+                self,
+                target=EvictLayer.DEVICE,
+                tracker=tracker,
+                device_frees=device_frees,
+                host_frees=host_frees,
+            )
+            self.tree_core._cascade_evict(
+                node,
+                self,
+                tracker,
+                device_frees=device_frees,
+                host_frees=host_frees,
+            )
+        return None
+
     def _can_evict_leaf_atomically(self, node: UnifiedTreeNode) -> bool:
-        # Don't allow a non-session-ref component to cascade-evict
-        # a high-priority session-ref component.
-        if self.session_ref(node) > 0:
-            return True
-        priority = self.eviction_priority(is_leaf=False)
-        return not any(
-            comp.eviction_priority(is_leaf=False) >= priority
-            and comp.session_ref(node) > 0
-            for comp in self.tree_core.components
+        # Atomic deletion releases every component, including higher-value ones.
+        tier = self.session_tier(node)
+        return self.tree_core.session_tier_allowed(tier) and all(
+            comp.session_tier(node) <= tier for comp in self.tree_core.components
         )
+
+    def can_evict_session_component(self, node, target=EvictLayer.DEVICE):
+        if not self.tree_core.enable_session_radix_cache:
+            return True
+        tier = self.session_tier(node)
+        if not self.tree_core.session_tier_allowed(tier):
+            return False
+        priority = self.eviction_priority(is_leaf=False)
+        for comp in self.tree_core.components:
+            if comp.eviction_priority(is_leaf=False) <= priority:
+                cd = node.component_data[comp.component_type]
+                if comp.node_has_component_data(node, target):
+                    if comp.session_tier(node) > tier:
+                        return False
+                    if target & EvictLayer.DEVICE and cd.lock_ref:
+                        return False
+                    if target & EvictLayer.HOST and cd.host_lock_ref:
+                        return False
+        return True
+
+    def _drive_session_host_eviction(
+        self, num_tokens, tracker, device_frees, host_frees
+    ):
+        """Advance host tiers without scanning or indexing unrelated entries."""
+        ct = self.component_type
+        lru = self.tree_core.host_lru_lists[ct]
+        candidates = None
+        lru.cursor_begin()
+        try:
+            while tracker[ct] < num_tokens:
+                node = lru.cursor_next(host_lock=True, max_tier=1)
+                if node is None and self.tree_core.session_allow_high:
+                    if candidates is None:
+                        candidates = iter(self.cache.session_refs.idle_hp_candidates())
+                    victim = next(candidates, None)
+                    if victim is not None:
+                        self.cache.session_refs.demote_session(victim)
+                        continue
+                    node = lru.cursor_next(host_lock=True)
+                if node is None:
+                    break
+                if not self.can_evict_session_component(node, EvictLayer.HOST):
+                    continue
+                if (
+                    node in self.tree_core.evictable_host_leaves
+                    and self._can_evict_leaf_atomically(node)
+                ):
+                    self.tree_core._evict_host_leaf(
+                        node, tracker, device_frees, host_frees
+                    )
+                else:
+                    self.tree_core._evict_component_and_detach_lru(
+                        node,
+                        self,
+                        target=EvictLayer.HOST,
+                        tracker=tracker,
+                        device_frees=device_frees,
+                        host_frees=host_frees,
+                    )
+                    self.tree_core._cascade_evict(
+                        node,
+                        self,
+                        tracker,
+                        target=EvictLayer.HOST,
+                        device_frees=device_frees,
+                        host_frees=host_frees,
+                    )
+                    self.tree_core._update_evictable_leaf_sets(node)
+        finally:
+            lru.cursor_end()
 
     def _refresh_session_partition(self, node: UnifiedTreeNode) -> None:
         ct = self.component_type
@@ -288,6 +427,10 @@ class TreeComponent(ABC):
 
         for node in reachable_nodes:
             cd = node.component_data[ct]
+            if not 0 <= cd.session_high_ref <= cd.session_ref:
+                report_error(
+                    f"node {node.id} {ct} invalid high refs={cd.session_high_ref}"
+                )
             if cd.session_ref < 0:
                 report_error(f"node {node.id} {ct} session_ref={cd.session_ref}")
             if cd.session_ids is not None and not cd.session_ids:
@@ -304,7 +447,9 @@ class TreeComponent(ABC):
         cd = node.component_data[self.component_type]
         if target is EvictLayer.DEVICE:
             return cd.value is not None
-        return cd.host_value is not None
+        if target is EvictLayer.HOST:
+            return cd.host_value is not None
+        return cd.value is not None or cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value

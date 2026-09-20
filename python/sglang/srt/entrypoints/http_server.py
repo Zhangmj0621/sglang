@@ -140,6 +140,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateSessionPriorityReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1572,6 +1573,17 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/update_session_priority")
+async def update_session_priority(
+    obj: Annotated[UpdateSessionPriorityReqInput, Body()], request: Request
+):
+    """Update the current session's scheduling and cache reference priority."""
+    result = await _global_state.tokenizer_manager.update_session_priority(obj, request)
+    return ORJSONResponse(
+        msgspec_to_builtins(result), status_code=200 if result.success else 400
+    )
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])

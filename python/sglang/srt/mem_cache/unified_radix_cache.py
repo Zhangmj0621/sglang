@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -179,6 +180,8 @@ class UnifiedRadixCache(BasePrefixCache):
             components=self._components_tuple,
             tree_core=self.tree_core,
             enable_session_radix_cache=self.enable_session_radix_cache,
+            enable_priority_scheduling=params.enable_priority_scheduling,
+            high_priority_threshold=params.high_priority_threshold,
         )
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
@@ -414,6 +417,30 @@ class UnifiedRadixCache(BasePrefixCache):
             # Drain still-pending actions so frees reach the allocator on abort.
             self._apply_cache_actions(self.tree_core.end_insert())
 
+    def is_high_priority(self, priority) -> bool:
+        return self.session_refs.is_high_priority(priority)
+
+    @contextmanager
+    def scoped_evict(self, allow_low=True, allow_high=False):
+        core = self.tree_core
+        previous = core.session_allow_low, core.session_allow_high
+        core.session_allow_low, core.session_allow_high = allow_low, allow_high
+        try:
+            yield
+        finally:
+            core.session_allow_low, core.session_allow_high = previous
+
+    def session_evictable_size(self, component_type=None, allow_high=False):
+        ct = BASE_COMPONENT_TYPE if component_type is None else component_type
+        total = self.tree_core.component_evictable_size_.get(ct, 0)
+        if self.enable_session_radix_cache and not allow_high:
+            total -= self.tree_core.session_high_evictable_size.get(ct, 0)
+        return total
+
+    def evict_for_session(self, params: EvictParams, allow_low=True, allow_high=False):
+        with self.scoped_evict(allow_low=allow_low, allow_high=allow_high):
+            return self.evict(params)
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -599,6 +626,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if not self.enable_session_radix_cache:
+            return self._cache_finished_req(
+                req, is_insert, kv_len_to_handle=kv_len_to_handle, **kwargs
+            )
+        with self.scoped_evict(allow_high=self.is_high_priority(req.priority)):
+            return self._cache_finished_req(
+                req, is_insert, kv_len_to_handle=kv_len_to_handle, **kwargs
+            )
+
+    def _cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+    ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -687,6 +726,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        if not self.enable_session_radix_cache:
+            return self._cache_unfinished_req(req, chunked=chunked, **kwargs)
+        with self.scoped_evict(allow_high=self.is_high_priority(req.priority)):
+            return self._cache_unfinished_req(req, chunked=chunked, **kwargs)
+
+    def _cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -854,10 +899,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components[ct].free_host_values(host_frees.pop(ct))
 
     def evict_host(
-        self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
+        self,
+        num_tokens: int,
+        component_type: ComponentType = BASE_COMPONENT_TYPE,
+        allow_high: Optional[bool] = None,
     ) -> int:
-        """Evict host resources for a specific component to free host pool space."""
-        result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        """Evict host resources, inheriting the caller's explicit HP permission."""
+        if allow_high is None:
+            allow_high = self.tree_core.session_allow_high
+        with self.scoped_evict(allow_low=True, allow_high=allow_high):
+            result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 
@@ -975,12 +1026,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component pre-allocate per-request state for the load-back;
         # the finally below lets components recover it unless the load succeeds.
-        preps: dict[ComponentType, PrepareLoadBackResult] = {
-            comp.component_type: comp.prepare_load_back(node_id, req=req)
-            for comp in self._components_tuple
-        }
+        preps: dict[ComponentType, PrepareLoadBackResult] = {}
         success = False
+        prepared = False
         try:
+            for comp in self._components_tuple:
+                prep = comp.prepare_load_back(node_id, req=req)
+                preps[comp.component_type] = prep
+                if prep.alloc_failed:
+                    return False
+            prepared = True
             success = self._load_back_transfers(
                 node_id=node_id,
                 mem_quota=mem_quota,
@@ -991,8 +1046,12 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             return success
         finally:
+            if not prepared:
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
             for comp in self._components_tuple:
-                comp.finalize_load_back(req, preps[comp.component_type], success)
+                if comp.component_type in preps:
+                    comp.finalize_load_back(req, preps[comp.component_type], success)
 
     def _load_back_transfers(
         self,
@@ -1889,7 +1948,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
-    def init_load_back(
+    def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, NodeId]:
+        if not self.enable_session_radix_cache:
+            return self._init_load_back(params)
+        with self.scoped_evict(allow_high=self.is_high_priority(params.req.priority)):
+            return self._init_load_back(params)
+
+    def _init_load_back(
         self,
         params: InitLoadBackParams,
     ) -> tuple[torch.Tensor, NodeId]:

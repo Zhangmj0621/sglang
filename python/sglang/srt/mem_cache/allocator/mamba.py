@@ -22,6 +22,7 @@ free-slot bookkeeping.
 
 from __future__ import annotations
 
+from operator import length_hint
 from typing import Iterator, Optional
 
 import torch
@@ -54,6 +55,10 @@ class MambaSlotAllocator:
         ``UnifiedMambaSlotAllocator`` overrides it with the byte-coordinated view.
         Lets ``alloc_req_slots`` call it uniformly without a getattr fallback."""
         return self.available_size()
+
+    def group_available_size(self) -> int:
+        """Slots reserved by ``alloc_group_begin`` but not consumed yet."""
+        return length_hint(self._alloc_iter, 0) if self._alloc_iter is not None else 0
 
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch of slots for match_prefix to amortize overhead."""

@@ -93,6 +93,10 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
+    def _end_session_request(self, req: Req) -> None:
+        if getattr(self.tree_cache, "enable_session_radix_cache", False) is True:
+            self.tree_cache.session_refs.end_request(req)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -106,6 +110,7 @@ class SchedulerBatchResultProcessor:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                self._end_session_request(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -273,6 +278,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
+                        self._end_session_request(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -352,6 +358,7 @@ class SchedulerBatchResultProcessor:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self._end_session_request(req)
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -1039,6 +1046,7 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_indexer_topk(req)
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
+                self._end_session_request(req)
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
@@ -1056,6 +1064,7 @@ class SchedulerBatchResultProcessor:
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                self._end_session_request(req)
 
             req.time_stats.set_completion_time()
 

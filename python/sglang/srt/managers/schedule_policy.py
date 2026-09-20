@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -549,6 +550,11 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.session_priority_enabled = (
+            getattr(tree_cache, "enable_session_radix_cache", False) is True
+        )
+        self._session_allow_high = True
+        self._session_mamba_reserved = 0
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -565,27 +571,81 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
+    def _evictable_for_session(self, component, fallback):
+        if self.session_priority_enabled:
+            return self.tree_cache.session_evictable_size(
+                component, allow_high=self._session_allow_high
+            )
+        return fallback()
+
+    @contextmanager
+    def _session_request_scope(self, req):
+        if not self.session_priority_enabled:
+            yield
+            return
+        previous = self._session_allow_high
+        self._session_allow_high = self.tree_cache.is_high_priority(req.priority)
+        try:
+            with self.tree_cache.scoped_evict(
+                allow_low=True, allow_high=self._session_allow_high
+            ):
+                yield
+        finally:
+            self._session_allow_high = previous
+
+    def _session_mamba_slots_needed(self, req):
+        if not self.session_priority_enabled or not self.is_hybrid_ssm_cache:
+            return 0
+        pool = self.tree_cache.req_to_token_pool
+        needed = int(req.mamba_pool_idx is None)
+        if pool.enable_mamba_extra_buffer and req.mamba_ping_pong_track_buffer is None:
+            needed += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        return needed
+
+    def _session_mamba_slots_available(self):
+        allocator = self.tree_cache.req_to_token_pool.mamba_allocator
+        return (
+            allocator.schedulable_available_size()
+            + allocator.group_available_size()
+            + self.tree_cache.session_evictable_size(
+                ComponentType.MAMBA, allow_high=self._session_allow_high
+            )
+            - self._session_mamba_reserved
+        )
+
     @property
     def rem_total_tokens(self):
         if self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.SWA, self.tree_cache.swa_evictable_size
+                )
             )
         elif self.is_hybrid_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.FULL, self.tree_cache.full_evictable_size
+                )
             )
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.FULL, self.tree_cache.full_evictable_size
+                )
             )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.FULL, self.tree_cache.evictable_size
+                )
             )
         return available_and_evictable - self.rem_total_token_offset
 
@@ -593,7 +653,9 @@ class PrefillAdder:
     def rem_swa_tokens(self):
         return (
             self.token_to_kv_pool_allocator.swa_available_size()
-            + self.tree_cache.swa_evictable_size()
+            + self._evictable_for_session(
+                ComponentType.SWA, self.tree_cache.swa_evictable_size
+            )
             - self.rem_swa_token_offset
         )
 
@@ -602,22 +664,30 @@ class PrefillAdder:
         if self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.SWA, self.tree_cache.swa_evictable_size
+                )
             )
         elif self.is_hybrid_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.FULL, self.tree_cache.full_evictable_size
+                )
             )
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.FULL, self.tree_cache.full_evictable_size
+                )
             )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+                + self._evictable_for_session(
+                    ComponentType.FULL, self.tree_cache.evictable_size
+                )
             )
 
         return available_and_evictable - self.cur_rem_token_offset
@@ -708,6 +778,9 @@ class PrefillAdder:
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
         multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
+        if self._mamba_slot_cost and self.session_priority_enabled:
+            # Track buffers consume the same shared gap as the main state.
+            return self._mamba_slot_cost * self._session_mamba_slots_needed(req)
         if self._mamba_slot_cost and req.mamba_pool_idx is None:
             return self._mamba_slot_cost
         return 0
@@ -723,6 +796,8 @@ class PrefillAdder:
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
         if not no_token and self.rem_mamba_slots is not None:
             no_token = self.rem_mamba_slots <= 0
+            if self.session_priority_enabled:
+                no_token = no_token or self._session_mamba_slots_available() <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
 
@@ -745,32 +820,58 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        fresh_kv_tokens: Optional[int] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
+        # Most prefills allocate KV for every input token. FDFO dLLM staging is
+        # the exception: an unresolved block can reuse KV that is already owned
+        # by the request. Keep its compute accounting at `extend_input_len`, but
+        # charge the memory budgets only for slots the allocator will create.
+        kv_extend_input_len = (
+            extend_input_len
+            if fresh_kv_tokens is None
+            else self.ceil_paged_tokens(fresh_kv_tokens)
+        )
+
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
+        page_overhead = (
+            self.page_size if fresh_kv_tokens is None or kv_extend_input_len > 0 else 0
+        )
         # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
         # immediately (counts against `cur_rem`) and held for the request lifetime
         # (counts against `rem_total`). See `_mamba_gap_budget_for_req`.
         self.rem_total_token_offset += (
-            extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
+            kv_extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
         )
         self.cur_rem_token_offset += (
-            extend_input_len + page_overhead + mamba_gap_reserve
+            kv_extend_input_len + page_overhead + mamba_gap_reserve
         )
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            self.rem_mamba_slots -= (
+                mamba_gap_reserve // self._mamba_slot_cost
+                if self.session_priority_enabled
+                else 1
+            )
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(
-                extend_input_len, max_new_tokens
-            )
+            if fresh_kv_tokens is None:
+                swa_budget = self._swa_budget_for_req(extend_input_len, max_new_tokens)
+            else:
+                # Mirror _swa_budget_for_req, but a fully reused dLLM block does
+                # not need the extra allocation page. Future decode headroom is
+                # still reserved through max_new_tokens.
+                window = self.tree_cache.sliding_window_size
+                swa_budget = max(kv_extend_input_len - window, 0) + min(
+                    kv_extend_input_len + max_new_tokens, window
+                )
+                swa_budget += page_overhead
+            self.rem_swa_token_offset += swa_budget
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -785,7 +886,25 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
 
-    def _get_dllm_remain_tokens(self) -> int:
+    def _get_dllm_remain_tokens(
+        self, staging_reusable_tokens: Optional[int] = None
+    ) -> int:
+        if self.session_priority_enabled and staging_reusable_tokens is not None:
+            # Only fresh KV needs tier-scoped capacity. A complete unresolved
+            # FDFO block is already absent from allocator.available_size(), so
+            # count it back into the logical staging length for this request.
+            fresh_capacity = max(0, int(self.rem_total_tokens))
+            if self.is_hybrid_swa:
+                fresh_capacity = min(fresh_capacity, max(0, int(self.rem_swa_tokens)))
+            return max(
+                0,
+                min(
+                    self.rem_dllm_tokens,
+                    self.dllm_block_size,
+                    fresh_capacity + staging_reusable_tokens,
+                ),
+            )
+
         _rem_tokens = min(
             self.rem_dllm_tokens,
             self.dllm_block_size,
@@ -795,6 +914,26 @@ class PrefillAdder:
             _rem_tokens = self.rem_dllm_tokens
 
         return _rem_tokens
+
+    def _dllm_staging_reusable_tokens(
+        self, req: Req, extend_start: int, extend_len: int
+    ) -> int:
+        """Return a fully reusable FDFO block, or zero for a fresh allocation.
+
+        Keep this predicate in lockstep with allocation._alloc_extend_loc_with_kv_reuse:
+        partial blocks are never reusable, and metadata alone is insufficient
+        unless the request still owns enough allocated KV through the planned
+        extend range.
+        """
+        if (
+            req.req_pool_idx is None
+            or not req.dllm_incomplete_ids
+            or req.kv is None
+            or extend_len != len(req.dllm_incomplete_ids)
+            or extend_start + extend_len > req.kv.kv_allocated_len
+        ):
+            return 0
+        return extend_len
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
         # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
@@ -827,21 +966,40 @@ class PrefillAdder:
         req.skip_lock_node_ids = {}
 
     def add_dllm_staging_req(self, req: Req):
+        with self._session_request_scope(req):
+            needed = self._session_mamba_slots_needed(req)
+            if needed and needed > self._session_mamba_slots_available():
+                return AddReqResult.NO_TOKEN
+            previous_count = len(self.can_run_list)
+            result = self._add_dllm_staging_req(req)
+            if len(self.can_run_list) > previous_count:
+                self._session_mamba_reserved += self._session_mamba_slots_needed(req)
+            return result
+
+    def _add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
+        prefix_len = len(req.prefix_indices)
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - prefix_len
+        reusable_tokens = self._dllm_staging_reusable_tokens(
+            req, prefix_len, cand_extend_input_len
+        )
+        _rem_tokens = self._get_dllm_remain_tokens(reusable_tokens)
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        # Truncate input length to available tokens and update request metadata
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        # Truncate input length to available tokens and update request metadata.
+        # An FDFO retry must reuse its complete retained block; the allocator
+        # deliberately rejects partial retained-block reuse.
         if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
-        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.set_extend_range(prefix_len, prefix_len + new_len)
+        reusable_tokens = self._dllm_staging_reusable_tokens(
+            req, req.extend_range.start, req.extend_range.length
+        )
+        fresh_kv_tokens = req.extend_range.length - reusable_tokens
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -856,20 +1014,43 @@ class PrefillAdder:
             max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            fresh_kv_tokens=(
+                fresh_kv_tokens if self.session_priority_enabled else None
+            ),
         )
 
         # Return based on remaining token availability
         return (
             AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens() <= 0
+            if self._get_dllm_remain_tokens(reusable_tokens) <= 0
             else AddReqResult.CONTINUE
         )
 
     def add_chunked_req(self, req: Req):
+        with self._session_request_scope(req):
+            needed = self._session_mamba_slots_needed(req)
+            if needed and needed > self._session_mamba_slots_available():
+                return req
+            previous_count = len(self.can_run_list)
+            result = self._add_chunked_req(req)
+            if len(self.can_run_list) > previous_count:
+                self._session_mamba_reserved += self._session_mamba_slots_needed(req)
+            return result
+
+    def _add_chunked_req(self, req: Req):
+        if self.session_priority_enabled and not self._session_allow_high:
+            # A deferred LP chunk must use the budget after HP prefix locks.
+            # Returning the owner without admitting it asks the scheduler to
+            # retract it; never fabricate an empty prefill chunk.
+            if self.rem_total_tokens <= self.page_size:
+                return req
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            budget = int(self.rem_total_tokens)
+            if self.session_priority_enabled:
+                budget -= self.page_size
+            _rem_tokens = min(self.rem_chunk_tokens, budget)
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
@@ -879,7 +1060,9 @@ class PrefillAdder:
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
+                if self.is_hybrid_swa or (
+                    self.session_priority_enabled and not self._session_allow_high
+                ):
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
@@ -1059,6 +1242,16 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        with self._session_request_scope(req):
+            previous_count = len(self.can_run_list)
+            result = self._add_one_req(req, has_chunked_req, truncation_align_size)
+            if len(self.can_run_list) > previous_count:
+                self._session_mamba_reserved += self._session_mamba_slots_needed(req)
+            return result
+
+    def _add_one_req(
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+    ):
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
@@ -1084,14 +1277,15 @@ class PrefillAdder:
         total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        total_tokens += self._mamba_gap_budget_for_req(req)
+        mamba_reserve = self._mamba_gap_budget_for_req(req)
+        total_tokens += mamba_reserve
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
+        if not self._can_admit_session_request(req, total_tokens):
             return AddReqResult.NO_TOKEN
 
         chunk_tokens_limit = self.rem_chunk_tokens
@@ -1124,7 +1318,7 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            if not self._can_admit_session_request(req, total_tokens):
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
@@ -1253,6 +1447,64 @@ class PrefillAdder:
                 )
 
         return self.budget_state()
+
+    def _can_admit_session_request(self, req: Req, total_tokens: int) -> bool:
+        needed = self._session_mamba_slots_needed(req)
+        if needed and needed > self._session_mamba_slots_available():
+            return False
+        if total_tokens < self.rem_total_tokens:
+            return True
+        if not self.session_priority_enabled or not self._session_allow_high:
+            return False
+
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+        if (
+            not server_args.enable_priority_scheduling
+            or server_args.disable_priority_preemption
+        ):
+            return False
+        # Only do this work under memory pressure. Keep the legacy largest-LP
+        # first policy without sorting the running batch on every prefill pass.
+        already_preempted = set(self.preempt_list)
+        candidates = [
+            r
+            for r in self.running_batch.reqs
+            if r not in already_preempted
+            and not r.finished()
+            and not self.tree_cache.is_high_priority(r.priority)
+        ]
+        candidates.sort(
+            key=lambda r: len(r.origin_input_ids) + len(r.output_ids), reverse=True
+        )
+        selected = []
+        removed_offset = 0
+        for running_req in candidates:
+            selected.append(running_req)
+            delta = self._get_running_request_total_token_offset(running_req)
+            removed_offset += delta
+            self.rem_total_token_offset -= delta
+            if total_tokens < self.rem_total_tokens:
+                break
+        if total_tokens >= self.rem_total_tokens:
+            self.rem_total_token_offset += removed_offset
+            return False
+
+        selected = set(selected)
+        keep_indices = []
+        released = 0
+        for index, running_req in enumerate(self.running_batch.reqs):
+            if running_req in selected:
+                released += 1
+                self.running_batch.release_req(
+                    index, len(self.running_batch.reqs) - released, server_args
+                )
+            else:
+                keep_indices.append(index)
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.preempt_list.extend(r for r in candidates if r in selected)
+        return True
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
         """

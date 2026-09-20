@@ -66,6 +66,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateSessionPriorityReqInput,
+    UpdateSessionPriorityReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -107,6 +109,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("update_session_priority", UpdateSessionPriorityReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -914,6 +917,33 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    async def update_session_priority(
+        self: TokenizerManager,
+        obj: UpdateSessionPriorityReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> UpdateSessionPriorityReqOutput:
+        self.auto_create_handle_loop()
+        if not self.server_args.enable_session_radix_cache:
+            return UpdateSessionPriorityReqOutput(
+                success=False, message="Session radix cache is disabled."
+            )
+        results = await self.update_session_priority_communicator(obj)
+        found = any(result.found for result in results)
+        success = found and all(result.success for result in results)
+        if not found and all(result.success for result in results):
+            message = f"Session {obj.session_id!r} is unknown or closed."
+        else:
+            message = " | ".join(
+                dict.fromkeys(
+                    result.message
+                    for result in results
+                    if result.found or not result.success
+                )
+            )
+        return UpdateSessionPriorityReqOutput(
+            success=success, message=message, found=found
+        )
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

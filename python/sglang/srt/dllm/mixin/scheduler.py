@@ -104,6 +104,7 @@ class SchedulerDllmMixin:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self._end_session_request(req)
                         req.time_stats.set_completion_time()
                     continue
 
@@ -145,6 +146,7 @@ class SchedulerDllmMixin:
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
+                    self._end_session_request(req)
                     req.time_stats.set_completion_time()
 
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)

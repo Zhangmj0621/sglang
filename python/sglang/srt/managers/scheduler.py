@@ -161,6 +161,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateSessionPriorityReqInput,
+    UpdateSessionPriorityReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1507,6 +1509,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (UpdateSessionPriorityReqInput, self.update_session_priority),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -2586,6 +2589,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        # Grammar compilation is also outstanding work for this session.
+        if getattr(self.tree_cache, "enable_session_radix_cache", False) is True:
+            if not self._set_or_validate_priority(
+                req
+            ) or not self._begin_session_request(req):
+                return
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -2626,22 +2635,54 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _begin_session_request(self, req: Req) -> bool:
+        tree_cache = getattr(self, "tree_cache", None)
+        if getattr(tree_cache, "enable_session_radix_cache", False) is not True:
+            return True
+        success, message = tree_cache.session_refs.begin_request(req)
+        if not success:
+            self._end_session_request(req)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(
+                    rid=req.rid,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": message,
+                    },
+                ),
+                req,
+            )
+        return success
+
+    def _end_session_request(self, req: Req) -> None:
+        tree_cache = getattr(self, "tree_cache", None)
+        if getattr(tree_cache, "enable_session_radix_cache", False) is True:
+            tree_cache.session_refs.end_request(req)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
+            self._end_session_request(req)
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
+                return
+            if not self._begin_session_request(req):
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if not self._begin_session_request(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if not self._begin_session_request(req):
+                return
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -2721,6 +2762,7 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        self._end_session_request(req_to_abort)
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -2747,6 +2789,7 @@ class Scheduler(
                     ),
                     req,
                 )
+                self._end_session_request(req)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2872,6 +2915,7 @@ class Scheduler(
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._end_session_request(req)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3090,6 +3134,26 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _try_add_session_chunk(
+        self, adder: PrefillAdder, req: Req, *, force_retract=False
+    ):
+        # A newly admitted HP chunk has priority over the deferred LP owner.
+        # There can only be one live chunk owner, including SWA-capped chunks
+        # that leave some of the global chunk budget unused.
+        if force_retract or adder.new_chunked_req is not None:
+            admitted = False
+        else:
+            self.chunked_req = adder.add_chunked_req(req)
+            admitted = bool(adder.can_run_list and adder.can_run_list[-1] is req)
+        if not admitted:
+            # No batch owns this middle chunk. Retract even for an otherwise
+            # empty batch so inflight_middle_chunks cannot grow without work.
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.reset_for_retract()
+            self.chunked_req = None
+            return req
+        return None
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3174,9 +3238,27 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        session_priority = (
+            getattr(self.tree_cache, "enable_session_radix_cache", False) is True
+        )
+        chunk_owner = self.chunked_req
+        deferred_chunk = None
+        retracted_chunk = None
+        chunk_admitted = False
+        if chunk_owner is not None:
+            chunk_owner.init_next_round_input()
+            if session_priority and not self.tree_cache.is_high_priority(
+                chunk_owner.priority
+            ):
+                deferred_chunk = chunk_owner
+            elif session_priority:
+                retracted_chunk = self._try_add_session_chunk(adder, chunk_owner)
+                chunk_admitted = retracted_chunk is None
+            else:
+                self.chunked_req = adder.add_chunked_req(chunk_owner)
+                chunk_admitted = bool(
+                    adder.can_run_list and adder.can_run_list[-1] is chunk_owner
+                )
 
         if self.enable_lora:
             running_loras = {
@@ -3192,20 +3274,71 @@ class Scheduler(
                 )
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-        if mamba_allocator is not None:
+        # A shared Full/Mamba allocator charges Mamba group reservations to the
+        # Full byte budget before admission. Keep per-request allocation there;
+        # otherwise the planner would need to credit unconsumed group slots with
+        # rounding-sensitive byte conversions. Static Mamba pools keep the batch
+        # allocation fast path and expose their held slots to the planner.
+        use_mamba_alloc_group = mamba_allocator is not None and not (
+            session_priority and adder._mamba_slot_cost > 0
+        )
+        if use_mamba_alloc_group:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
+            if (
+                deferred_chunk is not None
+                and self.tree_cache.is_high_priority(req.priority)
+                and self.req_to_token_pool.available_size() == 0
+            ):
+                # The owner holds the only reusable request slot. Release it
+                # before admitting a different request; counting that slot as
+                # free would over-admit HP requests and fail alloc_req_slots.
+                retracted_chunk = self._try_add_session_chunk(
+                    adder, deferred_chunk, force_retract=True
+                )
+                deferred_chunk = None
+
+            # HP prefix locks must be established before the deferred LP
+            # chunk consumes the remaining tier budget. Queue order is already
+            # priority-aware (the supported policies are FCFS / LOF).
+            if deferred_chunk is not None and not self.tree_cache.is_high_priority(
+                req.priority
+            ):
+                retracted_chunk = self._try_add_session_chunk(adder, deferred_chunk)
+                chunk_admitted = retracted_chunk is None
+                if chunk_admitted and self.enable_lora:
+                    running_loras.add(deferred_chunk.lora_id)
+                deferred_chunk = None
+
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            if session_priority:
+                reused_slot = int(
+                    chunk_admitted and chunk_owner.req_pool_idx is not None
+                )
+                num_allocatable = min(
+                    get_parallel().pp_max_micro_batch_size - running_bs,
+                    self.req_to_token_pool.available_size() + reused_slot,
+                )
+            else:
+                num_allocatable = self.get_num_allocatable_reqs(running_bs)
+            if len(adder.can_run_list) >= num_allocatable:
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                reused_slot = int(
+                    session_priority
+                    and chunk_admitted
+                    and chunk_owner.req_pool_idx is not None
+                )
+                if (
+                    len(adder.can_run_list)
+                    >= self.req_to_token_pool.available_size() + reused_slot
+                ):
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
@@ -3225,7 +3358,14 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            req.init_next_round_input(self.tree_cache)
+            if session_priority:
+                with self.tree_cache.scoped_evict(
+                    allow_low=True,
+                    allow_high=self.tree_cache.is_high_priority(req.priority),
+                ):
+                    req.init_next_round_input(self.tree_cache)
+            else:
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3263,8 +3403,20 @@ class Scheduler(
                         req.mamba_pool_idx = None
                 break
 
-        if mamba_allocator is not None:
+        if deferred_chunk is not None:
+            retracted_chunk = self._try_add_session_chunk(adder, deferred_chunk)
+
+        if use_mamba_alloc_group:
             mamba_allocator.alloc_group_end()
+
+        if retracted_chunk is not None:
+            self._add_request_to_queue(retracted_chunk, is_retracted=True)
+
+        # Preemption may have released running requests before a later gate
+        # rejects prefill. Requeue them even when this pass produces no batch.
+        if adder.preempt_list:
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -3273,9 +3425,6 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
@@ -3427,6 +3576,7 @@ class Scheduler(
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
+                self._end_session_request(req)
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
@@ -4341,6 +4491,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._end_session_request(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4374,6 +4525,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                self._end_session_request(req)
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -4435,6 +4587,7 @@ class Scheduler(
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
+                        self._end_session_request(decode_req)
                         self.ipc_channels.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )
@@ -4713,6 +4866,68 @@ class Scheduler(
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()
+
+    def update_session_priority(self, recv_req: UpdateSessionPriorityReqInput):
+        if getattr(self.tree_cache, "enable_session_radix_cache", False) is not True:
+            return UpdateSessionPriorityReqOutput(
+                success=False, found=False, message="session radix cache is disabled"
+            )
+        refs = self.tree_cache.session_refs
+        generation = refs.current_generation(recv_req.session_id)
+        if generation is None:
+            # Other DP ranks may own this session. The tokenizer combines found
+            # replies and reports not-found only when no rank owns it.
+            return UpdateSessionPriorityReqOutput(
+                success=True, found=False, message="session not found on this rank"
+            )
+        success, message = refs.update_priority(recv_req.session_id, recv_req.priority)
+        if success:
+            # This control operation is rare; walk live queues once, never in a
+            # decode step. Activity markers also exclude stale generations.
+            requests = list(self.waiting_queue)
+            requests.extend(self.grammar_manager.grammar_queue)
+            for batch in (
+                self.running_batch,
+                self.last_batch,
+                *(getattr(self, "running_mbs", ()) or ()),
+                *(getattr(self, "mbs", ()) or ()),
+            ):
+                if batch is not None:
+                    requests.extend(batch.reqs)
+            if self.chunked_req is not None:
+                requests.append(self.chunked_req)
+            for queue_name in (
+                "disagg_prefill_bootstrap_queue",
+                "disagg_decode_prealloc_queue",
+                "disagg_decode_transfer_queue",
+            ):
+                queue = getattr(self, queue_name, None)
+                for queue_attr in (
+                    "queue",
+                    "pending_reqs",
+                    "retracted_queue",
+                    "held_rebootstrap_reqs",
+                ):
+                    for item in getattr(queue, queue_attr, ()):
+                        requests.append(getattr(item, "req", item))
+            requests.extend(getattr(self, "disagg_prefill_inflight_queue", ()))
+            dllm_manager = getattr(self, "dllm_manager", None)
+            requests.extend(getattr(dllm_manager, "waiting_queue", ()))
+            requests.extend(getattr(dllm_manager, "staging_queue", ()))
+            hisparse_coordinator = getattr(self, "hisparse_coordinator", None)
+            requests.extend(
+                act.req
+                for act in getattr(hisparse_coordinator, "ack_staging_queue", ())
+            )
+            for req in requests:
+                if getattr(req, "_session_ref_activity", None) == (
+                    recv_req.session_id,
+                    generation,
+                ):
+                    req.priority = recv_req.priority
+        return UpdateSessionPriorityReqOutput(
+            success=success, found=True, message=message
+        )
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)

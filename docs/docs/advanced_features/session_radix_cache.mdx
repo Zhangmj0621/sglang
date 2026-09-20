@@ -4,9 +4,9 @@ metatags:
     description: "Keep active sessions ahead of unrelated KV in UnifiedRadixCache eviction order."
 ---
 
-Session-aware radix caching improves cache hits for long-lived, multi-turn workloads under memory pressure. It registers reusable KV to a session and evicts unreferenced KV before KV still referenced by an active session.
+Session-aware radix caching improves cache hits for long-lived, multi-turn workloads under memory pressure. It registers reusable KV to a session and evicts unreferenced KV before low-priority (LP) and high-priority (HP) session references.
 
-Session references are soft protection, not memory pins. Referenced KV can still be evicted when reclaiming unreferenced KV is insufficient.
+Session references are soft protection, not memory pins. LP requests can reclaim unreferenced and LP KV. HP requests can also reclaim HP KV when lower tiers are insufficient. Device and host locks continue to protect in-use data.
 
 ## Enable the cache
 
@@ -42,16 +42,80 @@ curl -X POST http://localhost:30000/close_session \
   -d '{"session_id": "agent-42"}'
 ```
 
-Closing removes the session's references but does not immediately free its KV. The KV remains reusable and returns to the normal eviction order.
+Closing removes the session's references but does not immediately free its KV. The KV remains reusable and returns to the unreferenced eviction tier. A late completion from the closed session generation cannot restore those references.
+
+## Set session priority
+
+Add `--enable-priority-scheduling` to distinguish high and low priority. The
+`--high-priority-threshold` defaults to `1`: a resolved request priority at or
+above the threshold is HP; lower values are LP. Without priority scheduling,
+all requests have HP allocation permission. This feature does not enable
+priority scheduling automatically and cannot be combined with
+`--schedule-low-priority-values-first` when priority scheduling is enabled.
+
+```bash Command
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --enable-session-radix-cache \
+  --enable-priority-scheduling \
+  --high-priority-threshold 1
+```
+
+Pass `"priority": 1` with the top-level `session_id` for an HP request, or
+`"priority": 0` for LP. Each session keeps one declared priority class. To
+change its class, update the session explicitly before submitting requests
+with the new class:
+
+```bash Command
+curl -X POST http://localhost:30000/update_session_priority \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "agent-42", "priority": 0}'
+```
+
+The update changes current-generation cache references and outstanding
+requests for that session. An unknown or closed session returns an error;
+updating priority does not create a session. Requests without a session ID
+still have scheduling priority but do not retain session references.
+Streaming sessions continue to use their existing lock-based ownership.
 
 ## Eviction behavior
 
-The cache tracks references independently for each UnifiedRadixCache component. Device and host eviction use the same session preference.
+References are tracked independently for each UnifiedRadixCache component.
+All components use the order unreferenced → LP → HP, subject to the requesting
+operation's allocation permission. A shared entry stays HP while any HP
+coverage remains.
 
-| Component | Referenced data | Eviction order |
+| Component | Referenced data | Within-tier order |
 | --- | --- | --- |
-| Full attention | The reusable prefix path from the registered leaf to the root | Unreferenced nodes first, then referenced nodes with fewer session references, then the configured policy such as LRU |
-| Sliding-window attention (SWA) | The reusable tail covering the sliding window plus page-alignment allowance | Two LRU passes: unreferenced nodes first, then referenced nodes if more space is required |
-| Mamba | The reusable state on the registered leaf | Two LRU passes: unreferenced nodes first, then referenced nodes if more space is required |
+| Full attention | Reusable prefix paths from registered frontier nodes to the root | Fewer HP references, then fewer LP references; ties use MRU for HP and the configured eviction policy for other tiers |
+| Sliding-window attention (SWA) | Reusable tail covering the sliding window plus page-alignment allowance | LRU within each tier |
+| Mamba | Reusable state on each registered frontier node | LRU within each tier |
 
-UnifiedRadixCache still applies component cascade rules. Evicting an internal Full node also evicts its SWA and Mamba data; evicting SWA also evicts Mamba data; evicting Mamba affects only Mamba. Evicting a leaf removes all component data on that leaf.
+Full reference counts measure frontier coverage. Multiple branches of one
+session can contribute multiple times to a shared ancestor. They are not a
+count of distinct session IDs.
+
+Component dependency rules still apply. An eviction cannot bypass an HP
+restriction by triggering through another component. Deleting Full data
+requires its dependent SWA/Mamba data to be eligible; an auxiliary component
+may be tombstoned while a higher-priority component remains reusable.
+
+## Temporary demotion under host pressure
+
+When an HP-authorized HiCache operation needs host space, it first reclaims
+unreferenced and LP entries. If that is insufficient, it temporarily demotes
+the shortest idle HP session to LP and retries the LP tier. Length is current
+logical Full KV coverage, deduplicated within the session and across device
+and host copies. Sessions with queued, running, or otherwise unfinished
+requests are excluded from temporary demotion. If no eligible sessions remain,
+the operation may fall back to directly reclaiming unlocked HP entries.
+
+Demotion changes cache protection only; it does not change request scheduling
+priority. A subsequent HP completion or an explicit HP priority update restores
+the session's remaining references. Closing an effective HP session restores
+one temporarily demoted session in FIFO order. Explicitly updating a demoted
+session to LP removes it from the restoration queue. Restoration does not
+recreate KV that has already been evicted.
+
+LP-authorized host pressure cannot temporarily demote or reclaim HP sessions.
+Device-only pressure does not trigger this adaptive demotion policy.

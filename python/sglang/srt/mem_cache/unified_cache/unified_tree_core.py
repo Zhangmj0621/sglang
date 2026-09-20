@@ -172,19 +172,24 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
-        # Session partition: [head .. mid) holds session-referenced nodes and
-        # (mid .. tail] unreferenced ones, so evictions directly walks (tail -> head).
+        # Three partitions: HP, LP, then unreferenced, walked tail -> head.
+        # Sentinels preserve O(1) moves when a reference changes tier.
         self._is_referenced = is_referenced
+        self.high_mid: Optional[UnifiedTreeNode] = None
         self.mid: Optional[UnifiedTreeNode] = None
         self.cursor: Optional[UnifiedTreeNode] = None
+        self.cursors: tuple[UnifiedTreeNode, ...] = ()
         if is_referenced is not None:
+            self.high_mid = UnifiedTreeNode(tree_components)
             self.mid = UnifiedTreeNode(tree_components)
-            self.cursor = UnifiedTreeNode(tree_components)
+            self.cursors = tuple(UnifiedTreeNode(tree_components) for _ in range(3))
+            self.cursor = self.cursors[0]
             for ct in tree_components:
-                for node in (self.mid, self.cursor):
+                for node in (self.high_mid, self.mid, *self.cursors):
                     node.component_data[ct].lock_ref = 1
                     node.component_data[ct].host_lock_ref = 1
-            self._add_node_after(self.head, self.mid)
+            self._add_node_after(self.head, self.high_mid)
+            self._add_node_after(self.high_mid, self.mid)
 
     def _add_node_after(self, prev_node: UnifiedTreeNode, new_node: UnifiedTreeNode):
         pt = self._pt
@@ -194,10 +199,9 @@ class UnifiedLRUList:
         prev_node.lru_next[pt] = new_node
 
     def _add_node(self, node: UnifiedTreeNode):
-        if self._is_referenced is None or self._is_referenced(node):
-            self._add_node_after(self.head, node)
-        else:
-            self._add_node_after(self.mid, node)
+        tier = 2 if self._is_referenced is None else self._is_referenced(node)
+        anchor = self.head if tier == 2 else self.high_mid if tier == 1 else self.mid
+        self._add_node_after(anchor, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
         pt = self._pt
@@ -223,28 +227,39 @@ class UnifiedLRUList:
         self._add_node(node)
 
     def cursor_begin(self):
-        if self.cursor.lru_prev[self._pt] is not None:
-            self._remove_node(self.cursor)
-        self._add_node_after(self.tail.lru_prev[self._pt], self.cursor)
+        # Each tier owns a physical progress marker. A tier change inserts
+        # the entry at MRU before that tier's marker, including after the tier
+        # was exhausted. No rescan or owner-sized revisit queue is necessary.
+        for cursor, end in zip(self.cursors, (self.tail, self.mid, self.high_mid)):
+            if cursor.lru_prev[self._pt] is not None:
+                self._remove_node(cursor)
+            self._add_node_after(end.lru_prev[self._pt], cursor)
 
-    def cursor_next(self, *, host_lock: bool = False):
+    def cursor_next(self, *, host_lock: bool = False, max_tier: int = 2):
         pt = self._pt
         ct = self.component_type
-        x = self.cursor.lru_prev[pt]
-        while x is not self.head:
-            cd = x.component_data[ct]
-            if (cd.host_lock_ref if host_lock else cd.lock_ref) == 0:
+        for tier, (cursor, anchor) in enumerate(
+            zip(self.cursors, (self.mid, self.high_mid, self.head))
+        ):
+            if tier > max_tier:
                 break
-            x = x.lru_prev[pt]
-        if x is self.head:
-            return None
-        self._remove_node(self.cursor)
-        self._add_node_after(x.lru_prev[pt], self.cursor)
-        return x
+            x = cursor.lru_prev[pt]
+            while x is not anchor:
+                cd = x.component_data[ct]
+                if (cd.host_lock_ref if host_lock else cd.lock_ref) == 0:
+                    self._remove_node(cursor)
+                    self._add_node_after(x.lru_prev[pt], cursor)
+                    return x
+                x = x.lru_prev[pt]
+            # Stop at the partition's MRU boundary. Future tier changes place
+            # moved entries before this marker, preserving their LRU position.
+            self._remove_node(cursor)
+            self._add_node_after(anchor, cursor)
+        return None
 
     def cursor_end(self):
-        """Unlink the walk-cursor sentinel after a walk."""
-        self._remove_node(self.cursor)
+        for cursor in self.cursors:
+            self._remove_node(cursor)
 
     def reset_node_and_parents_mru(
         self,
@@ -253,19 +268,14 @@ class UnifiedLRUList:
         should_include,
     ):
         is_referenced = self._is_referenced
-        prev_ref = self.head
-        prev_unref = self.head if self.mid is None else self.mid
+        previous = [self.mid or self.head, self.high_mid or self.head, self.head]
         while node != root_node:
             if should_include(node):
                 assert node.id in self.cache
-                part = is_referenced is None or is_referenced(node)
+                part = 2 if is_referenced is None else int(is_referenced(node))
                 self._remove_node(node)
-                if part:
-                    self._add_node_after(prev_ref, node)
-                    prev_ref = node
-                else:
-                    self._add_node_after(prev_unref, node)
-                    prev_unref = node
+                self._add_node_after(previous[part], node)
+                previous[part] = node
             node = node.parent
 
     def reset_node_and_window_ancestors_mru(
@@ -276,20 +286,15 @@ class UnifiedLRUList:
         should_include,
     ):
         is_referenced = self._is_referenced
-        prev_ref = self.head
-        prev_unref = self.head if self.mid is None else self.mid
+        previous = [self.mid or self.head, self.high_mid or self.head, self.head]
         accumulated = 0
         while node != root_node and accumulated < window_size:
             if should_include(node):
                 assert node.id in self.cache
-                part = is_referenced is None or is_referenced(node)
+                part = 2 if is_referenced is None else int(is_referenced(node))
                 self._remove_node(node)
-                if part:
-                    self._add_node_after(prev_ref, node)
-                    prev_ref = node
-                else:
-                    self._add_node_after(prev_unref, node)
-                    prev_unref = node
+                self._add_node_after(previous[part], node)
+                previous[part] = node
             accumulated += len(node.key)
             node = node.parent
 
@@ -390,6 +395,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.session_allow_low = True
+        self.session_allow_high = False
         self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
 
         # ``device`` is derived from the construction-time allocator; the
@@ -409,6 +416,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.components: tuple[TreeComponent, ...] = tuple(
             self.components_by_type.values()
         )
+        # Static component dependencies; no per-lock tree/owner traversal.
+        self._session_lower_components = {
+            comp.component_type: tuple(
+                other.component_type
+                for other in self.components
+                if other.eviction_priority(is_leaf=False)
+                < comp.eviction_priority(is_leaf=False)
+            )
+            for comp in self.components
+        }
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
@@ -420,7 +437,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _session_lru_predicate(self, ct: ComponentType):
         if not self.enable_session_radix_cache or ct is ComponentType.FULL:
             return None
-        return lambda node: node.component_data[ct].session_ref > 0
+        return lambda node: (
+            2
+            if node.component_data[ct].session_high_ref
+            else int(node.component_data[ct].session_ref > 0)
+        )
 
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
@@ -440,6 +461,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.root_node.component_data[ct].lock_ref = 1
 
         self.component_evictable_size_ = {ct: 0 for ct in self.component_types}
+        self.session_high_evictable_size = {ct: 0 for ct in self.component_types}
         self.component_protected_size_ = {ct: 0 for ct in self.component_types}
 
         self.lru_lists = {
@@ -472,6 +494,60 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=self.root_node.id,
             cache_actions=[],
         )
+
+    def session_tier_allowed(self, tier: int) -> bool:
+        return tier == 0 or (
+            self.session_allow_high if tier == 2 else self.session_allow_low
+        )
+
+    def adjust_evictable_size(
+        self, node: UnifiedTreeNode, ct: ComponentType, delta: int
+    ) -> None:
+        self.component_evictable_size_[ct] += delta
+        if self.enable_session_radix_cache:
+            self.adjust_session_evictable_size(node, ct, delta)
+
+    def adjust_session_evictable_size(
+        self, node: UnifiedTreeNode, ct: ComponentType, delta: int
+    ) -> None:
+        # Locks and pool changes do not change reference tiers. Update only
+        # this component; Full-only and direct HP refs need no dependency walk.
+        cd = node.component_data[ct]
+        cd.session_evictable_tokens += delta
+        lower = self._session_lower_components[ct]
+        if cd.session_high_ref or (
+            lower
+            and any(node.component_data[other].session_high_ref for other in lower)
+        ):
+            self.session_high_evictable_size[ct] += delta
+            cd.session_high_evictable_tokens += delta
+
+    def refresh_session_evictable(self, node: UnifiedTreeNode) -> None:
+        if not self.enable_session_radix_cache:
+            return
+        for comp in self.components:
+            ct = comp.component_type
+            cd = node.component_data[ct]
+            priority = comp.eviction_priority(is_leaf=False)
+            high = any(
+                other.eviction_priority(is_leaf=False) <= priority
+                and node.component_data[other.component_type].session_high_ref > 0
+                for other in self.components
+            )
+            amount = cd.session_evictable_tokens if high else 0
+            self.session_high_evictable_size[ct] += (
+                amount - cd.session_high_evictable_tokens
+            )
+            cd.session_high_evictable_tokens = amount
+
+    def _refresh_split_session_sizes(self, node: UnifiedTreeNode) -> None:
+        if self.enable_session_radix_cache:
+            for ct in self.component_types:
+                cd = node.component_data[ct]
+                cd.session_evictable_tokens = (
+                    len(cd.value) if cd.value is not None and not cd.lock_ref else 0
+                )
+            self.refresh_session_evictable(node)
 
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         """Resolve a NodeId back to its tree node.
@@ -1048,6 +1124,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
         child.last_access_time = get_and_increase_time_counter()
+        self._refresh_split_session_sizes(child)
+        self._refresh_split_session_sizes(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1065,7 +1143,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
-        self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        self.adjust_evictable_size(new_node, BASE_COMPONENT_TYPE, len(value))
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1084,7 +1162,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
-        self.component_evictable_size_[ct] += n
+        self.adjust_evictable_size(node, ct, n)
         self._update_evictable_leaf_sets(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
@@ -1189,6 +1267,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
+        if self.enable_session_radix_cache and not all(
+            self.session_tier_allowed(c.session_tier(node)) for c in self.components
+        ):
+            return result
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return result
         descendants: list[UnifiedTreeNode] = []
@@ -1197,6 +1279,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cur = stack.pop()
             if any(
                 cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            ):
+                return result
+            if self.enable_session_radix_cache and not all(
+                self.session_tier_allowed(c.session_tier(cur)) for c in self.components
             ):
                 return result
             descendants.append(cur)
@@ -1382,7 +1468,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                             continue
                         if EvictLayer.HOST in target and cd.host_lock_ref != 0:
                             continue
-                        if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+                        if comp.session_tier(node) > trigger.session_tier(node):
                             continue
                     if EvictLayer.DEVICE in target:
                         assert cd.lock_ref == 0
@@ -1834,7 +1920,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
-        self.component_evictable_size_[component_type] += len(value)
+        self.adjust_evictable_size(node, component_type, len(value))
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -2030,6 +2116,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for ct in self.component_types:
             evictable = 0
             protected = 0
+            high_evictable = 0
             for n in all_nodes:
                 if n is self.root_node:
                     continue
@@ -2040,6 +2127,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         protected += toks
                     else:
                         evictable += toks
+                if self.enable_session_radix_cache:
+                    accounted = (
+                        len(cd.value) if cd.value is not None and not cd.lock_ref else 0
+                    )
+                    if cd.session_evictable_tokens != accounted:
+                        E(
+                            f"[SessionSize] node {n.id} {ct} tokens={cd.session_evictable_tokens} != {accounted}"
+                        )
+                    high = cd.session_high_ref or any(
+                        n.component_data[other].session_high_ref
+                        for other in self._session_lower_components[ct]
+                    )
+                    expected_high = accounted if high else 0
+                    high_evictable += expected_high
+                    if cd.session_high_evictable_tokens != expected_high:
+                        E(
+                            f"[SessionSize] node {n.id} {ct} high={cd.session_high_evictable_tokens} != {expected_high}"
+                        )
+            if (
+                self.enable_session_radix_cache
+                and self.session_high_evictable_size[ct] != high_evictable
+            ):
+                E(
+                    f"[SessionSize] {ct} high={self.session_high_evictable_size[ct]} != {high_evictable}"
+                )
             if self.component_evictable_size_[ct] != evictable:
                 E(
                     f"[Size] {ct} evictable={self.component_evictable_size_[ct]} "
@@ -2103,7 +2215,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         while x is not None and x != lru.tail:
             if x.lru_prev[pt] != prev:
                 errors.append(f"[{label}][{ct}] broken prev at node {x.id}")
-            if x is lru.mid or x is lru.cursor:
+            if x is lru.high_mid or x is lru.mid or x in lru.cursors:
                 prev = x
                 x = x.lru_next[pt]
                 continue

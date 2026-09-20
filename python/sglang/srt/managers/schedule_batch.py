@@ -85,8 +85,16 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -2323,10 +2331,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        # Admission has already checked each LP request against its own tier
+        # budget. Only a batch containing HP demand may reclaim HP references.
+        if getattr(self.tree_cache, "enable_session_radix_cache", False) is True:
+            allow_high = any(
+                self.tree_cache.is_high_priority(req.priority) for req in reqs
+            )
+            with self.tree_cache.scoped_evict(allow_low=True, allow_high=allow_high):
+                out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                    alloc_for_extend(self)
+                )
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []
@@ -2725,17 +2743,99 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
-        """Reclaim evictable tree-cache entries (shortfall only), then report
-        whether the next decode step fits in the KV pool."""
+        """Reclaim permitted cache entries and test whether the decode step fits.
+
+        Ordinary caches reclaim the shortfall; session caches retain low-tier
+        headroom and bound high-tier eviction by the selected HP demand.
+        """
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        if getattr(self.tree_cache, "enable_session_radix_cache", False) is True:
+            self._evict_for_session_decode(num_tokens, selected_indices)
+        else:
+            evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _evict_for_session_decode(self, num_tokens, selected_indices=None):
+        """Reclaim low tiers first, then at most the selected HP decode demand.
+
+        Low-tier eviction retains the legacy total-demand headroom. The HP
+        phase only covers the remaining deficit, independently for each pool.
+        No HP scope escapes into the later decode allocator.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        hybrid_swa = isinstance(
+            allocator,
+            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+        )
+        pure_swa = isinstance(allocator, PureSWATokenToKVPoolAllocator)
+        full_available = (
+            allocator.full_available_size()
+            if hybrid_swa
+            else allocator.available_size()
+        )
+        swa_available = (
+            allocator.swa_available_size() if hybrid_swa or pure_swa else num_tokens
+        )
+        if full_available >= num_tokens and swa_available >= num_tokens:
+            return
+        self.tree_cache.evict_for_session(
+            EvictParams(
+                num_tokens=(
+                    num_tokens if full_available < num_tokens and not pure_swa else 0
+                ),
+                swa_num_tokens=num_tokens if swa_available < num_tokens else 0,
+            ),
+            allow_low=True,
+            allow_high=False,
+        )
+        full_shortfall = (
+            max(
+                0,
+                num_tokens
+                - (
+                    allocator.full_available_size()
+                    if hybrid_swa
+                    else allocator.available_size()
+                ),
+            )
+            if not pure_swa
+            else 0
+        )
+        swa_shortfall = (
+            max(0, num_tokens - allocator.swa_available_size())
+            if hybrid_swa or pure_swa
+            else 0
+        )
+        if not full_shortfall and not swa_shortfall:
+            return
+        indices = (
+            range(len(self.reqs)) if selected_indices is None else selected_indices
+        )
+        high_indices = [
+            i
+            for i in indices
+            if self.tree_cache.is_high_priority(self.reqs[i].priority)
+        ]
+        if not high_indices:
+            return
+        hp_tokens = self.new_tokens_required_next_decode(high_indices)
+        if hp_tokens:
+            self.tree_cache.evict_for_session(
+                EvictParams(
+                    num_tokens=min(full_shortfall, hp_tokens),
+                    swa_num_tokens=min(swa_shortfall, hp_tokens),
+                ),
+                allow_low=False,
+                allow_high=True,
+            )
 
     def retract_decode(
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
+        sorted_indices = self._get_decode_retraction_order(
+            self.reqs, server_args, self.tree_cache
+        )
 
         retracted_reqs = []
         first_iter = True
@@ -2783,7 +2883,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @staticmethod
     def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs
+        reqs: List[Req], server_args: ServerArgs, tree_cache=None
     ) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
 
@@ -2816,10 +2916,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             return sorted_indices
 
-        sorted_indices.sort(
-            key=lambda i: length_key(reqs[i]),
-            reverse=True,
-        )
+        if getattr(tree_cache, "enable_session_radix_cache", False) is True:
+            sorted_indices.sort(
+                key=lambda i: (
+                    tree_cache.is_high_priority(reqs[i].priority),
+                    *length_key(reqs[i]),
+                ),
+                reverse=True,
+            )
+        else:
+            sorted_indices.sort(
+                key=lambda i: length_key(reqs[i]),
+                reverse=True,
+            )
         return sorted_indices
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):

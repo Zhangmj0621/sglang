@@ -2034,6 +2034,18 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class UpdateSessionPriorityReqInput(BaseReq, kw_only=True):
+    session_id: str
+    priority: int
+
+
+class UpdateSessionPriorityReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    # A session may be present on only some DP workers.
+    found: bool = False
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

@@ -358,6 +358,15 @@ class PrefillBootstrapQueue:
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            if (
+                getattr(
+                    getattr(self.scheduler, "tree_cache", None),
+                    "enable_session_radix_cache",
+                    False,
+                )
+                is True
+            ):
+                self.scheduler._end_session_request(req)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
@@ -884,6 +893,8 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         for req in done_reqs:
+            if getattr(self.tree_cache, "enable_session_radix_cache", False) is True:
+                self._end_session_request(req)
             req.time_stats.set_completion_time()
 
         for req in done_reqs:
@@ -994,6 +1005,8 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        if getattr(self.tree_cache, "enable_session_radix_cache", False) is True:
+            self._end_session_request(req)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
